@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astril"
-version = "0.6.00"
+version = "0.6.01"
 description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -17,7 +17,8 @@ dependencies = [
     "psutil",
     "SimpleITK",
     "xlsxwriter",
-    "tqdm"
+    "tqdm",
+    "platformdirs>=4"
 ]
 
 [project.scripts]
@@ -32,12 +33,16 @@ visualize-model = "astril.visualize_model:main"
 preprocess_brain_mris = "astril.preprocess_brain_mris:main"
 convert-dicom-series = "astril.dicom_conversion:main"
 astril-make-models-json = "astril.models_manifest:cli_make_models_json"
+astril-download-models = "astril.models_download:cli_download"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.package-data]
-"astril" = ["models/*"]
+# Only ship tiny control files from the models folder
+"astril" = [
+  "models/models.json"
+]
 
 [project.optional-dependencies]
 preprocessing = [

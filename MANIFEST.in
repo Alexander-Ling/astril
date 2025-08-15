@@ -1,1 +1,1 @@
-recursive-include astril/models *
+include src/astril/models/models.json

@@ -1,0 +1,74 @@
+{
+  "Axial_1.h5": {
+    "bytes": 160392920,
+    "sha256": "2d6eb71ab08ba133a6e262f9dc44df4f1c0c27e9a65bed9d9f07780065b32379",
+    "url": "https://osf.io/download/689f48a0d91e7b08ce2ff33e/",
+    "version": "2025-08-15T16:44:52Z"
+  },
+  "Axial_1_train_parameters.cfg": {
+    "bytes": 1512,
+    "sha256": "19d71ad2c7fad1fef863fa0330c3a44697372db4b31160fc4eb90466b8abf427",
+    "url": "https://osf.io/download/689f487d30bb64690edcffd8/",
+    "version": "2025-08-15T16:44:52Z"
+  },
+  "Axial_2.h5": {
+    "bytes": 10317136,
+    "sha256": "4dab04afce0442bd656cfc6e627c066b7faa00067f89469044012c6a242f6112",
+    "url": "https://osf.io/download/689f4883ac9a14668aa5de75/",
+    "version": "2025-08-15T16:44:52Z"
+  },
+  "Axial_2_train_parameters.cfg": {
+    "bytes": 1357,
+    "sha256": "15d1bec087c34d90a2541a41494f3180c3a41a1f068798392c6056b0235c382c",
+    "url": "https://osf.io/download/689f4887b50d6c668da5df0e/",
+    "version": "2025-08-15T16:44:52Z"
+  },
+  "Coronal_1.h5": {
+    "bytes": 160392920,
+    "sha256": "fe7b3e3506e64cd16892004bf3d66554e04e8b599676c004720fc656422d5b29",
+    "url": "https://osf.io/download/689f486ad577083d805931e0/",
+    "version": "2025-08-15T16:44:53Z"
+  },
+  "Coronal_1_train_parameters.cfg": {
+    "bytes": 1542,
+    "sha256": "0ac1030098aeab05d67fd7b3dc608f9671c611731a4bfd3b198d2f6187187358",
+    "url": "https://osf.io/download/689f4830dc20823cd05930de/",
+    "version": "2025-08-15T16:44:53Z"
+  },
+  "Coronal_2.h5": {
+    "bytes": 10317136,
+    "sha256": "60739ca5aee6fe6826679c078fcb6addf52feffff8dd88ce93d2d2b0a17daae1",
+    "url": "https://osf.io/download/689f4836ac9a14668aa5de6a/",
+    "version": "2025-08-15T16:44:53Z"
+  },
+  "Coronal_2_train_parameters.cfg": {
+    "bytes": 1383,
+    "sha256": "6649730c929c7cba14c917b0735f79754f831cbd11ffdbf10511e65bd2c6fcb1",
+    "url": "https://osf.io/download/689f4839ecbf52b3d0fa74fa/",
+    "version": "2025-08-15T16:44:53Z"
+  },
+  "Sagittal_1.h5": {
+    "bytes": 160392920,
+    "sha256": "1257b09258c2acec167ad82706af67f951260177369649f935eb5b8a913dc6ac",
+    "url": "https://osf.io/download/689f487976c9a5c6b62ff399/",
+    "version": "2025-08-15T16:44:54Z"
+  },
+  "Sagittal_1_train_parameters.cfg": {
+    "bytes": 1557,
+    "sha256": "f0e5c6ccf55c68a20fd62b30bc08596f5f5e2b9a68c71e18707ae8d78252411c",
+    "url": "https://osf.io/download/689f48709138021e5edd0173/",
+    "version": "2025-08-15T16:44:54Z"
+  },
+  "Sagittal_2.h5": {
+    "bytes": 10317136,
+    "sha256": "01b9acdab402df993ab44fd042b75abaf7062287888d6bf46e53a6a80a1fe594",
+    "url": "https://osf.io/download/689f48775dde5bbb63fa73d3/",
+    "version": "2025-08-15T16:44:54Z"
+  },
+  "Sagittal_2_train_parameters.cfg": {
+    "bytes": 1396,
+    "sha256": "fed85cd8bf2b402be2b93ac338680e3f3d97b2d4db77eaee8694dd28c22d7136",
+    "url": "https://osf.io/download/689f4879f0f2135bf5a5df64/",
+    "version": "2025-08-15T16:44:54Z"
+  }
+}

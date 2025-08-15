@@ -17,5 +17,6 @@ dist/
 
 # Models inside the package (redundant with nested .gitignore, but safe)
 src/astril/models/**
+!src/astril/models/models.json
 !src/astril/models/.gitkeep
 !src/astril/models/.gitignore

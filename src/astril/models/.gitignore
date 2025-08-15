@@ -1,4 +1,5 @@
 # Ignore everything in models except keepers
 *
+!models.json
 !.gitignore
 !.gitkeep

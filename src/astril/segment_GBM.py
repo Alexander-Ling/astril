@@ -10,20 +10,21 @@ subfolder) after necessary inputs have been generated. The pre‐trained models 
 stage are loaded only once.
 """
 import os
+import sys
 import argparse
 import shutil
 from pathlib import Path
 import configparser
 
 # Import existing segmentation pipeline functions.
-from astril.create_segmentation_config import create_segmentation_config, parse_train_config_for_model_parameters
-from astril.run_segmentation import run_segmentation  # legacy use
-from astril.remap_gt_classes import remap_gt_classes
-from astril.merge_seg_volumes import merge_seg_volumes
-from astril.quantify_volumes import quantify_segmentation_volumes
+from .create_segmentation_config import create_segmentation_config, parse_train_config_for_model_parameters
+from .run_segmentation import run_segmentation  # legacy use
+from .remap_gt_classes import remap_gt_classes
+from .merge_seg_volumes import merge_seg_volumes
+from .quantify_volumes import quantify_segmentation_volumes
 
 # For later use in our helper functions, import functions from run_segmentation.
-from astril.run_segmentation import (
+from .run_segmentation import (
     read_paths_from_file,
     load_val_data,
     ValDataGenerator,
@@ -36,10 +37,43 @@ from astril.run_segmentation import (
 import nibabel as nib
 import numpy as np
 from tensorflow.keras.models import load_model
+from .models_download import locate_model, locate_models_dir
 
-# Assume that pre-trained models are bundled in a "models" subfolder.
-PACKAGE_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+# ------------------------------------------------------------
+# Model availability check
+# ------------------------------------------------------------
+def _required_model_filenames() -> list[str]:
+    # Update this list if you rename/add files in models.json
+    return [
+        # Ensembles – model set 1
+        "Axial_1.h5", "Coronal_1.h5", "Sagittal_1.h5",
+        "Axial_1_train_parameters.cfg", "Coronal_1_train_parameters.cfg", "Sagittal_1_train_parameters.cfg",
+        # Ensembles – model set 2
+        "Axial_2.h5", "Coronal_2.h5", "Sagittal_2.h5",
+        "Axial_2_train_parameters.cfg", "Coronal_2_train_parameters.cfg", "Sagittal_2_train_parameters.cfg",
+    ]
 
+def _ensure_models_available() -> None:
+    missing: list[str] = []
+    for name in _required_model_filenames():
+        try:
+            # locate_model() also verifies the resolved path exists
+            locate_model(name)
+        except FileNotFoundError:
+            missing.append(name)
+    if missing:
+        target = locate_models_dir()
+        msg = [
+            "Required Astril model files are missing:",
+            *[f"  - {m}" for m in missing],
+            "",
+            "To download them now, run:",
+            "  astril-download-models",
+            "",
+            f"Downloaded files will be placed in:\n  {target}",
+        ]
+        print("\n".join(msg), file=sys.stderr)
+        sys.exit(2)
 
 def cleanup_intermediate_files(root_dir):
     """
@@ -269,14 +303,14 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     # STEP 1: Prepare segmentation config for Model 1.
     #########################################
     model1_paths = [
-        os.path.join(PACKAGE_MODELS_DIR, "Axial_1.h5"),
-        os.path.join(PACKAGE_MODELS_DIR, "Coronal_1.h5"),
-        os.path.join(PACKAGE_MODELS_DIR, "Sagittal_1.h5")
+        str(locate_model("Axial_1.h5")),
+        str(locate_model("Coronal_1.h5")),
+        str(locate_model("Sagittal_1.h5")),
     ]
     model1_train_configs = [
-        os.path.join(PACKAGE_MODELS_DIR, "Axial_1_train_parameters.cfg"),
-        os.path.join(PACKAGE_MODELS_DIR, "Coronal_1_train_parameters.cfg"),
-        os.path.join(PACKAGE_MODELS_DIR, "Sagittal_1_train_parameters.cfg")
+        str(locate_model("Axial_1_train_parameters.cfg")),
+        str(locate_model("Coronal_1_train_parameters.cfg")),
+        str(locate_model("Sagittal_1_train_parameters.cfg")),
     ]
     seg_config_model1 = create_segmentation_config(
         workingDirectory=working_dir,
@@ -317,14 +351,14 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     print("[INFO] Loading Model 2 weights...")
     loaded_models_model2 = []
     model2_paths = [
-        os.path.join(PACKAGE_MODELS_DIR, "Axial_2.h5"),
-        os.path.join(PACKAGE_MODELS_DIR, "Coronal_2.h5"),
-        os.path.join(PACKAGE_MODELS_DIR, "Sagittal_2.h5")
+        str(locate_model("Axial_2.h5")),
+        str(locate_model("Coronal_2.h5")),
+        str(locate_model("Sagittal_2.h5")),
     ]
     model2_train_configs = [
-        os.path.join(PACKAGE_MODELS_DIR, "Axial_2_train_parameters.cfg"),
-        os.path.join(PACKAGE_MODELS_DIR, "Coronal_2_train_parameters.cfg"),
-        os.path.join(PACKAGE_MODELS_DIR, "Sagittal_2_train_parameters.cfg")
+        str(locate_model("Axial_2_train_parameters.cfg")),
+        str(locate_model("Coronal_2_train_parameters.cfg")),
+        str(locate_model("Sagittal_2_train_parameters.cfg")),
     ]
     for i, mp in enumerate(model2_paths):
         mp = mp.strip()
@@ -423,6 +457,7 @@ def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_o
 
 
 def main():
+
     parser = argparse.ArgumentParser(
         description="Run the full GBM segmentation pipeline using pre-trained models."
     )
@@ -442,6 +477,9 @@ def main():
     parser.add_argument("--segment_suffix", type=str, default="_GBM_seg.nii.gz",
                         help="Suffix to use in the final segmentation file names (default: _GBM_seg.nii.gz)")
     args = parser.parse_args()
+
+    # Fail early with a clear instruction if user hasn't fetched models yet
+    _ensure_models_available()
     
     segment_GBM(
         input_dir=args.input_directory,
