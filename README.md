@@ -2,6 +2,7 @@
 ### Authors:
 - Alexander Ling (alexander.l.ling@gmail.com; alling@bwh.harvard.edu)
 -  E. Antonio Chiocca
+### License: Creative Commons CC BY-NC-SA 4.0
 ### License Holders:
 - Alexander Ling
 - E. Antonio Chiocca

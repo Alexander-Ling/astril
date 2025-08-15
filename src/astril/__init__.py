@@ -1,5 +1,5 @@
 """
-astril – Automated Segmentation Toolkit for Radiology Image Libraries
+astril: Automated Segmentation Toolkit for Radiology Image Libraries
 (See pyproject.toml for project metadata)
 """
 
