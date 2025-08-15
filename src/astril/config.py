@@ -1,0 +1,22 @@
+# These all get dynamically assigned by the loaded config files
+output_dir = None
+n_cores = None
+slicing_plane = None
+image_paths_files = None         # training channels file list (comma?separated list from create_config_files)
+gt_paths_file = None             # training ground truth file
+mask_paths_file = None           # training mask file
+val_image_paths_files = None     # validation channels file list (list of paths)
+val_gt_paths_file = None         # validation ground truth file
+val_mask_paths_file = None       # validation mask file
+num_classes = None
+epochs = None
+num_input_slices = None
+num_output_slices = None
+training_schedule_file = None
+pretrained_model_path = None
+print_every_n_subbatches = None
+minimum_height_width = None
+num_channels = None
+base_num_filters = None
+encoder_level_factors = None
+center_depth = None

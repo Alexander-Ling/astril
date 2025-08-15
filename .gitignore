@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Envs & build
+.venv/
+env/
+venv/
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vs/
+.vscode/
+
+# Models inside the package (redundant with nested .gitignore, but safe)
+src/astril/models/**
+!src/astril/models/.gitkeep
+!src/astril/models/.gitignore

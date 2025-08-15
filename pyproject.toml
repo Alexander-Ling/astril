@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astril"
+version = "0.6.00"
+description = "Segmentation training project. Heavily aided by ChatGPT."
+authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
+dependencies = [
+    "nilearn",
+    "numpy",
+    "scipy",
+    "pandas",
+    "nibabel",
+    "tensorflow",
+    "psutil",
+    "SimpleITK",
+    "xlsxwriter",
+    "tqdm"
+]
+
+[project.scripts]
+create-config-files = "astril.create_config_files:main"
+remap-gt-classes = "astril.remap_gt_classes:main"
+create-segmentation-config = "astril.create_segmentation_config:main"
+run-segmentation = "astril.run_segmentation:main"
+merge-seg-volumes = "astril.merge_seg_volumes:main"
+quantify-volumes = "astril.quantify_volumes:main"
+segment-gbm = "astril.segment_GBM:main"
+visualize-model = "astril.visualize_model:main"
+preprocess_brain_mris = "astril.preprocess_brain_mris:main"
+convert-dicom-series = "astril.dicom_conversion:main"
+astril-make-models-json = "astril.models_manifest:cli_make_models_json"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"astril" = ["models/*"]
+
+[project.optional-dependencies]
+preprocessing = [
+    "hd-bet>=1.0.8",
+    "dicom2nifti>=2.4.7"
+]
