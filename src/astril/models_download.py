@@ -86,9 +86,9 @@ def download_models(overwrite: bool = False, only: Optional[List[str]] = None) -
                         print(f"[skip] {e.filename} (present, checksum OK)")
                         continue
                     else:
-                        print(f"[warn] {e.filename} present but checksum mismatch; re-downloading…")
+                        print(f"[warn] {e.filename} present but checksum mismatch; re-downloading...")
                 except Exception:
-                    print(f"[warn] Could not checksum {e.filename}; re-downloading…")
+                    print(f"[warn] Could not checksum {e.filename}; re-downloading...")
             else:
                 print(f"[skip] {e.filename} (present, no checksum in manifest)")
                 continue
