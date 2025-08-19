@@ -10,7 +10,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.6.05"
+version = "0.6.06"
 description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [

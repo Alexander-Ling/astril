@@ -3,13 +3,12 @@
 # E. Antonio Chiocca Group, BWH
 # Description: Preprocessing utilities for MRI normalization, resampling, etc.
 
-import nibabel as nib
-import numpy as np
-import pandas as pd
+# Description: Preprocessing utilities for MRI normalization, resampling, etc.
+from __future__ import annotations
+
 import os
 import sys
 import argparse
-import SimpleITK as sitk
 import shutil
 import subprocess
 import re
@@ -21,43 +20,20 @@ import uuid
 import string
 import csv as _csv
 from datetime import datetime
-from nilearn.image import resample_to_img
 from pathlib import Path
-from scipy.ndimage import binary_fill_holes
-from scipy.ndimage import zoom
 from typing import List, Dict
-from .preprocessing_utils import (
-    apply_padding,
-    interpolate_to_voxel_dims,
-    update_origin_for_padding,
-    adjust_to_target_shape,
-    read_padding_record,
-    load_roi_mask,
-    ensure_hd_bet_installed,
-    classify_exam_series,
-    _first_dicom_in,
-    _safe_dcmread,
-    _get_attr,
-    _clean_lower,
-    _read_table,
-    _save_table,
-    _progress,
-    _normalize_patient_name,
-    _safe_int_like,
-    _propose_series_dirname,
-    _avoid_name_collision,
-    _files_identical
-)
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None # Optional progress bar (graceful fallback if not installed)
+
+# NOTE: Heavy dependencies (numpy, nibabel, SimpleITK, pandas, nilearn, scipy)
+# and astril.preprocessing_utils are now imported *inside* the functions that need them.
 
 # -----------------------------------------------------------------
 # Function to normalize an MRI image using only the masked region
 # -----------------------------------------------------------------
 
 def normalize_masked_image(input_image_path, mask_path, output_path=None):
+    # Lazy imports
+    import nibabel as nib
+    import numpy as np
     """
     Normalize an MRI volume using the provided mask.
     Voxels inside the mask are zero-mean, unit-variance normalized.
@@ -106,6 +82,18 @@ def normalize_masked_image(input_image_path, mask_path, output_path=None):
 def resize_mri(input_filepath, output_filepath, target_shape, target_voxel_dims, interp,
                save_padding_record=False, padding_record_path=None,
                roi_mask_path=None, translation_only=False):
+    # Lazy imports
+    import nibabel as nib
+    import numpy as np
+    # Utilities are imported lazily as well
+    from .preprocessing_utils import (
+        apply_padding,
+        interpolate_to_voxel_dims,
+        update_origin_for_padding,
+        adjust_to_target_shape,
+        read_padding_record,
+        load_roi_mask,
+    )
 
     if not os.path.exists(input_filepath):
         raise ValueError(f"[Error] Attempting to resize {input_filepath}, but file does not exist.")
@@ -259,6 +247,9 @@ def match_direction_matrices(input_path, donor_path, output_path):
         donor_path (str): Path to donor NIfTI image
         output_path (str): Path to save the matched image
     """
+    import nibabel as nib
+    from nilearn.image import resample_to_img
+
     donor_img = nib.load(donor_path)
     input_img = nib.load(input_path)
 
@@ -291,6 +282,10 @@ def merge_binary_masks(mask_paths, output_path, fill_holes=True, strict_affine=F
         fill_holes (bool): Whether to apply hole filling
         strict_affine (bool): If True, check that affines match exactly
     """
+    import nibabel as nib
+    import numpy as np
+    from scipy.ndimage import binary_fill_holes
+
     if len(mask_paths) < 2:
         raise ValueError("At least two mask files are required.")
 
@@ -349,6 +344,9 @@ def register_images(
         save_dummy_ref (bool): Whether to save a zeroed copy of the moving image as a deidentified, space-efficient way to keep a reference for later re-application or reversal of the transformation.
         verbose (bool): Whether to print metric score and status.
     """
+    import SimpleITK as sitk
+    import numpy as np
+
     fixed = sitk.ReadImage(fixed_path, sitk.sitkFloat32)
     moving = sitk.ReadImage(moving_path, sitk.sitkFloat32)
 
@@ -458,6 +456,9 @@ def inverse_transform_image(
         interpolation (str): One of 'linear' or 'nearest'.
         verbose (bool): Print actions and summary.
     """
+    import SimpleITK as sitk
+    import numpy as np
+
     original_img = sitk.ReadImage(original_image_path, sitk.sitkFloat32)
     transformed_img = sitk.ReadImage(transformed_image_path, sitk.sitkFloat32)
     transform = sitk.ReadTransform(transform_path)
@@ -493,6 +494,7 @@ def inverse_transform_image(
 # ---------------------------------------------------------------------------------------
 
 def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", device="cpu", tta=0, pp=1, overwrite_existing=0):
+    from .preprocessing_utils import ensure_hd_bet_installed
     ensure_hd_bet_installed()
 
     if not output_path and not mask_path:
@@ -544,6 +546,7 @@ def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", de
 # ---------------------------------------------------------------------------------------
 
 def perform_mri_math(args):
+    import numpy as np
     from .preprocessing_utils import load_nifti_data, save_nifti_data, validate_volume_shapes
 
     if args.applymask:
@@ -635,6 +638,7 @@ def apply_or_reverse_transforms(
         interp (int): Interpolation order (0=nearest, 1=linear).
     """
     assert mode in ["apply", "reverse"], "mode must be 'apply' or 'reverse'"
+    from .preprocessing_utils import read_padding_record
 
     base_dir = os.path.dirname(os.path.abspath(transform_record_path))
 
@@ -745,6 +749,8 @@ def summarize_exam_series(dicom_exam_dir, mr_subdir="MR", to_csv=None, verbose=F
     -------
     pandas.DataFrame
     """
+    from .preprocessing_utils import classify_exam_series
+
     df = classify_exam_series(dicom_exam_dir, mr_subdir=mr_subdir, verbose=verbose)
     if to_csv:
         # create parent dir if needed
@@ -776,6 +782,12 @@ def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,  
       - dicomPatientID (lowercased unique IDs from DICOM)
       - day0Date (blank unless prefilled from previous tables)
     """
+    import pandas as pd
+    from .preprocessing_utils import (
+        _first_dicom_in, _read_table, _save_table, _progress,
+        _safe_dcmread, _get_attr, _normalize_patient_name, _clean_lower,
+    )
+
     if previous_paths is None:
         previous_paths = []
     # which subfolders under each patient folder to search
@@ -786,10 +798,6 @@ def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,  
 
     # Gather top-level patient folders
     patient_folders = sorted([d.path for d in os.scandir(root_dir) if d.is_dir()])
-
-    # Inform user if tqdm is unavailable but progress was requested
-    if show_progress and tqdm is None:
-        print("[Info] tqdm not installed; proceeding without a progress bar. Run `pip install tqdm` to enable it.")
 
     # Top-level progress (per patient folder)
     for pf in _progress(patient_folders, total=len(patient_folders), desc="Scanning patients", unit="patient", enable=show_progress):
@@ -929,6 +937,22 @@ def demix_dicoms(
             "OR run explicitly in place (in_place=True)."
         )
     root_dir = os.path.abspath(root_dir)
+
+    # All utilities imported on demand
+    from .preprocessing_utils import (
+        _first_dicom_in,
+        _safe_dcmread,
+        _get_attr,
+        _read_table,
+        _save_table,
+        _progress,
+        _normalize_patient_name,
+        _safe_int_like,
+        _propose_series_dirname,
+        _avoid_name_collision,
+        _files_identical,
+    )
+
     # Prepare move log (we record only “misplaced” files; in dry_run these are planned moves)
     moved_rows: list[dict] = []
     if (out_dir and not dry_run) or (out_dir and not log_out):

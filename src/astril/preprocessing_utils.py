@@ -5,7 +5,10 @@ import nibabel as nib
 import shutil
 import os
 import warnings
-import pydicom
+try:
+    import pydicom
+except Exception:
+    pydicom = None
 import re
 import datetime as _dt
 import pandas as pd
@@ -17,7 +20,7 @@ from typing import Optional, Tuple, List
 try:
     from tqdm import tqdm
 except Exception:
-    tqdm = None # Optional progress bar (graceful fallback if not installed)
+    tqdm = None
 
 # -------- small helper for progress --------
 def _progress(iterable, total=None, desc=None, unit=None, enable=True):
@@ -1108,9 +1111,16 @@ def _first_dicom_in(folder: str) -> str | None:
         if _safe_dcmread(p) is not None:
             return p
     return None
+
 def _safe_dcmread(path: str):
+    # Lazy import ensures utils can load even if pydicom isn't installed
+    global pydicom
     if pydicom is None:
-        return None
+        try:
+            import pydicom as _p
+            pydicom = _p
+        except Exception:
+            return None
     try:
         return pydicom.dcmread(path, stop_before_pixels=True, force=True)
     except Exception:
@@ -1128,7 +1138,8 @@ def _clean_lower(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.lower()
 
-def _read_table(path: str) -> pd.DataFrame:
+def _read_table(path: str):
+    import pandas as pd
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         return pd.read_csv(path)
@@ -1138,7 +1149,8 @@ def _read_table(path: str) -> pd.DataFrame:
         return pd.read_excel(path)
     raise ValueError(f"Unsupported previousMetadata extension: {ext}")
 
-def _save_table(df: pd.DataFrame, out_path: str):
+def _save_table(df, out_path: str):
+    import pandas as pd
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     ext = os.path.splitext(out_path)[1].lower()
     if ext == ".csv":
@@ -1146,6 +1158,8 @@ def _save_table(df: pd.DataFrame, out_path: str):
     elif ext in (".tsv", ".txt"):
         df.to_csv(out_path, sep="\t", index=False)
     elif ext in (".xlsx", ".xls"):
+        # lazy import of engine
+        import xlsxwriter  # noqa: F401
         with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
             df.to_excel(xw, index=False, sheet_name="metadata")
     else:
