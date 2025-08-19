@@ -882,7 +882,15 @@ def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,  
 # ------------------------------------------------------------------------
 # demix_dicoms
 # ------------------------------------------------------------------------
-def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None = None, out_dir: str | None = None,  dry_run: bool = False) -> None:
+def demix_dicoms(
+    root_dir: str,
+    show_progress: bool = True,
+    log_out: str | None = None,
+    out_dir: str | None = None,
+    dry_run: bool = False,
+    n_workers: int | None = None,
+    in_place: bool = False,
+) -> None:
     """
     Ensure each leaf DICOM series folder contains files from only ONE scan.
 
@@ -910,7 +918,16 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
               (i.e., whose target subfolder name differs from their original leaf name).
     dry_run : if True, do NOT move/copy anything; still compute and write the demix log
               of what WOULD change (same “misplaced only” rule).
+    in_place : if True, allow moving files within {root_dir}. If False, you MUST
+               provide out_dir. This guard prevents accidental in-place reshuffles.
     """
+    # --- safety guard: require either out_dir or explicit in_place=True
+    if out_dir is None and not in_place:
+        raise ValueError(
+            "[demix_dicoms] Refusing to run without an explicit destination.\n"
+            "You must either specify an output directory (out_dir=...)\n"
+            "OR run explicitly in place (in_place=True)."
+        )
     root_dir = os.path.abspath(root_dir)
     # Prepare move log (we record only “misplaced” files; in dry_run these are planned moves)
     moved_rows: list[dict] = []
@@ -943,12 +960,16 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
     except Exception:
         pass
 
+    # Thread-safe logging
     _logged_rows = 0
+    import threading as _threading
+    _log_lock = _threading.Lock()
     def _stream_log_row(mr_rel: str, src: str, dst: str, s_uid, s_no, s_desc, s_proto):
         nonlocal _logged_rows
-        _log_writer.writerow([mr_rel, src, dst, s_uid or "", (s_no if s_no is not None else ""), s_desc or "", s_proto or ""])
-        _log_fh.flush()
-        _logged_rows += 1
+        with _log_lock:
+            _log_writer.writerow([mr_rel, src, dst, s_uid or "", (s_no if s_no is not None else ""), s_desc or "", s_proto or ""])
+            _log_fh.flush()
+            _logged_rows += 1
 
     # ------------- pass A: find leaf series folders and their MR parent -------------
     mr_parent_to_leaves: dict[str, list[str]] = {}
@@ -966,9 +987,23 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
     # ------------- pass B: for each MR parent, index all DICOM files & demix -------------
     parents = sorted(mr_parent_to_leaves.keys())
     total_moves = 0
-    total_parents = len(parents)
+    # Choose a default worker count tuned for I/O bound work (DICOM header reads + file copies)
+    if n_workers is None:
+        try:
+            import os as _os
+            _cpu = (_os.cpu_count() or 8)
+            n_workers = min(32, _cpu * 4)
+        except Exception:
+            n_workers = 8
+    else:
+        # Coerce to int if callers passed a string (e.g., via CLI)
+        try:
+            n_workers = int(n_workers)
+        except Exception:
+            n_workers = 8
 
-    for mr_parent in _progress(parents, total=total_parents, desc="Demixing MR folders", unit="MR", enable=show_progress):
+    # progress over MR parents
+    for mr_parent in _progress(parents, total=len(parents), desc="Demixing MR folders", unit="MR", enable=show_progress):
         leaves = sorted(mr_parent_to_leaves[mr_parent])
         if not leaves:
             continue
@@ -986,27 +1021,36 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
         if not all_dicoms:
             continue
 
-        # Build grouping key for each DICOM
-        entries = []  # (path, group_key, series_number, series_desc, proto_name, series_uid)
-        for p in all_dicoms:
-            ds = _safe_dcmread(p)
+        # Build grouping key for each DICOM (THREADED)
+        # each entry: (path, group_key, series_number, series_desc, proto_name, series_uid)
+        def _read_one(_p: str):
+            ds = _safe_dcmread(_p)
             if ds is None:
-                # keep file, use a coarse fallback key to avoid dropping it
-                entries.append((p, ("__UNKNOWN__", None, None, None), None, None, None, None))
-                continue
+                return (_p, ("__UNKNOWN__", None, None, None), None, None, None, None)
             series_uid  = _get_attr(ds, "SeriesInstanceUID") or None
             series_no   = _safe_int_like(_get_attr(ds, "SeriesNumber"))
             series_desc = _get_attr(ds, "SeriesDescription") or ""
             proto_name  = _get_attr(ds, "ProtocolName") or ""
-
             if series_uid:
-                key = ("UID", series_uid)  # strongest key
+                key = ("UID", series_uid)
             else:
                 key = ("FALLBACK",
                        series_no if series_no is not None else -1,
                        series_desc.strip().lower(),
                        proto_name.strip().lower())
-            entries.append((p, key, series_no, series_desc, proto_name, series_uid))
+            return (_p, key, series_no, series_desc, proto_name, series_uid)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        entries = []
+        with ThreadPoolExecutor(max_workers=n_workers) as _pool:
+            futures = [_pool.submit(_read_one, p) for p in all_dicoms]
+            for fut in as_completed(futures):
+                try:
+                    entries.append(fut.result())
+                except Exception as e:
+                    # fall back: keep the file in a coarse group to avoid dropping it
+                    # (won't happen often, but keeps logic robust)
+                    pass
 
         # Nothing to do if everything already lives in one group per leaf
         # (We still compute target paths below to be thorough across all leaves)
@@ -1103,7 +1147,8 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
                     k = 2
                     while True:
                         alt = f"{base}-{k}"
-                        target2 = os.path.join(mr_parent, alt)
+                        # IMPORTANT: create under target_parent (respects --outDir)
+                        target2 = os.path.join(target_parent, alt)
                         if alt not in used_basenames and not os.path.exists(target2):
                             target = target2
                             base = alt
@@ -1117,49 +1162,51 @@ def demix_dicoms(root_dir: str, show_progress: bool = True, log_out: str | None 
             for target in group_to_target.values():
                 os.makedirs(target, exist_ok=True)
 
-        # Transfer files to their target (move in-place; copy when out_dir is set)
-        for rec in _progress(entries, total=len(entries), desc=mr_rel, unit="file", enable=show_progress):
+        # Transfer files to their target (move in-place; copy when out_dir is set) — THREADED
+        _moves_lock = _threading.Lock()
+        def _xfer_one(rec):
+            nonlocal total_moves
             p, key, s_no, s_desc, s_proto, s_uid = rec
             tgt_dir = group_to_target[key]
             curr_dir = os.path.dirname(p)
-            # Determine if this file is "misplaced" (different subfolder name than target)
             changed_subdir = (os.path.basename(curr_dir) != os.path.basename(tgt_dir))
-
-            # If in-place mode AND already in correct dir, skip I/O; still no log entry (not misplaced)
+            # Already in correct dir (in-place mode): skip
             if out_dir is None and os.path.normpath(curr_dir) == os.path.normpath(tgt_dir):
-                continue
-            # Build destination path
+                return
             dst = os.path.join(tgt_dir, os.path.basename(p))
-            # SAFETY: if destination exists, verify identical before skipping
+            # If destination exists, verify identical or note conflict
             if os.path.exists(dst):
                 if _files_identical(p, dst):
                     print(f"[demix_dicoms][info] identical exists, skipping: {p} == {dst}")
-                    # Log only if it would have been “misplaced”; still no transfer.
                     if changed_subdir and dry_run:
                         _stream_log_row(mr_rel, p, dst, s_uid, s_no, s_desc, s_proto)
-                    continue
+                    return
                 else:
                     print(f"[demix_dicoms][WARN] conflict: destination exists with different content, skipping move: {p} -> {dst}")
-                    # Also reflect intended move in dry_run logs if it was misplaced
                     if changed_subdir and dry_run:
                         _stream_log_row(mr_rel, p, dst, s_uid, s_no, s_desc, s_proto)
-                    continue
-            # Log if “misplaced” (i.e. different subfolder) — both dry_run and real run
+                    return
+            # Log “misplaced” files (different subfolder name than target)
             if changed_subdir:
                 _stream_log_row(mr_rel, p, dst, s_uid, s_no, s_desc, s_proto)
-
-            # Execute transfer unless dry_run
             if dry_run:
-                continue
+                return
             try:
                 if out_dir is None:
-                    os.replace(p, dst)        # in-place demix → move
+                    os.replace(p, dst)
                 else:
                     import shutil
-                    shutil.copy2(p, dst)      # to out_dir → copy (preserve original)
-                total_moves += 1
+                    shutil.copy2(p, dst)
+                with _moves_lock:
+                    total_moves += 1
             except Exception as e:
                 print(f"[demix_dicoms][warn] failed to transfer {p} -> {dst}: {e}")
+
+        with ThreadPoolExecutor(max_workers=n_workers) as _pool2:
+            futures = [_pool2.submit(_xfer_one, rec) for rec in entries]
+            # wait for completion
+            for _ in as_completed(futures):
+                pass
 
         # Clean up any empty series folders left behind
         if out_dir is None and not dry_run:
@@ -1434,11 +1481,31 @@ def cli_demix_dicoms():
                          "If omitted, a default demix_log_{date}_{time}.csv is written under --dir")
     parser.add_argument("--outDir", default=None,
                         help="If provided, write a fully de-mixed COPY of --dir under this path "
-                         "(original tree left unchanged).")
+                         "(original tree left unchanged)."
+                         "If omitted, you MUST also pass --in_place to allow moving files within --dir.")
+    parser.add_argument("--n_workers", default=1, type=int,
+                        help="Number of CPU threads to use while reading DICOM metadata and moving files.")
     parser.add_argument("--dryRun", action="store_true",
                         help="Compute assignments and write the demix log, but do NOT move/copy any files.")
+    parser.add_argument("--in_place", action="store_true",
+                        help="Allow demixing IN PLACE within --dir (moves files). "
+                             "If not set, you must specify --outDir.")
     args = parser.parse_args(sys.argv[2:])
-    demix_dicoms(root_dir=args.dir, show_progress=args.show_progress,log_out=args.logOut,out_dir=args.outDir,dry_run=args.dryRun,)
+    if args.out_dir is None and not args.in_place:
+        raise ValueError(
+            "[demix_dicoms] Refusing to run without an explicit destination.\n"
+            "You must either specify an output directory (--outDir)\n"
+            "OR run explicitly in place (--in_place)."
+        )
+    demix_dicoms(
+        root_dir=args.dir,
+        show_progress=args.show_progress,
+        log_out=args.logOut,
+        out_dir=args.outDir,
+        n_workers=args.n_workers,
+        dry_run=args.dryRun,
+        in_place=args.in_place,
+    )
 
 if __name__ == "__main__":
     main()
