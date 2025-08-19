@@ -1491,7 +1491,7 @@ def cli_demix_dicoms():
                         help="Allow demixing IN PLACE within --dir (moves files). "
                              "If not set, you must specify --outDir.")
     args = parser.parse_args(sys.argv[2:])
-    if args.out_dir is None and not args.in_place:
+    if args.outDir is None and not args.in_place:
         raise ValueError(
             "[demix_dicoms] Refusing to run without an explicit destination.\n"
             "You must either specify an output directory (--outDir)\n"
