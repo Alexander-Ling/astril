@@ -900,6 +900,7 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
                 rows.append(row)
 
     df = pd.DataFrame(rows, columns=["Directory", "patientID", "patientName", "dicomPatientID", "day0Date"])
+    df["Directory"] = df["Directory"].astype(str)  # ensure merge key is string
 
     # Apply previous metadata rules
     prev_tables = [_read_table(p) for p in (previous_paths or []) if p]
@@ -923,8 +924,9 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
                     if col not in sub.columns:
                         sub[col] = ""
                 sub = sub[["Directory", "patientID", "day0Date"]]
+                sub = sub[["Directory", "patientID", "day0Date"]]
+                sub["Directory"] = sub["Directory"].astype(str)  # normalize dtype before indexing
                 lookup_list.append(sub.set_index("Directory"))
-            if lookup_list:
                 # Combined (ordered) lookup — first non-missing wins
                 combined = pd.concat(lookup_list, axis=1, join="outer", keys=range(len(lookup_list)))
                 # Flatten to first non-empty per column
@@ -934,6 +936,7 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
                 flat = combined[[ (0, "__first_nonempty_patientID"), (0, "__first_nonempty_day0Date") ]]
                 flat.columns = ["_prefill_patientID", "_prefill_day0Date"]
                 flat = flat.reset_index()  # Directory becomes a column
+                flat["Directory"] = flat["Directory"].astype(str)  # match df key dtype
                 df = df.merge(flat, on="Directory", how="left")
                 df["patientID"] = df["patientID"].mask(df["patientID"].eq("") & df["_prefill_patientID"].notna(), df["_prefill_patientID"].fillna(""))
                 df["day0Date"] = df["day0Date"].mask(df["day0Date"].eq("") & df["_prefill_day0Date"].notna(), df["_prefill_day0Date"].fillna(""))
@@ -1448,6 +1451,33 @@ def plan_dicom_to_nifti_conversion(
     meta["_day0"]     = meta["day0Date"].map(_parse_day0)
     meta = meta[(meta["Directory"].str.strip()!="") & (meta["patientID"].str.strip()!="") & meta["_day0"].notna()].reset_index(drop=True)
 
+    # --- sanity checks vs disk and metadata (warnings) ---
+    try:
+        disk_dirs = sorted([d.name for d in os.scandir(root_dir) if d.is_dir()])
+    except Exception:
+        disk_dirs = []
+    meta_dirs = sorted({s for s in meta["Directory"].astype(str).str.strip().tolist() if s})
+
+    # (a) Patients on disk that are NOT in the provided metadata sheet
+    missing_in_meta = [d for d in disk_dirs if d not in meta_dirs]
+    if missing_in_meta:
+        examples = ", ".join(missing_in_meta[:10])
+        print(
+            f"[plan_dicom_to_nifti_conversion][WARN] {len(missing_in_meta)} patient "
+            f"directories under root_dir have no row in patient_metadata 'Directory' "
+            f"(e.g., {examples}). These patients will be ignored."
+        )
+
+    # (b) Metadata rows whose Directory does NOT exist under root_dir
+    missing_on_disk = [d for d in meta_dirs if not os.path.isdir(os.path.join(root_dir, d))]
+    if missing_on_disk:
+        examples = ", ".join(missing_on_disk[:10])
+        print(
+            f"[plan_dicom_to_nifti_conversion][WARN] {len(missing_on_disk)} 'Directory' "
+            f"values in patient_metadata do not exist under root_dir (e.g., {examples}). "
+            f"These rows will be skipped."
+        )
+
     # ---------- phase 1: discover all exam directories (progress over patients) ----------
     patient_rows = meta.to_dict(orient="records")
     discovered: list[dict] = []
@@ -1555,7 +1585,7 @@ def plan_dicom_to_nifti_conversion(
         df2 = df.reindex(columns=HEADER)
         df2.to_csv(plan_fh, index=False, header=False, sep=delim, lineterminator="\n")
         # one blank row (per exam)
-        plan_fh.write(delim.join([""]*len(HEADER)) + "\n")
+        plan_fh.write(delim.join(["-"]*len(HEADER)) + "\n")
         plan_fh.flush()
 
     _open_stream(plan_out)
@@ -1641,7 +1671,7 @@ def plan_dicom_to_nifti_conversion(
         label_col = "final_label" if "final_label" in df.columns else ("base_type" if "base_type" in df.columns else None)
 
         # Eligibility masks affect selection ONLY (rows still appear in plan)
-        excluded_labels = {"unknown","localizer"}
+        excluded_labels = {"unknown", "unknown-derived","localizer"}
         eligible = pd.Series(True, index=df.index)
 
         # Exclude by label
@@ -1953,9 +1983,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--dir", required=True, help="Exam directory containing MR/ subfolder")
     p.add_argument("--mrSubdir", default="MR")
     p.add_argument("--to_csv")
-    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--quiet", action="store_true")
     def _run_summarize(a):
-        summarize_exam_series(a.dir, mr_subdir=a.mrSubdir, to_csv=a.to_csv, verbose=a.verbose)
+        summarize_exam_series(a.dir, mr_subdir=a.mrSubdir, to_csv=a.to_csv, verbose=not a.quiet)
     p.set_defaults(func=_run_summarize)
 
     # ---- create_patient_metadata

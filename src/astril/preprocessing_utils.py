@@ -1139,14 +1139,21 @@ def _clean_lower(s: str) -> str:
     return s.lower()
 
 def _read_table(path: str):
+    """
+    Robust reader that preserves string-ish identifiers (e.g., '00123') by
+    forcing string dtype on input. This avoids Pandas' numeric inference
+    from stripping leading zeros.
+    """
     import pandas as pd
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
     if ext in (".tsv", ".txt"):
-        return pd.read_csv(path, sep="\t")
+        return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
     if ext in (".xlsx", ".xls"):
-        return pd.read_excel(path)
+        # dtype=str keeps leading zeros (requires pandas>=1.5); fillna("") for parity with CSV branch
+        df = pd.read_excel(path, dtype=str)
+        return df.fillna("")
     raise ValueError(f"Unsupported previousMetadata extension: {ext}")
 
 def _save_table(df, out_path: str):
