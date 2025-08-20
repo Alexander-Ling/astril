@@ -19,13 +19,13 @@ A detailed description of the package and instructions for its use will be provi
 ---
 #### Format for radiology image inputs:
 astril is designed to perform image pre-processing and segmentation on NIFTI (.nii.gz) images. However, astril includes functionality to convert DICOM imaging datasets to NIFTI images and organize them into the folder structure expected by astril's processing functions.
-If starting from a set of DICOM images, they should be organized by patient, radiology type, study, and series as in the following example:
+If starting from a set of DICOM images, they should be organized by patient, exam, radiology type, and sequence as in the following example:
 ```
 DICOM_Library/
 ├── Patient1/ 					{Patient}
-│   ├── MR/ 					{Radiology Type}
-|	|	├── Study1/ 			{Study}
-|	|	|	├── T1n/ 			{Series}
+│   ├── Exam1/ 				    {Exam}
+|	|	├── MR/ 			    {Radiology Type}
+|	|	|	├── T1n/ 			{Sequence}
 |	|	|	|	├── 001.dcm
 |	|	|	|	├── 002.dcm
 |	|	|	|	├── ...
@@ -34,7 +34,9 @@ DICOM_Library/
 |	|	|	|	├── 146.dcm
 |	|	|	|	├── ...
 |	|	|	├── ...
-|	|	├── Study2/
+|	|	├── ...
+|	├── Exam2/
+|	|	├── MR/ 
 |	|	|	├── T1n/
 |	|	|	|	├── 001.dcm
 |	|	|	|	├── 002.dcm
@@ -44,12 +46,12 @@ DICOM_Library/
 │   ├── ...
 ├── ...
 ```
-If starting from a set of NIFTI images, they should be organized by patient, study, and series as in the following example:
+If starting from a set of NIFTI images, they should be organized by patient, exam, and sequence as in the following example:
 ```
 NIFTI_Library/
 ├── Patient1/ 					{Patient}
-|   ├── Study1/ 				{Study}
-|	|	├── T1c.nii.gz 			{Series}
+|   ├── Exam1/ 				    {Exam}
+|	|	├── T1n.nii.gz 			{Sequence}
 |	|	├── T1c.nii.gz 
 |	|	├── ...			
 |   ├── ...
@@ -59,8 +61,8 @@ NIFTI_Library/
 #### Pre-processing files from DICOM library
 1. (Optional) Ensure that all of the DICOM files for each series are properly separated into their respective directories. I have occasionally found that DICOM libraries can have misplaced dicom files such that a single series has been divided into multiple folder or dicom files from multiple series have been placed in the same folder. The following command will check that all dicom files are correctly separated. **Note: The .dcm files in your library must have meaningful SeriesInstanceUID or SeriesNumber, SeriesDescription, and ProtocolName metadata fields for this to work. If these fields have been stripped, this function will not work as intended and <span style="color: red;">could scramble your library.</span>**
 ```
-usage: preprocess.py [-h] --dir DIR [--no-progress] [--logOut LOGOUT] [--outDir OUTDIR]
-                     [--n_workers N_WORKERS] [--dryRun] [--in_place]
+Usage: py -m astril.preprocess demix_dicoms [-h] --dir DIR [--no-progress] [--logOut LOGOUT] [--outDir OUTDIR]
+                                            [--n_workers N_WORKERS] [--dryRun] [--in_place]
 
 Ensure each series folder contains only one scan; demix if needed.
 
@@ -81,21 +83,22 @@ options:
 ```
 2. Create a spreadsheet of patient-level metadata to help with organizing/deidentifying your dataset during NIFTI file conversion. A template patient metadata spreadsheet can be generated using the following function.
 ```
-astril.preprocess create_patient_metadata
+Usage: py -m astril.preprocess create_patient_metadata [-h] --dir DIR --metadataOut METADATAOUT [--previousMetadata [PREVIOUSMETADATA ...]] [--omitPrevious]
+                                                       [--subdirs SUBDIRS [SUBDIRS ...]] [--excludeEmpty]
+
+Create a patient metadata table for use in converting DICOM directories into nifti directories.
+
 options:
   -h, --help            show this help message and exit
   --dir DIR             Root directory with {Patient_folder}/.../MR/{series}
   --metadataOut METADATAOUT
                         Output path (.csv | .tsv | .xlsx)
   --previousMetadata [PREVIOUSMETADATA ...]
-                        Zero or more previous metadata tables (.csv|.tsv|.xlsx) to be used to help populate metadata or to omit patient folders that have been previously analysed.
+                        Zero or more previous metadata tables (.csv|.tsv|.xlsx)
   --omitPrevious        Omit rows whose Directory appears in previous metadata
   --subdirs SUBDIRS [SUBDIRS ...]
                         One or more subfolder names to search under each patient folder (default: MR). Example: --subdirs MR MR2
   --excludeEmpty        If set, exclude patient folders where no DICOM files were found under the chosen subfolders
-  
-Example Usage:
-py -m astril.preprocess create_patient_metadata --dir ./My_DICOM_Library/ --metadataOut ./Patient_Metadata.csv
 ```
 This will generate a metadata table with the following columns:
 - **Directory:** The immediate subdirectory of --dir to which the metadata in a given row pertains. Remember, each of these directories should contain scans for only a single patient.

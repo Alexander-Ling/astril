@@ -180,6 +180,7 @@ def reverse_resize_mri(input_filepath, output_filepath, padding_record_path, int
     import nibabel as nib
     import numpy as np
     from scipy.ndimage import zoom
+    from .preprocessing_utils import read_padding_record
 
     if not os.path.exists(padding_record_path):
         raise FileNotFoundError(f"Padding record not found: {padding_record_path}")
@@ -770,9 +771,7 @@ def summarize_exam_series(dicom_exam_dir, mr_subdir="MR", to_csv=None, verbose=F
 # ------------------------------------------------------------------------
 # create_patient_metadata
 # ------------------------------------------------------------------------
-def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,                              #Should consider adding multithread support to this in the future.
-                            omit_previous: bool = False, show_progress: bool = True,
-                            subdirs: list[str] | None = None, exclude_empty: bool = False) -> pd.DataFrame:
+def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previous=False, subdirs=None, exclude_empty=False, show_progress=True, n_workers=None):
     """
     Build a per-patient metadata table by scanning {root_dir}/{Patient_folder}/.../MR/{series}.
     Columns:
@@ -781,12 +780,18 @@ def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,  
       - patientName (lowercased unique names from DICOM)
       - dicomPatientID (lowercased unique IDs from DICOM)
       - day0Date (blank unless prefilled from previous tables)
+    Args:
+        n_workers (int | None): If >1, use a thread pool with this many workers to scan
+            patient folders concurrently. If None, choose a sensible default for I/O.
+            Use 1 to disable threading.
     """
     import pandas as pd
     from .preprocessing_utils import (
         _first_dicom_in, _read_table, _save_table, _progress,
         _safe_dcmread, _get_attr, _normalize_patient_name, _clean_lower,
     )
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import math
 
     if previous_paths is None:
         previous_paths = []
@@ -799,49 +804,100 @@ def create_patient_metadata(root_dir: str, out_path: str, previous_paths=None,  
     # Gather top-level patient folders
     patient_folders = sorted([d.path for d in os.scandir(root_dir) if d.is_dir()])
 
-    # Top-level progress (per patient folder)
-    for pf in _progress(patient_folders, total=len(patient_folders), desc="Scanning patients", unit="patient", enable=show_progress):
+    def _scan_one_patient(pf: str):
+        """Return a row dict for one patient folder, or None if skipped."""
         rel_dir = os.path.relpath(pf, root_dir)
-        names = set()
-        names_norm = set()
-        names_raw  = set()  # (kept only to improve normalization if ever needed)
-        ids = set()
+        names_norm: set[str] = set()
+        names_raw: set[str] = set()
+        ids: set[str] = set()
         found_any_dicom = False
 
-        # Walk to find any target subdir(s) (default 'MR'), then take immediate subfolders as series
-        for walk_root, dirnames, _ in os.walk(pf):
-            base = os.path.basename(walk_root)
-            if base not in subdir_set:
-                continue
-            series_dirs = sorted([os.path.join(walk_root, d) for d in dirnames if os.path.isdir(os.path.join(walk_root, d))])
-            for sdir in series_dirs:
-                dcm_path = _first_dicom_in(sdir)
-                if not dcm_path:
+        try:
+            # Walk to find any target subdir(s) (default 'MR'), then take immediate subfolders as series
+            for walk_root, dirnames, _ in os.walk(pf):
+                base = os.path.basename(walk_root)
+                if base not in subdir_set:
                     continue
-                found_any_dicom = True
-                ds = _safe_dcmread(dcm_path)
-                if ds is None:
-                    continue
-                # normalize name: keep apostrophes, replace all other punctuation with spaces, collapse spaces, lowercase
-                pname_raw = _get_attr(ds, "PatientName")
-                pname = _normalize_patient_name(pname_raw)
-                pid = _clean_lower(_get_attr(ds, "PatientID"))
-                if pname:      names_norm.add(pname)
-                if pname_raw:  names_raw.add(pname_raw)
-                if pid:
-                    ids.add(pid)
-        # optionally exclude patients with no DICOMs discovered under the chosen subdirs
+                series_dirs = sorted(
+                    os.path.join(walk_root, d)
+                    for d in dirnames
+                    if os.path.isdir(os.path.join(walk_root, d))
+                )
+                for sdir in series_dirs:
+                    dcm_path = _first_dicom_in(sdir)
+                    if not dcm_path:
+                        continue
+                    ds = _safe_dcmread(dcm_path)
+                    if ds is None:
+                        continue
+                    found_any_dicom = True
+                    # normalize name: keep apostrophes, replace punctuation, collapse spaces, lowercase
+                    pname_raw = _get_attr(ds, "PatientName")
+                    pname = _normalize_patient_name(pname_raw)
+                    pid = _clean_lower(_get_attr(ds, "PatientID"))
+                    if pname:
+                        names_norm.add(pname)
+                    if pname_raw:
+                        names_raw.add(pname_raw)
+                    if pid:
+                        ids.add(pid)
+        except Exception:
+            # Be robust to odd directories; skip with no crash
+            return None
+
         if exclude_empty and not found_any_dicom:
-            continue
+            return None
 
-
-        rows.append(dict(
+        return dict(
             Directory=rel_dir,
-            patientID="",  # user-assigned; prefilled from previous if provided
+            patientID="",
             patientName="; ".join(sorted(names_norm)) if names_norm else "",
             dicomPatientID="; ".join(sorted(ids)) if ids else "",
             day0Date="",
-        ))
+        )
+
+    use_threads = (n_workers is None) or (isinstance(n_workers, int) and n_workers != 1)
+    # Choose a sensible default if not provided; I/O-bound so more threads can help.
+    if n_workers in (None, 0):
+        try:
+            import os as _os
+            cpu = max(1, (_os.cpu_count() or 1))
+            n_workers = min(32, cpu * 4)
+        except Exception:
+            n_workers = 8
+
+    if use_threads and n_workers > 1:
+        # Threaded path: submit each patient folder
+        results = []
+        with ThreadPoolExecutor(max_workers=n_workers) as _pool:
+            futures = [_pool.submit(_scan_one_patient, pf) for pf in patient_folders]
+            for fut in _progress(
+                as_completed(futures),
+                total=len(futures),
+                desc="Scanning patients",
+                unit="patient",
+                enable=show_progress,
+            ):
+                try:
+                    row = fut.result()
+                    if row:
+                        results.append(row)
+                except Exception:
+                    # Ignore a failed folder; continue
+                    pass
+        rows.extend(results)
+    else:
+        # Sequential path (original behavior)
+        for pf in _progress(
+            patient_folders,
+            total=len(patient_folders),
+            desc="Scanning patients",
+            unit="patient",
+            enable=show_progress,
+        ):
+            row = _scan_one_patient(pf)
+            if row:
+                rows.append(row)
 
     df = pd.DataFrame(rows, columns=["Directory", "patientID", "patientName", "dicomPatientID", "day0Date"])
 
@@ -1253,283 +1309,739 @@ def demix_dicoms(
         print(f"[demix_dicoms] Completed. No files to {'copy' if out_dir else 'move'}{', dry run only' if dry_run else ''}.")
 
 
+# -------------------------------------------------------------
+# Function to plan conversion of DICOM library to NIFTI library
+# -------------------------------------------------------------
+
+def plan_dicom_to_nifti_conversion(
+    patient_metadata: str,
+    root_dir: str,
+    out_dir: str,
+    n_workers: int | None = None,
+    plan_out: str | None = None,
+    show_progress: bool = True,
+    previous_plans: list[str] | None = None,
+    ignore_previous: bool = False,
+    include_mr_subdirs: list[str] | None = None,
+    min_slices: int = 10,
+):
+    """
+    Plan DICOM->NIfTI conversion using existing series classification.
+
+    Inputs:
+      - patient_metadata: table from create_patient_metadata() (manually filled).
+        Must include Directory, patientID, day0Date. Rows missing any are skipped.
+      - root_dir: the DICOM library root; patient subfolders match 'Directory'.
+      - out_dir: the target NIfTI root.
+      - n_workers: thread count for I/O-bound work (default: min(32, cpu*4)).
+      - plan_out: path to write the plan (.csv/.tsv streamed; .xlsx at end).
+      - show_progress: show progress bars if tqdm is available.
+      - previous_plans: 0+ prior plan files; if provided we will either reuse
+        matching ExamDirectory rows from them (default) or skip them when
+        ignore_previous=True.
+      - ignore_previous: when True, discovered exams present in previous_plans
+        are skipped entirely; when False, rows for those exams are copied from
+        the previous plan(s) into the new plan without reprocessing.
+      - include_mr_subdirs: list[str] | None
+        If provided, only exams whose 'mr_subdir_name' (case-insensitive) is in this list
+        will be planned.
+      - min_slices: int
+        Minimum number of slices a sequence must have to be considered for selection.
+        (Rows remain in the plan; the threshold only affects 'selected_for_conversion'.)
+
+    Returns:
+      pandas.DataFrame with one row per discovered series, including:
+        Directory (patient folder), ExamDirectory (study folder), patientID, day0Date,
+        folder, series_number, acq_dt/acq_dt_iso, final_label/base_type, plane, n_slices,
+        confidence, timepoint_days, selected_for_conversion (bool), proposed_nifti_path.
+      Rows are grouped by ExamDirectory (blank line between exams).
+    """
+    import os, re, csv as _csv
+    from datetime import datetime, date
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from .preprocessing_utils import (
+        classify_exam_series,           # returns labeled per-series rows
+        _read_table, _save_table,       # robust I/O helpers
+        _progress,                      # optional tqdm wrapper
+    )
+
+    # ---------- helpers ----------
+    def _parse_day0(d) -> date | None:
+        if pd.isna(d): return None
+        s = str(d).strip()
+        if not s: return None
+        try: return pd.to_datetime(s, errors="coerce").date()
+        except Exception: return None
+
+    def _safe_int(x, default=None):
+        try: return int(x)
+        except Exception: return default
+
+    def _sanitize_label(lbl: str) -> str:
+        if lbl is None: return "Unknown"
+        s = str(lbl).strip()
+        s = s.replace("(", "_").replace(")", "_")
+        s = re.sub(r"[^\w\-\+\.]+", "_", s)
+        s = re.sub(r"__+", "_", s).strip("_")
+        return s or "Unknown"
+
+    def _discover_exams(patient_abs: str) -> list[tuple[str, str]]:
+        """Return de-duplicated (exam_dir_abs, mr_subdir_name) based on .dcm leaves."""
+        seen = set()
+        for curr, _dirs, files in os.walk(patient_abs):
+            if any(f.lower().endswith(".dcm") for f in files):
+                mr_dir = os.path.dirname(curr)
+                exam_dir = os.path.dirname(mr_dir)
+                mr_name = os.path.basename(mr_dir)
+                seen.add((os.path.normpath(exam_dir), mr_name))
+        return sorted(seen)
+
+    # Classifier columns (stable) + our metadata columns.
+    CLASSIFY_CORE = [
+        "folder","series_number","acq_dt","acq_dt_iso","manufacturer","modality",
+        "series_description","protocol_name","sequence_name","image_type",
+        "te","tr","ti","flip_angle","b_value","primary_secondary","is_fspgr",
+        "base_type","final_label","is_postcontrast","is_flair","reason","confidence",
+        "plane","matrix","voxel_mm","n_slices","mr_acq_type","pulse_sequence_name"
+    ]
+
+    # Put these side-by-side in the plan for easy viewing:
+    _VIEW_CLUSTER = [
+        "ExamDirectory","patientID","timepoint_days","series_identifier",
+        "final_label","plane","is_derived","matrix","voxel_mm","n_slices",
+        "selected_for_conversion","proposed_nifti_path",
+    ]
+
+    # Build the header: Directory first, then the cluster, then the rest (no dups)
+    _PREFIX = ["Directory"]
+    _SUFFIX = ["day0Date","mr_subdir_name"]  # keep but not inside the cluster
+
+    _all = _PREFIX + _VIEW_CLUSTER + _SUFFIX + CLASSIFY_CORE
+    seen = set()
+    HEADER = [c for c in _all if not (c in seen or seen.add(c))]
+
+    # ---------- setup ----------
+    root_dir = os.path.abspath(root_dir)
+    out_dir  = os.path.abspath(out_dir)
+
+    # threads tuned for I/O
+    if n_workers is None:
+        try:
+            n_workers = min(32, (os.cpu_count() or 8) * 4)
+        except Exception:
+            n_workers = 8
+    else:
+        n_workers = _safe_int(n_workers, default=8)
+
+    meta = _read_table(patient_metadata)
+    need_cols = {"Directory","patientID","day0Date"}
+    miss = need_cols - set(map(str, meta.columns))
+    if miss:
+        raise ValueError(f"patient_metadata is missing required columns: {sorted(miss)}")
+
+    # normalize and filter meta rows
+    meta = meta.copy()
+    meta["Directory"] = meta["Directory"].astype(str)
+    meta["patientID"] = meta["patientID"].astype(str)
+    meta["_day0"]     = meta["day0Date"].map(_parse_day0)
+    meta = meta[(meta["Directory"].str.strip()!="") & (meta["patientID"].str.strip()!="") & meta["_day0"].notna()].reset_index(drop=True)
+
+    # ---------- phase 1: discover all exam directories (progress over patients) ----------
+    patient_rows = meta.to_dict(orient="records")
+    discovered: list[dict] = []
+
+    def _discover_one(row):
+        patient_rel = row["Directory"]
+        patient_abs = os.path.join(root_dir, patient_rel)
+        if not os.path.isdir(patient_abs):
+            return []
+        out = []
+        for exam_abs, mr_name in _discover_exams(patient_abs):
+            exam_rel = os.path.relpath(exam_abs, root_dir)
+            out.append({
+                "Directory": patient_rel,
+                "ExamDirectory": exam_rel,
+                "patientID": row["patientID"],
+                "day0Date": row["day0Date"],
+                "_day0": row["_day0"],
+                "mr_subdir_name": mr_name,
+                "exam_abs": exam_abs,
+            })
+        return out
+
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_discover_one, r) for r in patient_rows]
+            for fut in _progress(as_completed(futures), total=len(futures), desc="Discovering exams", unit="patient", enable=show_progress):
+                try:
+                    discovered.extend(fut.result())
+                except Exception:
+                    pass
+    else:
+        for r in _progress(patient_rows, total=len(patient_rows), desc="Discovering exams", unit="patient", enable=show_progress):
+            discovered.extend(_discover_one(r))
+
+    # Deduplicate exams
+    key = lambda d: (d["ExamDirectory"], d["mr_subdir_name"])
+    # keep first occurrence
+    dedup = {}
+    for rec in discovered:
+        dedup.setdefault(key(rec), rec)
+    exams = list(dedup.values())
+
+    # Optional MR-subdir filter (case-insensitive)
+    if include_mr_subdirs:
+        want = {s.lower().strip() for s in include_mr_subdirs if s}
+        exams = [rec for rec in exams if str(rec.get("mr_subdir_name","")).lower().strip() in want]
+
+    # ---------- previous plan handling ----------
+    prev_tables = []
+    prev_exam_keys = set()
+    if previous_plans:
+        for p in previous_plans:
+            try:
+                t = _read_table(p)
+                if "ExamDirectory" in t.columns:
+                    prev_tables.append(t)
+                    prev_exam_keys.update((str(ed), str(ms) if "mr_subdir_name" in t.columns else None)
+                                          for ed, ms in zip(t["ExamDirectory"].astype(str),
+                                                            t.get("mr_subdir_name", pd.Series([None]*len(t))).astype(str)))
+            except Exception:
+                pass
+        # convert to tuple set: (ExamDirectory, mr_subdir_name) — mr_subdir_name may be "None"
+        norm_prev = set()
+        for ed, ms in prev_exam_keys:
+            norm_prev.add((ed, None if ms == "None" else ms))
+        prev_exam_keys = norm_prev
+
+    # Partition: to_skip / to_process
+    exams_to_process = []
+    exams_to_reuse   = []
+    for rec in exams:
+        k = (rec["ExamDirectory"], rec["mr_subdir_name"])
+        if previous_plans and k in prev_exam_keys:
+            if ignore_previous:
+                continue
+            else:
+                exams_to_reuse.append(k)
+                continue
+        exams_to_process.append(rec)
+
+    # ---------- streaming writer (CSV/TSV only) ----------
+    wrote_header = False
+    plan_fh = None
+    delim = ","
+    ext = None
+    def _open_stream(path):
+        nonlocal plan_fh, delim, ext, wrote_header
+        if path is None:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".csv",".tsv"):
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            plan_fh = open(path, "w", newline="", encoding="utf-8")
+            delim = "\t" if ext == ".tsv" else ","
+            writer = _csv.writer(plan_fh, delimiter=delim)
+            writer.writerow(HEADER)
+            plan_fh.flush()
+            wrote_header = True
+
+    def _stream_block(df: pd.DataFrame):
+        if plan_fh is None:
+            return
+        # enforce header order; fill missing cols with ""
+        df2 = df.reindex(columns=HEADER)
+        df2.to_csv(plan_fh, index=False, header=False, sep=delim, lineterminator="\n")
+        # one blank row (per exam)
+        plan_fh.write(delim.join([""]*len(HEADER)) + "\n")
+        plan_fh.flush()
+
+    _open_stream(plan_out)
+
+    # If reusing previous plans, stream those rows first (without recomputing)
+    all_results = []
+    if exams_to_reuse and prev_tables:
+        prev_tables = [t for t in prev_tables if t is not None and not t.empty]
+        prev_all = pd.concat(prev_tables, axis=0, ignore_index=True) if prev_tables else pd.DataFrame(columns=HEADER)
+        # normalize string types to avoid dtype drift
+        for col in ("Directory","ExamDirectory","patientID","day0Date","mr_subdir_name"):
+            if col in prev_all.columns:
+                prev_all[col] = prev_all[col].astype(str)
+        # write per exam group (keep blank line per exam)
+        for k in _progress(sorted(set(exams_to_reuse)), total=len(set(exams_to_reuse)),
+                           desc="Copying from previous plans", unit="exam", enable=show_progress):
+            ed, ms = k
+            sub = prev_all[(prev_all.get("ExamDirectory","") == ed) &
+                           ((prev_all.get("mr_subdir_name") == ms) | (~prev_all.columns.isin(["mr_subdir_name"]).any()))]
+            if sub.empty:
+                continue
+            # enforce header & stream
+            _stream_block(sub)
+            all_results.append(sub)
+
+    # ---------- phase 2: process exams (progress over exams) ----------
+    def _process_exam(rec) -> pd.DataFrame:
+        import pandas as _pd
+        exam_abs = rec["exam_abs"]
+        pid      = rec["patientID"]
+        day0     = rec["_day0"]
+        mr_name  = rec["mr_subdir_name"]
+        exam_rel = rec["ExamDirectory"]
+
+        try:
+            df = classify_exam_series(exam_abs, mr_subdir=mr_name, verbose=False)
+        except Exception as e:
+            return _pd.DataFrame([{
+                "Directory": rec["Directory"], "ExamDirectory": exam_rel, "patientID": pid,
+                "day0Date": rec["day0Date"], "mr_subdir_name": mr_name,
+                "error": f"classify_exam_series failed: {e}",
+            }])
+
+        if df is None or df.empty:
+            return _pd.DataFrame()
+
+        df = df.copy()
+        df["Directory"]       = rec["Directory"]
+        df["ExamDirectory"]   = exam_rel
+        df["patientID"]       = pid
+        df["day0Date"]        = rec["day0Date"]
+        df["mr_subdir_name"]  = mr_name
+        df["series_identifier"] = df["folder"].map(lambda p: os.path.basename(str(p)) if pd.notna(p) else "")
+
+        # timepoint (int days from acq_dt to day0)
+        def _tp(acq):
+            if pd.isna(acq): return None
+            try:
+                acqd = acq.date() if hasattr(acq, "date") else pd.to_datetime(acq).date()
+                return int((acqd - day0).days)
+            except Exception:
+                return None
+        df["timepoint_days"] = df["acq_dt"].map(_tp)
+
+        # pick best per type within this exam
+        def _select_best(group: _pd.DataFrame) -> int | None:
+            g = group.copy()
+            if "primary_secondary" in g.columns:
+                pri = g["primary_secondary"].fillna("").str.upper().eq("PRIMARY")
+                if pri.any(): g = g[pri]
+            if "is_derived" in g.columns and (~g["is_derived"].astype(bool)).any():
+                g = g[~g["is_derived"].astype(bool)]
+            if "plane" in g.columns:
+                ax = g["plane"].fillna("").str.upper().str.startswith("AX")
+                if ax.any(): g = g[ax]
+            g = g.assign(
+                _ns=g.get("n_slices", _pd.Series(index=g.index, dtype="float")).fillna(-1).astype(float),
+                _conf=g.get("confidence", _pd.Series(index=g.index, dtype="float")).fillna(0.0).astype(float),
+                _acq=g.get("acq_dt", _pd.Series(index=g.index)).map(lambda x: _pd.to_datetime(x) if pd.notna(x) else pd.NaT),
+            ).sort_values(by=["_ns","_conf","_acq"], ascending=[False, False, True])
+            return None if g.empty else int(g.index[0])
+
+        label_col = "final_label" if "final_label" in df.columns else ("base_type" if "base_type" in df.columns else None)
+
+        # Eligibility masks affect selection ONLY (rows still appear in plan)
+        excluded_labels = {"unknown","localizer"}
+        eligible = pd.Series(True, index=df.index)
+
+        # Exclude by label
+        if "final_label" in df.columns:
+            eligible &= ~df["final_label"].fillna("").str.strip().str.lower().isin(excluded_labels)
+        elif label_col:
+            eligible &= ~df[label_col].fillna("").str.strip().str.lower().isin(excluded_labels)
+
+        # Exclude by min slices (default 10)
+        if "n_slices" in df.columns:
+            eligible &= df["n_slices"].fillna(-1).astype(float) >= float(min_slices)
+
+        df["selected_for_conversion"] = False
+
+        def _select_best(group: _pd.DataFrame) -> int | None:
+            g = group.copy()
+            # keep only eligible rows within this label group
+            g = g[eligible.loc[g.index]]
+
+            if g.empty:
+                return None
+
+            # prefer PRIMARY & not derived → AX plane → max slices → max confidence → earliest acq_dt
+            if "primary_secondary" in g.columns:
+                pri = g["primary_secondary"].fillna("").str.upper().eq("PRIMARY")
+                if pri.any():
+                    g = g[pri]
+            if "is_derived" in g.columns and (~g["is_derived"].astype(bool)).any():
+                g = g[~g["is_derived"].astype(bool)]
+            if "plane" in g.columns:
+                ax = g["plane"].fillna("").str.upper().str.startswith("AX")
+                if ax.any():
+                    g = g[ax]
+
+            g = g.assign(
+                _ns=g.get("n_slices", _pd.Series(index=g.index, dtype="float")).fillna(-1).astype(float),
+                _conf=g.get("confidence", _pd.Series(index=g.index, dtype="float")).fillna(0.0).astype(float),
+                _acq=g.get("acq_dt", _pd.Series(index=g.index)).map(lambda x: _pd.to_datetime(x) if pd.notna(x) else pd.NaT),
+            ).sort_values(by=["_ns","_conf","_acq"], ascending=[False, False, True])
+
+            return None if g.empty else int(g.index[0])
+
+        if label_col:
+            chosen = []
+            for lbl, g in df.groupby(df[label_col]):
+                idx = _select_best(g)
+                if idx is not None:
+                    chosen.append(idx)
+            if chosen:
+                df.loc[chosen, "selected_for_conversion"] = True
+
+        # proposed nifti paths (only for selected)
+        def _proposed_path(r):
+            if not bool(r.get("selected_for_conversion", False)):
+                return ""
+            tp = r.get("timepoint_days", None)
+            tp_str = f"d{tp}" if tp is not None else "dNA"
+            lbl = _sanitize_label(r.get(label_col, "Unknown"))
+            sid = r.get("series_identifier", "")
+            subdir = f"{pid}_{tp_str}_{sid}" if sid else f"{pid}_{tp_str}"
+            fname  = f"{pid}_{tp_str}_{lbl}.nii.gz"
+            return os.path.join(out_dir, pid, subdir, fname)
+
+        df["proposed_nifti_path"] = df.apply(_proposed_path, axis=1)
+
+        # sort within exam and return
+        sort_cols = [c for c in ["series_number","acq_dt"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, kind="mergesort", na_position="last")
+        return df
+
+    # Process all new exams
+    results = []
+    if exams_to_process:
+        if n_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [pool.submit(_process_exam, r) for r in exams_to_process]
+                for fut in _progress(as_completed(futures), total=len(futures), desc="Processing exams", unit="exam", enable=show_progress):
+                    try:
+                        df = fut.result()
+                        if df is not None and not df.empty:
+                            results.append(df)
+                            _stream_block(df)  # stream per-exam block + blank line
+                    except Exception:
+                        pass
+        else:
+            for r in _progress(exams_to_process, total=len(exams_to_process), desc="Processing exams", unit="exam", enable=show_progress):
+                df = _process_exam(r)
+                if df is not None and not df.empty:
+                    results.append(df)
+                    _stream_block(df)
+
+    # Combine everything for return value — normalize to HEADER first and
+    # exclude empty AND all-NA frames to avoid pandas concat FutureWarning.
+    normalized = []
+    for df in (all_results + results):
+        if df is None or df.empty:
+            continue
+        df2 = df.reindex(columns=HEADER)
+        # if *every* cell is NA, skip (prevents the deprecation warning)
+        if not df2.notna().to_numpy().any():
+            continue
+        normalized.append(df2)
+
+    out_df = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame(columns=HEADER)
+
+    # If we couldn’t stream (e.g., .xlsx), write once at end with exam separators
+    if plan_out and (plan_fh is None):
+        # order: per exam by series_number then acq_dt
+        sort_cols = [c for c in ["ExamDirectory","series_number","acq_dt"] if c in out_df.columns]
+        out_df = out_df.sort_values(sort_cols, kind="mergesort", na_position="last").reset_index(drop=True)
+
+        # blank line between ExamDirectory groups
+        def _with_sep(df):
+            if "ExamDirectory" not in df.columns:
+                return df
+            blocks = []
+            for _, g in df.groupby("ExamDirectory", sort=False, dropna=False):
+                blocks.append(g)
+                blocks.append(pd.DataFrame([{c: "" for c in df.columns}]))
+            return pd.concat(blocks, ignore_index=True)
+        _save_table(_with_sep(out_df), plan_out)
+
+    # close stream if open
+    try:
+        if plan_fh is not None:
+            plan_fh.close()
+    except Exception:
+        pass
+
+    return out_df
+
+
+
+
+
+
 # ------------------------------------------------------------------------
 # CLI entry point
 # ------------------------------------------------------------------------
 
-def main():
+def _build_cli_parser() -> "argparse.ArgumentParser":
     parser = argparse.ArgumentParser(
-        description="MRI Preprocessing Tools",
-        usage=(
-            "python -m astril.preprocessing_functions <command> [<args>]\n\n"
-            "Available commands:\n"
-            "  normalize                Normalize an MRI volume using a mask\n"
-            "  resize                   Resize an MRI volume to target dimensions and voxel spacing\n"
-            "  reverse_resize           Reverse a resize operation using padding record\n"
-            "  match_affine             Match affine direction matrix of input to donor image\n"
-            "  merge_masks              Merge 2+ binary masks (logical OR, optional fill holes)\n"
-            "  register                 Register an MRI volume to match the position/spacing of a reference volume\n"
-            "  inverse_transform        Apply inverse of a transform to return image to original space\n"
-            "  skullstrip               Perform skullstripping on a T1c, T1n, T2f, or T2w volume using hd-bet\n"
-            "  math                     Perform arithmetic or masking operations on MRI volumes\n"
-            "  transform_pipeline       Apply or reverse full transform pipeline using saved record\n"
-            "  summarize_exam_series    Infer scan types from DICOM series metadata in MR/ folders\n"
-            "  create_patient_metadata  Create patient metadata table from multi-patient DICOM directory\n"
-            "  demix_dicoms             Looks through a directory to ensure no subdirectories contain .dcm files from more than one scan\n"
-        )
+        prog="python -m astril.preprocess",
+        description="MRI Preprocessing Tools (subcommand-style CLI)",
     )
-    parser.add_argument("command", help="Subcommand to run (e.g., normalize)")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    args = parser.parse_args(sys.argv[1:2])
-    if not hasattr(sys.modules[__name__], f"cli_{args.command}"):
-        print(f"Unknown command: {args.command}")
+    # ---- normalize
+    p = sub.add_parser("normalize", help="Normalize an MRI volume using a binary mask.")
+    p.add_argument("--input", required=True)
+    p.add_argument("--mask", required=True)
+    p.add_argument("--output", required=True)
+    def _run_normalize(a):
+        normalize_masked_image(a.input, a.mask, a.output)
+    p.set_defaults(func=_run_normalize)
+
+    # ---- resize
+    p = sub.add_parser("resize", help="Resize MRI scan to target shape and voxel dims.")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--data_dims", default="240,240,155", help="e.g., 240,240,155")
+    p.add_argument("--voxel_dims", default="1.0,1.0,1.0", help="e.g., 1.0,1.0,1.0")
+    p.add_argument("--interp", type=int, default=1)
+    p.add_argument("--save_padding_record", action="store_true")
+    p.add_argument("--padding_record")
+    p.add_argument("--roimask")
+    p.add_argument("--translation_only", action="store_true")
+    def _run_resize(a):
+        resize_mri(
+            input_filepath=a.input,
+            output_filepath=a.output,
+            target_shape=tuple(map(int, a.data_dims.split(","))),
+            target_voxel_dims=tuple(map(float, a.voxel_dims.split(","))),
+            interp=a.interp,
+            save_padding_record=a.save_padding_record,
+            padding_record_path=a.padding_record,
+            roi_mask_path=a.roimask,
+            translation_only=a.translation_only,
+        )
+    p.set_defaults(func=_run_resize)
+
+    # ---- reverse_resize
+    p = sub.add_parser("reverse_resize", help="Reverse a previous resize using a saved padding record.")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--padding_record", required=True)
+    p.add_argument("--interp", type=int, default=1)
+    def _run_reverse(a):
+        reverse_resize_mri(a.input, a.output, a.padding_record, interp=a.interp)
+    p.set_defaults(func=_run_reverse)
+
+    # ---- match_affine
+    p = sub.add_parser("match_affine", help="Match affine of INPUT to DONOR image.")
+    p.add_argument("--input", required=True)
+    p.add_argument("--donor", required=True)
+    p.add_argument("--output", required=True)
+    def _run_match(a):
+        match_direction_matrices(a.input, a.donor, a.output)
+    p.set_defaults(func=_run_match)
+
+    # ---- merge_masks
+    p = sub.add_parser("merge_masks", help="Merge 2 binary masks into one.")
+    p.add_argument("--masks", nargs="+", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--no_fill", action="store_true")
+    p.add_argument("--strict_affine", action="store_true")
+    def _run_merge(a):
+        merge_binary_masks(a.masks, a.output, fill_holes=not a.no_fill, strict_affine=a.strict_affine)
+    p.set_defaults(func=_run_merge)
+
+    # ---- register
+    p = sub.add_parser("register", help="Register or apply transform to align moving->fixed.")
+    p.add_argument("--fixed", required=True)
+    p.add_argument("--moving", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--transform")
+    p.add_argument("--apply_only", action="store_true")
+    p.add_argument("--type", default="rigid", choices=["rigid", "affine", "translation"])
+    p.add_argument("--metric", default="correlation", choices=["correlation", "mi"])
+    p.add_argument("--use_gpu", action="store_true")
+    p.add_argument("--save_dummy_ref", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    def _run_register(a):
+        register_images(
+            fixed_path=a.fixed, moving_path=a.moving, output_path=a.output,
+            transform_path=a.transform, apply_only=a.apply_only,
+            registration_type=a.type, similarity_metric=a.metric,
+            use_gpu=a.use_gpu, save_dummy_ref=a.save_dummy_ref, verbose=not a.quiet,
+        )
+    p.set_defaults(func=_run_register)
+
+    # ---- inverse_transform
+    p = sub.add_parser("inverse_transform", help="Apply inverse of a saved transform.")
+    p.add_argument("--original", required=True, help="Original (pre-registered) image")
+    p.add_argument("--transformed", required=True, help="Already transformed image")
+    p.add_argument("--transform", required=True, help="Transform .tfm")
+    p.add_argument("--output", required=True)
+    p.add_argument("--interp", default="linear", choices=["linear", "nearest"])
+    p.add_argument("--quiet", action="store_true")
+    def _run_inverse(a):
+        inverse_transform_image(
+            original_image_path=a.original,
+            transformed_image_path=a.transformed,
+            transform_path=a.transform,
+            output_path=a.output,
+            interpolation=a.interp,
+            verbose=not a.quiet,
+        )
+    p.set_defaults(func=_run_inverse)
+
+    # ---- skullstrip (hd-bet)
+    p = sub.add_parser("skullstrip", help="Run HD-BET skullstripping.")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", help="Optional output (bet) image")
+    p.add_argument("--mask", help="Optional output mask")
+    p.add_argument("--mode", default="accurate")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--tta", type=int, default=0)
+    p.add_argument("--pp", type=int, default=1)
+    p.add_argument("--overwrite_existing", type=int, default=0)
+    def _run_hd_bet_cli(a):
+        run_hd_bet(
+            input_path=a.input,
+            output_path=a.output,
+            mask_path=a.mask,
+            mode=a.mode,
+            device=a.device,
+            tta=a.tta,
+            pp=a.pp,
+            overwrite_existing=a.overwrite_existing,
+        )
+    p.set_defaults(func=_run_hd_bet_cli)
+
+    # ---- math
+    p = sub.add_parser("math", help="Arithmetic / masking on MRI volumes.")
+    # Keep the flexible interface used by perform_mri_math()
+    p.add_argument("--applymask", action="store_true")
+    p.add_argument("--input")
+    p.add_argument("--mask")
+    p.add_argument("--average", nargs="*")
+    p.add_argument("--operation")
+    p.add_argument("--inputs", nargs="*")
+    p.add_argument("--output")
+    def _run_math(a):
+        # Reuse the existing, flexible argument contract
+        perform_mri_math(a)
+    p.set_defaults(func=_run_math)
+
+    # ---- transform_pipeline
+    p = sub.add_parser("transform_pipeline", help="Apply or reverse a transform pipeline (json).")
+    p.add_argument("--input", required=True)
+    p.add_argument("--record", required=True, help="transform_record.json")
+    p.add_argument("--output", required=True)
+    p.add_argument("--mode", default="apply", choices=["apply", "reverse"])
+    p.add_argument("--interp", type=int, default=1)
+    def _run_pipeline(a):
+        apply_or_reverse_transforms(
+            input_path=a.input,
+            transform_record_path=a.record,
+            output_path=a.output,
+            mode=a.mode,
+            interp=a.interp,
+        )
+    p.set_defaults(func=_run_pipeline)
+
+    # ---- summarize_exam_series
+    p = sub.add_parser("summarize_exam_series", help="Infer scan types from an exam's MR/ series.")
+    p.add_argument("--dir", required=True, help="Exam directory containing MR/ subfolder")
+    p.add_argument("--mrSubdir", default="MR")
+    p.add_argument("--to_csv")
+    p.add_argument("--verbose", action="store_true")
+    def _run_summarize(a):
+        summarize_exam_series(a.dir, mr_subdir=a.mrSubdir, to_csv=a.to_csv, verbose=a.verbose)
+    p.set_defaults(func=_run_summarize)
+
+    # ---- create_patient_metadata
+    p = sub.add_parser("create_patient_metadata", help="Scan multi-patient DICOM dir to build a metadata table.")
+    p.add_argument("--dir", required=True, help="Root directory with {Patient}/.../MR/{series}")
+    p.add_argument("--metadataOut", required=True, help="Output table (.csv|.tsv|.xlsx)")
+    p.add_argument("--previousMetadata", nargs="*", default=[], help="Zero or more prior tables to prefill from")
+    p.add_argument("--omitPrevious", action="store_true", help="Omit rows already present in previous tables")
+    p.add_argument("--subdirs", nargs="+", default=["MR"], help="Subfolder names to search under each patient folder")
+    p.add_argument("--excludeEmpty", action="store_true", help="Drop patient folders with no DICOM series found")
+    p.add_argument("--n_workers", type=int, default=None, help="Threads for scanning (I/O bound). Set 1 to disable.")
+    def _run_cpm(a):
+        create_patient_metadata(
+            root_dir=a.dir,
+            out_path=a.metadataOut,
+            previous_paths=a.previousMetadata,
+            omit_previous=a.omitPrevious,
+            subdirs=a.subdirs,
+            exclude_empty=a.excludeEmpty,
+            n_workers=a.n_workers,
+        )
+    p.set_defaults(func=_run_cpm)
+
+    # ---- demix_dicoms
+    p = sub.add_parser("demix_dicoms", help="Ensure each series folder contains files from only one scan.")
+    p.add_argument("--dir", required=True, help="Root directory containing patient/exam/MR folders")
+    p.add_argument("--outDir", default=None, help="Write a fully de-mixed COPY of --dir under this path")
+    p.add_argument("--logOut", default=None, help="Optional path for move log (.csv|.tsv)")
+    p.add_argument("--n_workers", type=int, default=12, help="Threads for header reads/transfers (I/O bound)")
+    p.add_argument("--dryRun", action="store_true", help="Plan demix and write log, but do not move/copy files")
+    p.add_argument("--in_place", action="store_true", help="Allow in-place moves inside --dir (no --outDir)")
+    p.add_argument("--noProgress", action="store_true", help="Disable progress bar")
+    def _run_demix(a):
+        demix_dicoms(
+            root_dir=a.dir,
+            out_dir=a.outDir,
+            log_out=a.logOut,
+            n_workers=a.n_workers,
+            dry_run=a.dryRun,
+            in_place=a.in_place,
+            show_progress=not a.noProgress,
+        )
+    p.set_defaults(func=_run_demix)
+
+    # ---- plan_dicom_to_nifti_conversion (NEW)
+    p = sub.add_parser("plan_dicom_to_nifti_conversion", help="Plan which DICOM series to convert and propose NIfTI names.")
+    p.add_argument("--patientMetadata", required=True, help="Table from create_patient_metadata() (filled in)")
+    p.add_argument("--dir", required=True, help="Root DICOM directory; must contain subfolders in 'Directory' column")
+    p.add_argument("--outDir", required=True, help="Planned destination root for converted files")
+    p.add_argument("--planOut", required=True, help="Where to write the plan (.csv|.tsv|.xlsx). .csv|.tsv files will be streamed; .xlsx files will only write after function is complete.")
+    p.add_argument("--n_workers", type=int, default=None, help="Threads per exam (I/O bound)")
+    p.add_argument("--noProgress", action="store_true", help="Disable progress bar")
+    p.add_argument("--previousPlan", nargs="*", default=None,
+                    help="0+ previous plan files to reuse/skip exam directories from.")
+    p.add_argument("--ignorePrevious", action="store_true",
+                    help="Skip exams already present in previous plan files (instead of reusing their rows).")
+    p.add_argument("--mrSubdirs", nargs="*", default=None,
+                    help="Only include these MR subfolder names (case-insensitive).")
+    p.add_argument("--minSlices", type=int, default=10,
+                    help="Minimum slices required to consider a sequence for selection.")
+    def _run_plan(a):
+        plan_dicom_to_nifti_conversion(
+            patient_metadata=a.patientMetadata,
+            root_dir=a.dir,
+            out_dir=a.outDir,
+            plan_out=a.planOut,
+            n_workers=a.n_workers,
+            show_progress=not a.noProgress,
+            previous_plans=getattr(a, "previousPlan", None),
+            ignore_previous=getattr(a, "ignorePrevious", False),
+            include_mr_subdirs=getattr(a, "mrSubdirs", None),
+            min_slices=getattr(a, "minSlices", 10),
+        )
+    p.set_defaults(func=_run_plan)
+
+    return parser
+
+
+def main():
+    parser = _build_cli_parser()
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
         parser.print_help()
         sys.exit(1)
-
-    # Call the appropriate CLI handler
-    getattr(sys.modules[__name__], f"cli_{args.command}")()
-
-
-def cli_normalize():
-    parser = argparse.ArgumentParser(description="Normalize an MRI volume using a binary mask.")
-    parser.add_argument("--input", required=True, help="Path to input NIfTI image")
-    parser.add_argument("--mask", required=True, help="Path to binary brain mask")
-    parser.add_argument("--output", required=True, help="Path to save the normalized image")
-
-    args = parser.parse_args(sys.argv[2:])
-    normalize_masked_image(args.input, args.mask, args.output)
-    #print(f"Normalized image saved to: {args.output}")
-
-def cli_resize():
-    parser = argparse.ArgumentParser(description="Resize MRI scan to target shape and voxel dims.")
-    parser.add_argument("--input", required=True, help="Input NIfTI image")
-    parser.add_argument("--output", required=True, help="Output NIfTI path")
-    parser.add_argument("--data_dims", default="240,240,155", help="Target data dimensions (e.g., 240,240,155)")
-    parser.add_argument("--voxel_dims", default="1.0,1.0,1.0", help="Target voxel dims (e.g., 1.0,1.0,1.0)")
-    parser.add_argument("--interp", type=int, default=1, help="Interpolation order (0=nearest, 1=linear, etc.)")
-    parser.add_argument("--save_padding_record", action="store_true", help="Save padding record")
-    parser.add_argument("--padding_record", help="Use saved padding record instead of recalculating")
-    parser.add_argument("--roimask", help="ROI mask for centering (ignored if padding_record is used)")
-    parser.add_argument("--translation_only", action="store_true", help="Only center without resampling")
-
-    args = parser.parse_args(sys.argv[2:])
-    resize_mri(
-        input_filepath=args.input,
-        output_filepath=args.output,
-        target_shape=tuple(map(int, args.data_dims.split(','))),
-        target_voxel_dims=tuple(map(float, args.voxel_dims.split(','))),
-        interp=args.interp,
-        save_padding_record=args.save_padding_record,
-        padding_record_path=args.padding_record,
-        roi_mask_path=args.roimask,
-        translation_only=args.translation_only
-    )
-    #print(f"Resized image saved to: {args.output}")
-
-def cli_reverse_resize():
-    parser = argparse.ArgumentParser(description="Reverse resize using a saved padding record.")
-    parser.add_argument("--input", required=True, help="Path to the resized input image (.nii.gz)")
-    parser.add_argument("--output", required=True, help="Path to save the reversed (original) image")
-    parser.add_argument("--padding_record", required=True, help="Path to the saved padding record file (.txt)")
-    parser.add_argument("--interp", type=int, default=1, help="Interpolation order (0=nearest, 1=linear, etc.)")
-
-    args = parser.parse_args(sys.argv[2:])
-    reverse_resize_mri(
-        input_filepath=args.input,
-        output_filepath=args.output,
-        padding_record_path=args.padding_record,
-        interp=args.interp
-    )
-
-def cli_match_affine():
-    parser = argparse.ArgumentParser(description="Match direction matrix (affine) of input image to donor image.")
-    parser.add_argument("--input", required=True, help="Path to input NIfTI image to be resampled")
-    parser.add_argument("--donor", required=True, help="Path to donor NIfTI image (defines target affine/orientation)")
-    parser.add_argument("--output", required=True, help="Path to save output image")
-
-    args = parser.parse_args(sys.argv[2:])
-    match_direction_matrices(args.input, args.donor, args.output)
-    #print(f"Affine-matched image saved to: {args.output}")
-
-def cli_merge_masks():
-    parser = argparse.ArgumentParser(description="Merge 2+ binary brain masks into a single mask (logical OR).")
-    parser.add_argument("--masks", nargs='+', required=True, help="Paths to input NIfTI mask files")
-    parser.add_argument("--output", required=True, help="Output file path (.nii.gz)")
-    parser.add_argument("--no_fill", action="store_true", help="Disable hole filling")
-    parser.add_argument("--strict_affine", action="store_true", help="Require affines to match exactly")
-
-    args = parser.parse_args(sys.argv[2:])
-    merge_binary_masks(
-        mask_paths=args.masks,
-        output_path=args.output,
-        fill_holes=not args.no_fill,
-        strict_affine=args.strict_affine
-    )
-    #print(f"Merged mask saved to: {args.output}")
-
-def cli_register():
-    parser = argparse.ArgumentParser(description="Register or transform MRI using SimpleITK.")
-    parser.add_argument("--fixed", required=True, help="Path to fixed (reference) image")
-    parser.add_argument("--moving", required=True, help="Path to moving image")
-    parser.add_argument("--output", required=True, help="Path to save output registered image")
-    parser.add_argument("--transform", help="Path to save or load transform (.tfm)")
-    parser.add_argument("--apply_only", action="store_true", help="Apply existing transform only")
-    parser.add_argument("--type", default="rigid", choices=["rigid", "affine", "translation"], help="Registration type (rigid, affine, translation)")
-    parser.add_argument("--metric", default="correlation", choices=["correlation", "mi"], help="Similarity metric: correlation or mutual information")
-    parser.add_argument("--use_gpu", action="store_true", help="Use GPU-style random sampling if available")
-    parser.add_argument("--save_dummy_ref", action="store_true", help="Save a blanked copy of the moving image to establish original spacing, etc. if you ever want to reverse the registration.")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
-
-    args = parser.parse_args(sys.argv[2:])
-    register_images(
-        fixed_path=args.fixed,
-        moving_path=args.moving,
-        output_path=args.output,
-        transform_path=args.transform,
-        apply_only=args.apply_only,
-        registration_type=args.type,
-        similarity_metric=args.metric,
-        use_gpu=args.use_gpu,
-        save_dummy_ref=args.save_dummy_ref,
-        verbose=not args.quiet
-    )
-
-def cli_inverse_transform():
-    parser = argparse.ArgumentParser(description="Apply inverse of saved transform to restore image to original space.")
-    parser.add_argument("--original", required=True, help="Original (pre-registered) image to restore spacing/grid")
-    parser.add_argument("--transformed", required=True, help="Registered/transformed image to be inverse-transformed")
-    parser.add_argument("--transform", required=True, help="Path to transform file (.tfm) to invert")
-    parser.add_argument("--output", required=True, help="Output path for inverse-transformed image")
-    parser.add_argument("--interp", default="linear", choices=["linear", "nearest"], help="Interpolation method")
-    parser.add_argument("--quiet", action="store_true", help="Suppress output")
-
-    args = parser.parse_args(sys.argv[2:])
-    inverse_transform_image(
-        original_image_path=args.original,
-        transformed_image_path=args.transformed,
-        transform_path=args.transform,
-        output_path=args.output,
-        interpolation=args.interp,
-        verbose=not args.quiet
-    )
-
-def cli_skullstrip():
-    parser = argparse.ArgumentParser(description="Run HD-BET skull stripping.")
-    parser.add_argument("--input", required=True, help="Path to the input image (NIfTI)")
-    parser.add_argument("--output", required=False, help="Path to save the stripped brain image")
-    parser.add_argument("--mask", required=False, help="Path to save the brain mask image")
-    parser.add_argument("--mode", default="accurate", choices=["accurate", "fast"], help="HD-BET mode")
-    parser.add_argument("--device", default="cpu", help="Device: integer (GPU ID), 'cpu', or 'mps'")
-    parser.add_argument("--tta", default=0, type=int, help="Test-time augmentation (1=True, 0=False)")
-    parser.add_argument("--pp", default=1, type=int, help="Postprocessing (1=True, 0=False)")
-    parser.add_argument("--overwrite_existing", default=0, type=int, help="Allow overwrite of output files")
-    
-    args = parser.parse_args(sys.argv[2:])
-    run_hd_bet(
-        input_path=args.input,
-        output_path=args.output,
-        mask_path=args.mask,
-        mode=args.mode,
-        device=args.device,
-        tta=args.tta,
-        pp=args.pp,
-        overwrite_existing=args.overwrite_existing,
-    )
-
-def cli_math():
-    parser = argparse.ArgumentParser(description="MRI volume math: expressions, masks, averages")
-
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--operation",
-        help=(
-            "Math expression using variables A, B, C, etc. for inputs. "
-            "Supports +, -, *, /, **, (), where(), log(), log10(), exp()."
-        )
-    )
-    group.add_argument("--applymask", action="store_true", help="Apply a binary mask to an image")
-    group.add_argument("--average", nargs='+', help="Average multiple volumes")
-
-    parser.add_argument("--inputs", nargs='+', help="Input NIfTI volumes in A, B, C, etc. order (used with --operation)")
-    parser.add_argument("--input", help="Input image (used with --applymask)")
-    parser.add_argument("--mask", help="Mask image (used with --applymask)")
-    parser.add_argument("--output", required=True, help="Output file path")
-
-    args = parser.parse_args(sys.argv[2:])
-    perform_mri_math(args)
-
-def cli_transform_pipeline():
-    parser = argparse.ArgumentParser(description="Apply or reverse transform pipeline using transform record JSON.")
-    parser.add_argument("--input", required=True, help="Input image (e.g. transformed or original scan)")
-    parser.add_argument("--record", required=True, help="Path to transform record JSON file")
-    parser.add_argument("--output", required=True, help="Path to output image")
-    parser.add_argument("--mode", choices=["apply", "reverse"], default="apply", help="Apply or reverse transform pipeline")
-    parser.add_argument("--interp", type=int, default=1, help="Interpolation order for resizing (default=1)")
-
-    args = parser.parse_args(sys.argv[2:])
-    apply_or_reverse_transforms(
-        input_path=args.input,
-        transform_record_path=args.record,
-        output_path=args.output,
-        mode=args.mode,
-        interp=args.interp
-    )
-
-def cli_summarize_exam_series():
-    parser = argparse.ArgumentParser(description="Identify scan types in DICOM directory using metadata and naming.")
-    parser.add_argument("--dicom_dir", required=True, help="Path to top-level DICOM directory (should contain 'MR/' subdirectory)")
-    parser.add_argument("--to_csv", help="Path to save CSV of results")
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose reasoning output")
-    args = parser.parse_args(sys.argv[2:])
-    df = summarize_exam_series(dicom_exam_dir=args.dicom_dir, to_csv=args.to_csv, verbose=not args.quiet)
-
-def cli_create_patient_metadata():
-    parser = argparse.ArgumentParser(description="Create a patient metadata table for use in converting DICOM directories into nifti directories.")
-    parser.add_argument("--dir", required=True, help="Root directory with {Patient_folder}/.../MR/{series}")
-    parser.add_argument("--metadataOut", required=True, help="Output path (.csv | .tsv | .xlsx)")
-    parser.add_argument("--previousMetadata", nargs="*", default=[], help="Zero or more previous metadata tables (.csv|.tsv|.xlsx)")
-    parser.add_argument("--omitPrevious", action="store_true", help="Omit rows whose Directory appears in previous metadata")
-    parser.add_argument("--subdirs", nargs="+", default=["MR"],
-                    help="One or more subfolder names to search under each patient folder (default: MR). Example: --subdirs MR MR2")
-    parser.add_argument("--excludeEmpty", action="store_true",
-                    help="If set, exclude patient folders where no DICOM files were found under the chosen subfolders")
-    args = parser.parse_args(sys.argv[2:])
-    create_patient_metadata(root_dir=args.dir, out_path=args.metadataOut, previous_paths=args.previousMetadata, omit_previous=args.omitPrevious, subdirs=args.subdirs, exclude_empty=args.excludeEmpty,)
-
-def cli_demix_dicoms():
-    parser = argparse.ArgumentParser(description="Ensure each series folder contains only one scan; demix if needed.")
-    parser.add_argument("--dir", required=True, help="Root directory containing patient/exam/MR folders")
-    parser.add_argument("--no-progress", dest="show_progress", action="store_false", help="Disable progress bar")
-    parser.add_argument("--logOut", default=None,
-                    help="Optional path for the move log (.csv | .tsv). "
-                         "If omitted, a default demix_log_{date}_{time}.csv is written under --dir")
-    parser.add_argument("--outDir", default=None,
-                        help="If provided, write a fully de-mixed COPY of --dir under this path "
-                         "(original tree left unchanged)."
-                         "If omitted, you MUST also pass --in_place to allow moving files within --dir.")
-    parser.add_argument("--n_workers", default=1, type=int,
-                        help="Number of CPU threads to use while reading DICOM metadata and moving files.")
-    parser.add_argument("--dryRun", action="store_true",
-                        help="Compute assignments and write the demix log, but do NOT move/copy any files.")
-    parser.add_argument("--in_place", action="store_true",
-                        help="Allow demixing IN PLACE within --dir (moves files). "
-                             "If not set, you must specify --outDir.")
-    args = parser.parse_args(sys.argv[2:])
-    if args.outDir is None and not args.in_place:
-        raise ValueError(
-            "[demix_dicoms] Refusing to run without an explicit destination.\n"
-            "You must either specify an output directory (--outDir)\n"
-            "OR run explicitly in place (--in_place)."
-        )
-    demix_dicoms(
-        root_dir=args.dir,
-        show_progress=args.show_progress,
-        log_out=args.logOut,
-        out_dir=args.outDir,
-        n_workers=args.n_workers,
-        dry_run=args.dryRun,
-        in_place=args.in_place,
-    )
+    # Dispatch
+    return args.func(args)
 
 if __name__ == "__main__":
     main()

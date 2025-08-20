@@ -932,7 +932,7 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         # --- FLAIR ---
         elif "flair" in t:
             base = "T2f"
-            label = "T2-FLAIR"
+            label = "T2f"
             is_flair = True
             is_derived = _compute_is_derived(t, imgtypes, None)  # usually False
             reason.append("FLAIR in name")
