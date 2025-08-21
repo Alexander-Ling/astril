@@ -131,6 +131,7 @@ def ensure_dicom2nifti_installed():
             "    pip install dicom2nifti"
         )
 
+
 # ------------------------------------------------------------------------
 # Helper functions for DICOM file classification
 # ------------------------------------------------------------------------

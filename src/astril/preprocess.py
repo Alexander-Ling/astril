@@ -1327,6 +1327,7 @@ def plan_dicom_to_nifti_conversion(
     ignore_previous: bool = False,
     include_mr_subdirs: list[str] | None = None,
     min_slices: int = 10,
+    use_actual_exam_ids: bool = False,
 ):
     """
     Plan DICOM->NIfTI conversion using existing series classification.
@@ -1351,13 +1352,14 @@ def plan_dicom_to_nifti_conversion(
       - min_slices: int
         Minimum number of slices a sequence must have to be considered for selection.
         (Rows remain in the plan; the threshold only affects 'selected_for_conversion'.)
+      - use_actual_exam_ids: boolean to indicate if actual exam IDs should be used instead of unique random ones.
 
     Returns:
       pandas.DataFrame with one row per discovered series, including:
-        Directory (patient folder), ExamDirectory (study folder), patientID, day0Date,
-        folder, series_number, acq_dt/acq_dt_iso, final_label/base_type, plane, n_slices,
-        confidence, timepoint_days, selected_for_conversion (bool), proposed_nifti_path.
-      Rows are grouped by ExamDirectory (blank line between exams).
+        Directory (patient folder), ExamDirectory (study folder), ExamAlias (8-char A–Z/0–9, unique),
+        patientID, day0Date, folder, series_number, acq_dt/acq_dt_iso, final_label/base_type,
+        plane, n_slices, confidence, timepoint_days, selected_for_conversion (bool),
+        proposed_nifti_path. Rows are grouped by ExamDirectory (blank line "-" between exams).
     """
     import os, re, csv as _csv
     from datetime import datetime, date
@@ -1412,7 +1414,7 @@ def plan_dicom_to_nifti_conversion(
 
     # Put these side-by-side in the plan for easy viewing:
     _VIEW_CLUSTER = [
-        "ExamDirectory","patientID","timepoint_days","series_identifier",
+        "ExamDirectory","ExamAlias","patientID","timepoint_days","series_identifier",
         "final_label","plane","is_derived","matrix","voxel_mm","n_slices",
         "selected_for_conversion","proposed_nifti_path",
     ]
@@ -1529,6 +1531,7 @@ def plan_dicom_to_nifti_conversion(
     # ---------- previous plan handling ----------
     prev_tables = []
     prev_exam_keys = set()
+    used_aliases = set()
     if previous_plans:
         for p in previous_plans:
             try:
@@ -1538,6 +1541,11 @@ def plan_dicom_to_nifti_conversion(
                     prev_exam_keys.update((str(ed), str(ms) if "mr_subdir_name" in t.columns else None)
                                           for ed, ms in zip(t["ExamDirectory"].astype(str),
                                                             t.get("mr_subdir_name", pd.Series([None]*len(t))).astype(str)))
+                if "ExamAlias" in t.columns:
+                    used_aliases.update(
+                        s for s in t["ExamAlias"].astype(str).fillna("")
+                        if s.strip() not in ("", "-")
+                    )
             except Exception:
                 pass
         # convert to tuple set: (ExamDirectory, mr_subdir_name) — mr_subdir_name may be "None"
@@ -1558,6 +1566,32 @@ def plan_dicom_to_nifti_conversion(
                 exams_to_reuse.append(k)
                 continue
         exams_to_process.append(rec)
+
+    # Generate unique 8-char alphanumeric ExamAlias for exams we're processing now
+    import secrets, string
+    ALPHABET = string.ascii_uppercase + string.digits
+
+    def _new_alias() -> str:
+        while True:
+            s = "".join(secrets.choice(ALPHABET) for _ in range(8))
+            if s not in used_aliases:
+                used_aliases.add(s)
+                return s
+
+    alias_map: dict[tuple[str, str | None], str] = {}
+    for rec in exams_to_process:
+        k = (rec["ExamDirectory"], rec["mr_subdir_name"])
+        if use_actual_exam_ids:
+            base = os.path.basename(rec["ExamDirectory"])  # terminal dir name
+            alias = base
+            i = 2
+            while alias in used_aliases:
+                alias = f"{base}_{i}"
+                i += 1
+            used_aliases.add(alias)
+            alias_map[k] = alias
+        else:
+            alias_map[k] = _new_alias()
 
     # ---------- streaming writer (CSV/TSV only) ----------
     wrote_header = False
@@ -1635,6 +1669,7 @@ def plan_dicom_to_nifti_conversion(
         df = df.copy()
         df["Directory"]       = rec["Directory"]
         df["ExamDirectory"]   = exam_rel
+        df["ExamAlias"]       = alias_map.get((exam_rel, mr_name), None)
         df["patientID"]       = pid
         df["day0Date"]        = rec["day0Date"]
         df["mr_subdir_name"]  = mr_name
@@ -1730,8 +1765,8 @@ def plan_dicom_to_nifti_conversion(
             tp = r.get("timepoint_days", None)
             tp_str = f"d{tp}" if tp is not None else "dNA"
             lbl = _sanitize_label(r.get(label_col, "Unknown"))
-            sid = r.get("series_identifier", "")
-            subdir = f"{pid}_{tp_str}_{sid}" if sid else f"{pid}_{tp_str}"
+            ea = r.get("ExamAlias", None)
+            subdir = f"{pid}_{tp_str}_{ea}" if ea else f"{pid}_{tp_str}"
             fname  = f"{pid}_{tp_str}_{lbl}.nii.gz"
             return os.path.join(out_dir, pid, subdir, fname)
 
@@ -1804,7 +1839,191 @@ def plan_dicom_to_nifti_conversion(
 
     return out_df
 
+# ------------------------------------------------------------
+# Convert a single DICOM series to NIFTI
+# ------------------------------------------------------------
 
+def convert_dicom_to_nifti(
+    dicom_series_dir: str,
+    output_path: str,
+    reorient: bool = True,
+    compress: bool = True,
+) -> str:
+    """
+    Convert a single DICOM series directory to NIfTI using dicom2nifti.
+
+    Parameters
+    ----------
+    dicom_series_dir : str
+        Path to a directory containing a single series of DICOM files.
+    output_path : str
+        Destination NIfTI path (.nii or .nii.gz). Parent directories will be created.
+    reorient : bool
+        If True, reorient to standard (dicom2nifti's default).
+    compress : bool
+        If True, create .nii.gz; else create .nii.
+
+    Returns
+    -------
+    str
+        The path written to (same as output_path).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the series directory is missing.
+    RuntimeError
+        If dicom2nifti did not produce a NIfTI.
+    """
+    from .preprocessing_utils import ensure_dicom2nifti_installed
+    ensure_dicom2nifti_installed()
+    from pathlib import Path
+    import tempfile
+    import dicom2nifti
+
+    series = Path(dicom_series_dir)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not series.exists():
+        raise FileNotFoundError(f"Series directory not found: {series}")
+
+    # Run conversion into a temp folder, then move the first produced file to desired name.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dicom2nifti.convert_directory(
+            str(series),
+            tmpdir,
+            reorient=reorient,
+            compression=compress,
+        )
+        candidates = sorted(Path(tmpdir).glob("*.nii*"))  # .nii or .nii.gz
+        if not candidates:
+            raise RuntimeError(f"No NIfTI produced from {series}")
+        candidates[0].replace(out)
+    return str(out)
+
+
+# ------------------------------------------------------------
+# Execute DICOM -> NIfTI conversions from a saved plan
+# ------------------------------------------------------------
+def convert_dicom_plan(
+    plan_path: str,
+    n_workers: int | None = None,
+    overwrite: bool = False,
+    reorient: bool = True,
+    compress: bool = True,
+    log_out: str | None = None,
+    show_progress: bool = True,
+):
+    """Read a plan produced by `plan_dicom_to_nifti_conversion` and run conversions
+    for rows with a non-empty, non-"-" `proposed_nifti_path`.
+
+    Returns a DataFrame log with per-row status.
+    """
+    import os
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from .preprocessing_utils import (
+        _read_table, _save_table, _progress,
+    )
+
+    plan = _read_table(plan_path)
+    required = {"folder", "proposed_nifti_path"}
+    missing = required - set(map(str, plan.columns))
+    if missing:
+        raise ValueError(f"Plan is missing required columns: {sorted(missing)}")
+
+    def _valid_path(val) -> bool:
+        if val is None:
+            return False
+        s = str(val).strip()
+        return bool(s) and s != "-"
+
+    todo = plan[plan["proposed_nifti_path"].map(_valid_path)].copy()
+    if todo.empty:
+        cols = ["Directory","ExamDirectory","series_identifier","final_label",
+                "folder","proposed_nifti_path","status","message","nii_path"]
+        return pd.DataFrame(columns=cols)
+
+    if n_workers is None:
+        try:
+            n_workers = min(8, max(1, os.cpu_count() or 2))
+        except Exception:
+            n_workers = 4
+
+    def _convert_row(row: pd.Series) -> dict:
+        series_dir = str(row.get("folder", ""))
+        out_path = str(row.get("proposed_nifti_path", "")).strip()
+        rec = {
+            "Directory": row.get("Directory", ""),
+            "ExamDirectory": row.get("ExamDirectory", ""),
+            "series_identifier": row.get("series_identifier", ""),
+            "final_label": row.get("final_label", ""),
+            "folder": series_dir,
+            "proposed_nifti_path": out_path,
+            "status": None,
+            "message": "",
+            "nii_path": "",
+        }
+        if not series_dir or not os.path.isdir(series_dir):
+            rec["status"] = "missing_series_folder"
+            rec["message"] = f"Series folder not found: {series_dir}"
+            return rec
+
+        # Skip if exists and not overwriting
+        if os.path.isfile(out_path) and not overwrite:
+            rec["status"] = "exists"
+            rec["nii_path"] = out_path
+            return rec
+
+        # Remove old file if overwriting
+        if overwrite:
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+
+        try:
+            written = convert_dicom_to_nifti(
+                dicom_series_dir=series_dir,
+                output_path=out_path,
+                reorient=reorient,
+                compress=compress,
+            )
+            rec["status"] = "ok"
+            rec["nii_path"] = written
+        except Exception as e:
+            rec["status"] = "failed"
+            rec["message"] = f"{type(e).__name__}: {e}"
+        return rec
+
+    jobs = [r for _, r in todo.iterrows()]
+    records = []
+    if n_workers == 1:
+        for r in _progress(jobs, total=len(jobs), desc="Converting", unit="series", enable=show_progress):
+            records.append(_convert_row(r))
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_convert_row, r) for r in jobs]
+            for ft in _progress(as_completed(futs), total=len(futs), desc="Converting", unit="series", enable=show_progress):
+                try:
+                    records.append(ft.result())
+                except Exception as e:
+                    records.append({"status":"exception","message":f"Future failed: {e}"})
+
+    log_df = pd.DataFrame.from_records(records)
+    if log_out:
+        _save_table(log_df, log_out)
+
+    try:
+        counts = log_df["status"].value_counts(dropna=False).to_dict()
+        print("[convert_dicom_plan] status counts:", counts)
+    except Exception:
+        pass
+
+    return log_df
 
 
 
@@ -2030,7 +2249,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
         )
     p.set_defaults(func=_run_demix)
 
-    # ---- plan_dicom_to_nifti_conversion (NEW)
+    # ---- plan_dicom_to_nifti_conversion
     p = sub.add_parser("plan_dicom_to_nifti_conversion", help="Plan which DICOM series to convert and propose NIfTI names.")
     p.add_argument("--patientMetadata", required=True, help="Table from create_patient_metadata() (filled in)")
     p.add_argument("--dir", required=True, help="Root DICOM directory; must contain subfolders in 'Directory' column")
@@ -2046,6 +2265,11 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
                     help="Only include these MR subfolder names (case-insensitive).")
     p.add_argument("--minSlices", type=int, default=10,
                     help="Minimum slices required to consider a sequence for selection.")
+    p.add_argument(
+        "--use_actual_exam_ids",
+        action="store_true",
+        help="Use the terminal ExamDirectory folder name as ExamAlias (may contain PHI) instead of a random 8-char alias."
+    )
     def _run_plan(a):
         plan_dicom_to_nifti_conversion(
             patient_metadata=a.patientMetadata,
@@ -2058,8 +2282,46 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             ignore_previous=getattr(a, "ignorePrevious", False),
             include_mr_subdirs=getattr(a, "mrSubdirs", None),
             min_slices=getattr(a, "minSlices", 10),
+            use_actual_exam_ids=getattr(a, "use_actual_exam_ids", False),
         )
     p.set_defaults(func=_run_plan)
+
+    # ---- convert_dicom_to_nifti (single series)
+    p = sub.add_parser("convert_dicom_to_nifti", help="Convert one DICOM series directory to NIfTI (dicom2nifti).")
+    p.add_argument("--dicom_dir", required=True, help="Directory containing one DICOM series")
+    p.add_argument("--output_path", required=True, help="Output NIfTI path (.nii or .nii.gz)")
+    p.add_argument("--no_reorient", action="store_true", help="Disable reorientation to standard space")
+    p.add_argument("--no_compress", action="store_true", help="Write .nii instead of .nii.gz")
+    def _run_c2n(a):
+        convert_dicom_to_nifti(
+            dicom_series_dir=a.dicom_dir,
+            output_path=a.output_path,
+            reorient=not a.no_reorient,
+            compress=not a.no_compress,
+        )
+        print(f"Saved: {a.output_path}")
+    p.set_defaults(func=_run_c2n)
+
+    # ---- convert_dicom_plan (batch from plan file)
+    p = sub.add_parser("convert_dicom_plan", help="Run DICOM->NIfTI conversions from a saved plan (dicom2nifti).")
+    p.add_argument("--plan", required=True, help="Path to plan CSV/TSV/XLSX from plan_dicom_to_nifti_conversion.")
+    p.add_argument("--n_workers", type=int, default=None, help="Parallel workers (I/O-bound).")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing output NIfTI if present.")
+    p.add_argument("--no_reorient", action="store_true", help="Disable reorientation to standard space.")
+    p.add_argument("--no_compress", action="store_true", help="Write .nii instead of .nii.gz.")
+    p.add_argument("--logOut", default=None, help="Optional CSV/TSV/XLSX log path for results.")
+    def _run_convert(a):
+        convert_dicom_plan(
+            plan_path=a.plan,
+            n_workers=a.n_workers,
+            overwrite=a.overwrite,
+            reorient=(not a.no_reorient),
+            compress=(not a.no_compress),
+            log_out=a.logOut,
+            show_progress=True,
+        )
+    p.set_defaults(func=_run_convert)
+
 
     return parser
 
