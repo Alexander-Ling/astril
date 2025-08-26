@@ -1,4 +1,6 @@
 ﻿
+![astril/astril metro map](images/astril_metro_map_animation.svg)
+
 # astril: Automated Segmentation Toolkit for Radiology Image Libraries
 ### Authors:
 - Alexander Ling (alexander.l.ling@gmail.com; alling@bwh.harvard.edu)
