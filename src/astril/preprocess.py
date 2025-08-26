@@ -2230,7 +2230,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
 
     # ---- demix_dicoms
     p = sub.add_parser("demix_dicoms", help="Ensure each series folder contains files from only one scan.")
-    p.add_argument("--dir", required=True, help="Root directory containing patient/exam/MR folders")
+    p.add_argument("--dir", required=True, help="Root directory containing patient/exam/MR folders with DICOM (.dcm) files.")
     p.add_argument("--outDir", default=None, help="Write a fully de-mixed COPY of --dir under this path")
     p.add_argument("--logOut", default=None, help="Optional path for move log (.csv|.tsv)")
     p.add_argument("--n_workers", type=int, default=12, help="Threads for header reads/transfers (I/O bound)")
