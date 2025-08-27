@@ -142,8 +142,8 @@ NIFTI_Library/
                             Use the terminal ExamDirectory folder name as ExamAlias (may contain PHI) instead of a random 8-char alias.
     ```
     This will generate a table which lists all of the scan series present in --dir along with the patient, timepoint, and inferred scan type (i.e. T1c, T1n, etc.) assocaited with them. After this file has been created, you can manually inspect and edit it to ensure that all desired series will be converted and correctly named in the next step. The columns relevant to conversion in the next step are:
-    -selected_for_conversion
-    -proposed_nifti_path
+    - selected_for_conversion
+    - proposed_nifti_path
 
     All scans selected for conversion with a valid proposed_nifti_path will be converted to that path. The proposed file names are constructed to follow the format `{outDir}/{patientID}/{patientID}_{timepoint_days}_{ExamAlias}/{patientID}_{timepoint_days}_{final_label}.nii.gz`. This is the format astril will expect NIFTI libraries to be in for downstream segmentation/algorithm training.
 
@@ -163,3 +163,5 @@ NIFTI_Library/
     ```
 
     This will use the conversion plan created in the last step to actually convert the files to a NIFTI library.
+---
+#### Perform image pre-processing on NIFTI library
