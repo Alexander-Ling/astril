@@ -2044,7 +2044,7 @@ def convert_dicom_plan(
 
     # ---------- read and validate plan ----------
     plan = _read_table(plan_path)
-    required = {"folder", "proposed_nifti_path"}
+    required = {"Directory", "ExamDirectory", "series_identifier", "final_label", "selected_for_conversion", "Action", "folder", "proposed_nifti_path"}
     missing = required - set(map(str, plan.columns))
     if missing:
         raise ValueError(f"Plan is missing required columns: {sorted(missing)}")
@@ -2056,11 +2056,22 @@ def convert_dicom_plan(
         return bool(s) and s != "-"
 
     # Keep only rows explicitly selected AND that have a valid target path
+    def _to_bool(x):
+        s = str(x).strip().lower()
+        # truthy tokens
+        if s in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        # falsy tokens (incl. empty string from CSV/TSV)
+        if s in {"", "0", "false", "f", "no", "n", "off", "-"}:
+            return False
+        # anything else → False by default
+        return False
+
     if "selected_for_conversion" in plan.columns:
-        _sel = plan["selected_for_conversion"].fillna(False).astype(bool)
+        _sel = plan["selected_for_conversion"].map(_to_bool)
     else:
-        # Back-compat: if the column is absent, treat all as selected
         _sel = pd.Series(True, index=plan.index)
+
     _has_path = plan["proposed_nifti_path"].map(_valid_path)
     todo = plan.loc[_sel & _has_path].copy()
     if todo.empty:

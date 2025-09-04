@@ -3,6 +3,42 @@ import os, math, tempfile
 import numpy as np
 import nibabel as nib
 
+# Write-unit for DWI scalar maps (ADC/MD/EXP_ATTEN): mm^2/s * DWI_SCALE.
+# 1e6 → outputs in "×10^-6 mm^2/s" (aka µm^2/s)
+DWI_SCALE = 1e6
+
+# Relaxed brain-mask threshold: keep voxels above 5% of S0 99th percentile
+BRAIN_MASK_FRAC = 0.05
+
+# ---------- Debug helpers ----------
+def _pstats(name: str, arr: np.ndarray, mask: np.ndarray | None = None):
+    """Print robust percentiles for diagnostics; no algorithm changes."""
+    try:
+        x = arr[mask] if (mask is not None) else arr
+        x = np.asarray(x, dtype=np.float64)
+        if x.size == 0:
+            print(f"[{name}] stats: EMPTY")
+            return
+        p = np.nanpercentile(x, [0, 1, 5, 50, 95, 99, 100])
+        print(f"[{name}] min={p[0]:.3e} p1={p[1]:.3e} p5={p[2]:.3e} "
+              f"med={p[3]:.3e} p95={p[4]:.3e} p99={p[5]:.3e} max={p[6]:.3e}")
+    except Exception as e:
+        print(f"[{name}] stats error: {e!r}")
+
+def _maybe_make_inbrain_mask_from_S0(S0: np.ndarray) -> np.ndarray:
+    """
+    Cheap in-brain proxy using S0: voxels above 10% of S0 99th percentile.
+    Avoids background dominating global stats.
+    """
+    try:
+        p99 = float(np.nanpercentile(S0, 99.0))
+        thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
+        m = S0 > thr
+        print(f"[debug] in-brain mask: thr={thr:.3e}, frac={(m.sum()/m.size):.3f}")
+        return m
+    except Exception:
+        return np.ones_like(S0, dtype=bool)
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -63,25 +99,37 @@ def _maybe_load_bvals_bvecs(nifti_path: str):
 # DWI family
 # ----------------------------
 def gen_dwi_trace(nifti_path: str, out_path: str) -> str:
-    """Simple isotropic/TRACE-like image: mean across volumes if 4D."""
+    """Isotropic TRACE (vendor-like): geometric mean across b>0 volumes (no b0)."""
     img = nib.load(nifti_path); data = img.get_fdata()
-    proj = data.mean(axis=3) if data.ndim == 4 else data
-    return _save_like(img, proj, out_path)
+    if data.ndim != 4 or data.shape[3] < 2:
+        return _save_like(img, data if data.ndim == 3 else data.mean(axis=3), out_path)
+    bvals, _ = _maybe_load_bvals_bvecs(nifti_path)
+    if bvals is None or bvals.shape[0] != data.shape[3]:
+        # Fallback: mean over all non-first frames (heuristic)
+        proj = np.exp(np.mean(np.log(np.clip(data[..., 1:], 1e-6, None)), axis=3))
+        return _save_like(img, proj, out_path)
+    pos = bvals > 10
+    if not np.any(pos):
+        # No non-b0 → plain mean
+        return _save_like(img, data.mean(axis=3), out_path)
+    # Geometric mean over diffusion-weighted frames (b>0)
+    v = np.clip(data[..., pos], 1e-6, None)
+    trace_iso = np.exp(np.mean(np.log(v), axis=3))
+    return _save_like(img, trace_iso, out_path)
 
 def _estimate_adc_from_logfit(S: np.ndarray, bvals: np.ndarray) -> np.ndarray:
     """
-    Fit log(S) ~ log(S0) - b * ADC using all b>0 volumes.
+    Fit log(S) ~ log(S0) - b * ADC using b≈0 and b>0 volumes (include b0 rows for stability).
     S: (..., V)
     """
-    # Identify b>0 and (optionally) b≈0 for S0
-    pos = bvals > 10
-    if not np.any(pos):
-        # Fallback: single non-b0 -> TRACE equivalent
+    # Use all volumes; require at least two distinct b-values
+    b = bvals.astype(np.float64)
+    if np.unique(b).size < 2:
+        # Fallback: single b-value -> TRACE equivalent
         return S.mean(axis=-1)
-    b = bvals[pos].astype(np.float64)
-    Y = np.log(np.clip(S[..., pos], 1e-6, None))
+    Y = np.log(np.clip(S, 1e-6, None))
     # Linear least squares: Y = A * [logS0, -ADC]^T with A=[1, b]
-    A = np.stack([np.ones_like(b), -b], axis=-1)  # (Vpos, 2)
+    A = np.stack([np.ones_like(b), -b], axis=-1)  # (V, 2)
     # Solve per voxel using normal equations
     AtA = A.T @ A
     AtY = np.tensordot(A.T, Y, axes=(1, -1))  # (2, ...spatial...)
@@ -90,7 +138,19 @@ def _estimate_adc_from_logfit(S: np.ndarray, bvals: np.ndarray) -> np.ndarray:
         sol = np.linalg.solve(AtA, AtY.reshape(2, -1))  # (2, Nvox)
         ADC = sol[1].reshape(Y.shape[:-1])
         # ADC should be non-negative; clamp tiny negatives to 0
-        return np.clip(ADC, 0, None)
+        ADC = np.clip(ADC, 0, None)
+        # Mask outside brain-like S0 if available
+        try:
+            is_b0 = bvals < 10
+            if np.any(is_b0):
+                S0 = np.maximum(S[..., is_b0].mean(axis=-1), 1e-6)
+                p99 = float(np.nanpercentile(S0, 99.0))
+                thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
+                mask = S0 > thr
+                ADC = np.where(mask, ADC, 0.0)
+        except Exception:
+            pass
+        return ADC
     except np.linalg.LinAlgError:
         # Degenerate design (e.g., all nonzero b the same shell) → two-point fallback using S0
         b0 = bvals <= 10
@@ -99,9 +159,18 @@ def _estimate_adc_from_logfit(S: np.ndarray, bvals: np.ndarray) -> np.ndarray:
         S0 = np.mean(S[..., b0], axis=-1)  # (...)
         Sb = S[..., pos]                   # (..., K)
         # Avoid division by zero and log(0)
-        ratio = np.maximum(Sb / np.maximum(S0[..., None], 1e-6), 1e-6)
+        ratio = np.clip(Sb / np.maximum(S0[..., None], 1e-6), 1e-6, 1.0)
         adc = np.mean(-np.log(ratio) / b[None, None, None, :], axis=-1)
-        return np.clip(adc, 0, None)
+        adc = np.clip(adc, 0, None)
+        try:
+            S0 = np.maximum(S[..., b0].mean(axis=-1), 1e-6)
+            p99 = float(np.nanpercentile(S0, 99.0))
+            thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
+            mask = S0 > thr
+            adc = np.where(mask, adc, 0.0)
+        except Exception:
+            pass
+        return adc
 
 def gen_dwi_adc(nifti_path: str, out_path: str) -> str:
     """Estimate ADC via voxelwise log-linear fit across all b>0 frames.
@@ -136,13 +205,39 @@ def gen_dwi_adc(nifti_path: str, out_path: str) -> str:
         raise ValueError("DWI ADC requires a 4D diffusion series (>=2 volumes).")
     if bvals is None or bvals.shape[0] != data.shape[3]:
         raise ValueError("Missing or mismatched .bval/.bvec for DWI ADC.")
+    # Optional deeper diagnostics (no algorithm changes)
+    try:
+        is_b0 = bvals < 10
+        if np.any(is_b0):
+            S0 = np.maximum(data[..., is_b0].mean(axis=-1), 1e-6)
+            inbrain = _maybe_make_inbrain_mask_from_S0(S0)
+            pos = bvals > 10
+            if np.any(pos):
+                Sb = data[..., pos]
+                ratio = np.clip(Sb / S0[..., None], 1e-6, None)
+                frac_clamped = float(np.mean(ratio <= 1.0e-6))
+                _pstats("gen_dwi_adc/ratio_all", ratio)
+                # Broadcast the 3D in-brain mask across b>0 frames
+                try:
+                    _pstats("gen_dwi_adc/ratio_inbrain", ratio,
+                            mask=np.broadcast_to(inbrain[..., None], ratio.shape))
+                except Exception as e:
+                    print(f"[gen_dwi_adc] ratio_inbrain log error: {e!r}")
+                print(f"[gen_dwi_adc] frac(ratio==1e-6)={frac_clamped:.4f} (all voxels, all b>0)")
+            _pstats("gen_dwi_adc/S0_all", S0)
+            _pstats("gen_dwi_adc/S0_inbrain", S0, mask=inbrain)
+    except Exception as e:
+        print(f"[gen_dwi_adc] debug prefit error: {e!r}")
     adc = _estimate_adc_from_logfit(data, bvals)
     # --- debug stats before save ---
     try:
-        print(f"[gen_dwi_adc] stats: min={float(np.nanmin(adc)):.3e}, max={float(np.nanmax(adc)):.3e}, dtype_out=float32")
+        _pstats("gen_dwi_adc/ADC_all_mm2_per_s", adc)
+        _pstats("gen_dwi_adc/ADC_all_x1e6", adc * 1.0e6)
+        print(f"[gen_dwi_adc] writing units: x1e6 mm^2/s (scale={DWI_SCALE:g})")
     except Exception:
         pass
-    return _save_like(img, adc, out_path, dtype=np.float32)
+    # Scale to µm^2/s for output
+    return _save_like(img, adc * DWI_SCALE, out_path, dtype=np.float32)
 
 def _fit_tensor(S: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray):
     """
@@ -170,7 +265,7 @@ def _fit_tensor(S: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray):
     ], axis=1)  # (Vpos, 6)
     A = (b[:, None] * G)  # (Vpos, 6)
     # RHS
-    Y = -np.log(np.clip(S[..., pos] / S0[..., None], 1e-6, None))  # (..., Vpos)
+    Y = -np.log(np.clip(S[..., pos] / S0[..., None], 1e-6, 1.0))  # (..., Vpos)
     # Solve normal equations per voxel: (A^T A) d = A^T y
     AtA = A.T @ A  # (6,6)
     AtA_inv = np.linalg.pinv(AtA)
@@ -188,12 +283,22 @@ def _fit_tensor(S: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray):
     ], axis=-2)
     # Eigenvalues
     w = np.linalg.eigvalsh(D)  # (..., 3)
+    w = np.clip(w, 0, None)
     l1, l2, l3 = w[..., 2], w[..., 1], w[..., 0]
     md = (l1 + l2 + l3) / 3.0
     # FA
     num = 1.5 * ((l1 - md)**2 + (l2 - md)**2 + (l3 - md)**2)
     den = (l1**2 + l2**2 + l3**2) + 1e-12
     fa = np.sqrt(np.clip(num / den, 0, 1))
+    # Mask outside brain-like S0
+    try:
+        p99 = float(np.nanpercentile(S0, 99.0))
+        thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
+        mask = S0 > thr
+        md = np.where(mask, md, 0.0)
+        fa = np.where(mask, fa, 0.0)
+    except Exception:
+        pass
     return md, fa
 
 def gen_dwi_fa(nifti_path: str, out_path: str) -> str:
@@ -206,7 +311,7 @@ def gen_dwi_fa(nifti_path: str, out_path: str) -> str:
     md, fa = _fit_tensor(data, bvals, bvecs)
     # --- debug stats before save ---
     try:
-        print(f"[gen_dwi_fa] stats: min={float(np.nanmin(fa)):.3e}, max={float(np.nanmax(fa)):.3e}, dtype_out=float32")
+        _pstats("gen_dwi_fa/FA_all", fa)
     except Exception:
         pass
     return _save_like(img, fa, out_path, dtype=np.float32)
@@ -221,10 +326,13 @@ def gen_dwi_md(nifti_path: str, out_path: str) -> str:
     md, fa = _fit_tensor(data, bvals, bvecs)
     # --- debug stats before save ---
     try:
-        print(f"[gen_dwi_md] stats: min={float(np.nanmin(md)):.3e}, max={float(np.nanmax(md)):.3e}, dtype_out=float32")
+        _pstats("gen_dwi_md/MD_all_mm2_per_s", md)
+        _pstats("gen_dwi_md/MD_all_x1e6", md * 1.0e6)
+        print(f"[gen_dwi_md] writing units: x1e6 mm^2/s (scale={DWI_SCALE:g})")
     except Exception:
         pass
-    return _save_like(img, md, out_path, dtype=np.float32)
+    # Scale to µm^2/s for output
+    return _save_like(img, md * DWI_SCALE, out_path, dtype=np.float32)
 
 def gen_dwi_bem(nifti_path: str, out_path: str) -> str:
     """
@@ -250,8 +358,8 @@ def gen_dwi_bem(nifti_path: str, out_path: str) -> str:
 
 def gen_dwi_exp_atten(nifti_path: str, out_path: str) -> str:
     """
-    Exponential attenuation estimate averaged across non-b0 volumes:
-      E = mean_{b>0} [ -ln(S/S0)/b ]
+    Exponential attenuation (vendor-like, dimensionless):
+      EA = mean_{b>0} [ S(b) / S0 ], clamped to [ε, 1].
     """
     img = nib.load(nifti_path); S = img.get_fdata()
     if S.ndim != 4 or S.shape[3] < 2:
@@ -264,8 +372,19 @@ def gen_dwi_exp_atten(nifti_path: str, out_path: str) -> str:
         raise ValueError("EXP_ATTEN needs at least one b≈0 frame.")
     S0 = np.maximum(S[..., is_b0].mean(axis=-1), 1e-6)
     pos = bvals > 10
-    E = (-np.log(np.clip(S[..., pos] / S0[..., None], 1e-6, None)) / bvals[pos]).mean(axis=-1)
-    return _save_like(img, E, out_path)
+    ratio = np.clip(S[..., pos] / S0[..., None], 1e-6, 1.0)
+    # Dimensionless attenuation (bright WM, dark CSF), average over b>0 frames
+    EA = ratio.mean(axis=-1)
+    # Mask outside brain-like S0
+    try:
+        p99 = float(np.nanpercentile(S0, 99.0))
+        thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
+        mask = S0 > thr
+        EA = np.where(mask, EA, 0.0)
+    except Exception:
+        pass
+    # Write dimensionless (no DWI_SCALE)
+    return _save_like(img, EA, out_path)
 
 # ----------------------------
 # SWI family
