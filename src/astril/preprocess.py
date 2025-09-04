@@ -1328,6 +1328,8 @@ def plan_dicom_to_nifti_conversion(
     include_mr_subdirs: list[str] | None = None,
     min_slices: int = 10,
     use_actual_exam_ids: bool = False,
+    add_missing_derived: bool = False,
+    make_derived_from_scratch: bool = False,
 ):
     """
     Plan DICOM->NIfTI conversion using existing series classification.
@@ -1353,6 +1355,8 @@ def plan_dicom_to_nifti_conversion(
         Minimum number of slices a sequence must have to be considered for selection.
         (Rows remain in the plan; the threshold only affects 'selected_for_conversion'.)
       - use_actual_exam_ids: boolean to indicate if actual exam IDs should be used instead of unique random ones.
+      - add_missing_derived: boolean to indicate if function should dentify derived scan types missing for each primary in an exam and add DERIVE jobs to the plan.
+      - make_derived_from_scratch: boolean to indicate if function should ignore existing derived scans and plan DERIVE jobs for all supported derived types from primaries.
 
     Returns:
       pandas.DataFrame with one row per discovered series, including:
@@ -1370,6 +1374,9 @@ def plan_dicom_to_nifti_conversion(
         classify_exam_series,           # returns labeled per-series rows
         _read_table, _save_table,       # robust I/O helpers
         _progress,                      # optional tqdm wrapper
+        enumerate_supported_derivatives,
+        choose_primary_for_derivation,
+        build_derived_output_name
     )
 
     # ---------- helpers ----------
@@ -1417,6 +1424,9 @@ def plan_dicom_to_nifti_conversion(
         "ExamDirectory","ExamAlias","patientID","timepoint_days","series_identifier",
         "final_label","plane","is_derived","matrix","voxel_mm","n_slices",
         "selected_for_conversion","proposed_nifti_path",
+        # show derivation info when present
+        "Action","GeneratorKey","PrimaryLabel","DerivedLabel",
+        "PrimarySeriesIdentifier","PrimarySeriesPath",
     ]
 
     # Build the header: Directory first, then the cluster, then the rest (no dups)
@@ -1670,6 +1680,9 @@ def plan_dicom_to_nifti_conversion(
         df["Directory"]       = rec["Directory"]
         df["ExamDirectory"]   = exam_rel
         df["ExamAlias"]       = alias_map.get((exam_rel, mr_name), None)
+        # Locals used by the DERIVE block
+        exam_alias = alias_map.get((exam_rel, mr_name), None)
+        patient_rel = rec["Directory"]
         df["patientID"]       = pid
         df["day0Date"]        = rec["day0Date"]
         df["mr_subdir_name"]  = mr_name
@@ -1771,6 +1784,103 @@ def plan_dicom_to_nifti_conversion(
             return os.path.join(out_dir, pid, subdir, fname)
 
         df["proposed_nifti_path"] = df.apply(_proposed_path, axis=1)
+        # Tag original rows explicitly as CONVERT for clarity downstream
+        if "Action" not in df.columns:
+            df["Action"] = "CONVERT"
+        # If deriving from scratch, do not convert vendor-derived series
+        if make_derived_from_scratch and "is_derived" in df.columns:
+            df.loc[df["is_derived"].fillna(False).astype(bool), "selected_for_conversion"] = False
+
+        # --- If requested, append DERIVE rows for derived outputs ---
+        if add_missing_derived or make_derived_from_scratch:
+            # Which labels already exist in this exam (case-insensitive)
+            have_labels = set(str(x).strip().upper() for x in df.get("final_label", []))
+
+            # Consider only PRIMARIES that were selected for conversion
+            sel_mask = df.get("selected_for_conversion", False).astype(bool) & ~df.get("is_derived", False).astype(bool)
+            sel_prim = df.loc[sel_mask].copy()
+
+            def _norm_primary_label(lbl: str) -> str:
+                s = str(lbl or "")
+                return s.split("(", 1)[0].strip().upper()
+
+            # Build primary map preferring true primaries (labels without parentheses)
+            prim_by_label = {}
+            if not sel_prim.empty:
+                sel_prim["_lbl_norm"] = sel_prim[label_col].map(_norm_primary_label)
+                for lbl, g in sel_prim.groupby("_lbl_norm"):
+                    # Prefer rows whose display label has no parentheses (e.g., 'DWI', not 'DWI(TRACE)')
+                    g_no_paren = g[~g[label_col].astype(str).str.contains(r"\(")]
+                    idx = _select_best(g_no_paren if not g_no_paren.empty else g)
+                    if idx is not None:
+                        prim_by_label[lbl] = df.loc[idx]
+
+            planned_labels: set[str] = set()   # ensure one per DerivedLabel per exam
+            derived_rows: list[dict] = []
+
+            for norm_lbl, prim_row in prim_by_label.items():
+                # DWI family: force derivations to use the true DWI primary, never TRACE/AvDC
+                if str(norm_lbl).upper() == "DWI":
+                    raw_lbl = str(prim_row.get(label_col, "")).upper()
+                    if "(" in raw_lbl or "TRACE" in raw_lbl or "AVDC" in raw_lbl or "MD" in raw_lbl:
+                        _cands = sel_prim[
+                            (sel_prim[label_col].map(_norm_primary_label) == "DWI") &
+                            (~sel_prim[label_col].astype(str).str.contains(r"\("))
+                        ]
+                        idx_fix = _select_best(_cands) if not _cands.empty else None
+                        if idx_fix is not None:
+                            prim_row = df.loc[idx_fix]
+                base_type = str(prim_row.get("base_type", norm_lbl)).strip()
+                prim_lbl  = str(prim_row.get("final_label", "")).strip()
+                if bool(prim_row.get("is_derived", False)):
+                    continue
+
+                # Use the actual base_type variable (the old code used an undefined `base`)
+                for derived_lbl, gen_key in enumerate_supported_derivatives(base_type):
+                    d_up = str(derived_lbl).strip().upper()
+                    if d_up == prim_lbl.strip().upper():
+                        continue
+                    if (not make_derived_from_scratch) and (d_up in have_labels):
+                        continue
+                    if d_up in planned_labels:
+                        continue
+
+                    # Mirror convert naming/placement for this exam/timepoint
+                    tp     = prim_row.get("timepoint_days", None)
+                    tp_str = f"d{tp}" if tp is not None else "dNA"
+                    ea     = prim_row.get("ExamAlias", None)
+                    subdir = f"{pid}_{tp_str}_{ea}" if ea else f"{pid}_{tp_str}"
+                    out_path = os.path.join(out_dir, pid, subdir, f"{pid}_{tp_str}_{_sanitize_label(derived_lbl)}.nii.gz")
+
+                    sid = f"DERIVE:{prim_row.get('series_number','')}:{derived_lbl}"
+                    rec = {
+                        "Directory":             patient_rel,
+                        # Keep this consistent with other plan rows (use the same ExamDirectory value)
+                        "ExamDirectory":         df.loc[prim_row.name, "ExamDirectory"],
+                        "ExamAlias":             df.loc[prim_row.name, "ExamAlias"],
+                        "patientID":             pid,
+                        "day0Date":              df.loc[prim_row.name, "day0Date"],
+                        "mr_subdir_name":        df.loc[prim_row.name, "mr_subdir_name"],
+                        "acq_dt":                prim_row.get("acq_dt"),
+                        "timepoint_days":        tp,
+                        "series_identifier":     sid,
+                        "final_label":           derived_lbl,
+                        "DerivedLabel":          derived_lbl,
+                        "is_derived":            True,
+                        "folder":                prim_row.get("folder") or prim_row.get("series_dir") or "",
+                        "selected_for_conversion": True,
+                        "Action":                "DERIVE",
+                        "GeneratorKey":          gen_key,
+                        "PrimaryLabel":          prim_lbl,
+                        "PrimarySeriesIdentifier": prim_row.get("series_identifier") or str(prim_row.get("series_number","")),
+                        "PrimarySeriesPath":     prim_row.get("folder") or prim_row.get("series_dir") or "",
+                        "proposed_nifti_path":   out_path,
+                    }
+                    derived_rows.append(rec)
+                    planned_labels.add(d_up)
+
+            if derived_rows:
+                df = pd.concat([df, pd.DataFrame(derived_rows)], ignore_index=True, sort=False)
 
         # sort within exam and return
         sort_cols = [c for c in ["series_number","acq_dt"] if c in df.columns]
@@ -1918,9 +2028,13 @@ def convert_dicom_plan(
     """Read a plan produced by `plan_dicom_to_nifti_conversion` and run conversions
     for rows with a non-empty, non-"-" `proposed_nifti_path`.
 
+    Streams a per-row CSV/TSV log to disk (thread-safe), similar to `demix_dicoms()`.
     Returns a DataFrame log with per-row status.
     """
     import os
+    import csv as _csv
+    from datetime import datetime
+    import threading as _threading
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1928,6 +2042,7 @@ def convert_dicom_plan(
         _read_table, _save_table, _progress,
     )
 
+    # ---------- read and validate plan ----------
     plan = _read_table(plan_path)
     required = {"folder", "proposed_nifti_path"}
     missing = required - set(map(str, plan.columns))
@@ -1940,18 +2055,92 @@ def convert_dicom_plan(
         s = str(val).strip()
         return bool(s) and s != "-"
 
-    todo = plan[plan["proposed_nifti_path"].map(_valid_path)].copy()
+    # Keep only rows explicitly selected AND that have a valid target path
+    if "selected_for_conversion" in plan.columns:
+        _sel = plan["selected_for_conversion"].fillna(False).astype(bool)
+    else:
+        # Back-compat: if the column is absent, treat all as selected
+        _sel = pd.Series(True, index=plan.index)
+    _has_path = plan["proposed_nifti_path"].map(_valid_path)
+    todo = plan.loc[_sel & _has_path].copy()
     if todo.empty:
         cols = ["Directory","ExamDirectory","series_identifier","final_label",
                 "folder","proposed_nifti_path","status","message","nii_path"]
         return pd.DataFrame(columns=cols)
 
+    # Ensure primaries are converted before derived sequences
+    if "Action" in todo.columns:
+        _order = todo["Action"].astype(str).str.upper().map({"CONVERT": 0, "DERIVE": 1}).fillna(2)
+        if "ExamDirectory" in todo.columns:
+            todo = (
+                todo.assign(_order=_order)
+                    .sort_values(by=["ExamDirectory", "_order"], kind="mergesort")
+                    .drop(columns="_order")
+            )
+        else:
+            todo = todo.assign(_order=_order).sort_values(by=["_order"], kind="mergesort").drop(columns="_order")
+
+    # threads tuned for I/O
     if n_workers is None:
         try:
             n_workers = min(8, max(1, os.cpu_count() or 2))
         except Exception:
             n_workers = 4
 
+    # ---------- thread-safe streaming log (CSV/TSV only) ----------
+    # Choose/default path
+    if log_out is None:
+        default_dir = os.path.dirname(os.path.abspath(plan_path)) or "."
+        log_out = os.path.join(default_dir, f"convert_log_{datetime.now():%Y%m%d_%H%M%S}.csv")
+    _log_path = log_out
+    _ext = os.path.splitext(_log_path)[1].lower()
+    if _ext not in (".csv", ".tsv"):
+        # Fallback to csv if user passed an unknown extension (incl. .xlsx)
+        _log_path = os.path.splitext(_log_path)[0] + ".csv"
+        print(f"[convert_dicom_plan][note] {_ext} not supported for logs; writing .csv instead: {_log_path}")
+        _ext = ".csv"
+    _delim = "\t" if _ext == ".tsv" else ","
+    os.makedirs(os.path.dirname(_log_path) or ".", exist_ok=True)
+
+    LOG_HEADER = [
+        "Directory","ExamDirectory","series_identifier","final_label",
+        "Action","GeneratorKey","PrimaryLabel","DerivedLabel",
+        "PrimarySeriesIdentifier","PrimarySeriesPath",
+        "folder","proposed_nifti_path","status","message","nii_path",
+    ]
+    _log_fh = open(_log_path, "a", newline="", encoding="utf-8")
+    _log_writer = _csv.writer(_log_fh, delimiter=_delim)
+    try:
+        if _log_fh.tell() == 0:
+            _log_writer.writerow(LOG_HEADER)
+            _log_fh.flush()
+    except Exception:
+        pass
+
+    _log_lock = _threading.Lock()
+    def _stream_log_row(rec: dict):
+        # Write one row; thread-safe; tolerate missing keys.
+        with _log_lock:
+            _log_writer.writerow([
+                rec.get("Directory", ""),
+                rec.get("ExamDirectory", ""),
+                rec.get("series_identifier", ""),
+                rec.get("final_label", ""),
+                rec.get("Action", ""),
+                rec.get("GeneratorKey", ""),
+                rec.get("PrimaryLabel", ""),
+                rec.get("DerivedLabel", ""),
+                rec.get("PrimarySeriesIdentifier", ""),
+                rec.get("PrimarySeriesPath", ""),
+                rec.get("folder", ""),
+                rec.get("proposed_nifti_path", ""),
+                rec.get("status", ""),
+                rec.get("message", ""),
+                rec.get("nii_path", ""),
+            ])
+            _log_fh.flush()
+
+    # ---------- worker ----------
     def _convert_row(row: pd.Series) -> dict:
         series_dir = str(row.get("folder", ""))
         out_path = str(row.get("proposed_nifti_path", "")).strip()
@@ -1962,6 +2151,13 @@ def convert_dicom_plan(
             "final_label": row.get("final_label", ""),
             "folder": series_dir,
             "proposed_nifti_path": out_path,
+            # include derivation context for logging (even for CONVERT rows)
+            "Action": str(row.get("Action", "CONVERT")).upper(),
+            "GeneratorKey": str(row.get("GeneratorKey", "")).strip(),
+            "PrimaryLabel": str(row.get("PrimaryLabel", "")).strip(),
+            "DerivedLabel": str(row.get("DerivedLabel", "")).strip(),
+            "PrimarySeriesIdentifier": row.get("PrimarySeriesIdentifier", ""),
+            "PrimarySeriesPath": row.get("PrimarySeriesPath", ""),
             "status": None,
             "message": "",
             "nii_path": "",
@@ -1971,51 +2167,87 @@ def convert_dicom_plan(
             rec["message"] = f"Series folder not found: {series_dir}"
             return rec
 
-        # Skip if exists and not overwriting
-        if os.path.isfile(out_path) and not overwrite:
-            rec["status"] = "exists"
-            rec["nii_path"] = out_path
+        # Skip if exists and not overwriting; ensure parent exists
+        if os.path.isabs(out_path):
+            out_parent = os.path.dirname(out_path)
+        else:
+            out_parent = os.path.dirname(os.path.abspath(out_path))
+        try:
+            if os.path.isfile(out_path) and not overwrite:
+                rec["status"] = "exists"
+                rec["nii_path"] = out_path
+                return rec
+            os.makedirs(out_parent or ".", exist_ok=True)
+        except Exception as e:
+            rec["status"] = "error"
+            rec["message"] = f"Unable to create parent dir: {type(e).__name__}: {e}"
             return rec
 
-        # Remove old file if overwriting
-        if overwrite:
-            try:
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-            except Exception:
-                pass
-
         try:
-            written = convert_dicom_to_nifti(
-                dicom_series_dir=series_dir,
-                output_path=out_path,
-                reorient=reorient,
-                compress=compress,
-            )
-            rec["status"] = "ok"
-            rec["nii_path"] = written
+            from .preprocess import convert_dicom_to_nifti  # local import to avoid cycles
+            action = rec.get("Action", "CONVERT")
+            if action == "CONVERT":
+                written = convert_dicom_to_nifti(
+                    dicom_series_dir=series_dir,
+                    output_path=out_path,
+                    reorient=reorient,
+                    compress=compress,
+                )
+                rec["status"] = "ok"
+                rec["nii_path"] = written
+            elif action == "DERIVE":
+                from .preprocessing_utils import run_derived_generator
+                generator_key = rec.get("GeneratorKey", "")
+                primary_label = rec.get("PrimaryLabel", "")
+                derived_label = rec.get("DerivedLabel", "")
+                src_path = rec.get("PrimarySeriesPath") or series_dir  # both are a DICOM dir per the plan
+                written = run_derived_generator(
+                    input_path_or_dicom_dir=src_path,
+                    output_path=out_path,
+                    generator_key=generator_key,
+                    primary_label=primary_label,
+                    derived_label=derived_label,
+                )
+                rec["status"] = "ok"
+                rec["nii_path"] = written
+            else:
+                rec["status"] = "skipped"
+                rec["message"] = f"Unknown Action '{action}'"
         except Exception as e:
             rec["status"] = "failed"
             rec["message"] = f"{type(e).__name__}: {e}"
         return rec
 
+    # ---------- execute ----------
     jobs = [r for _, r in todo.iterrows()]
     records = []
-    if n_workers == 1:
-        for r in _progress(jobs, total=len(jobs), desc="Converting", unit="series", enable=show_progress):
-            records.append(_convert_row(r))
-    else:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = [pool.submit(_convert_row, r) for r in jobs]
-            for ft in _progress(as_completed(futs), total=len(futs), desc="Converting", unit="series", enable=show_progress):
-                try:
-                    records.append(ft.result())
-                except Exception as e:
-                    records.append({"status":"exception","message":f"Future failed: {e}"})
+    try:
+        if n_workers == 1:
+            for r in _progress(jobs, total=len(jobs), desc="Converting", unit="series", enable=show_progress):
+                rec = _convert_row(r)
+                records.append(rec)
+                _stream_log_row(rec)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = [pool.submit(_convert_row, r) for r in jobs]
+                for ft in _progress(as_completed(futs), total=len(futs), desc="Converting", unit="series", enable=show_progress):
+                    try:
+                        rec = ft.result()
+                    except Exception as e:
+                        rec = {"status": "exception", "message": f"Future failed: {e}"}
+                    records.append(rec)
+                    _stream_log_row(rec)
+    finally:
+        try:
+            _log_fh.close()
+        except Exception:
+            pass
 
+    # Build pandas result for return value (stream already written to disk)
     log_df = pd.DataFrame.from_records(records)
-    if log_out:
-        _save_table(log_df, log_out)
+
+    # No _save_table() here since we've streamed the log.
+    # _save_table(log_df, log_out)  # (intentionally disabled for streamed log)
 
     try:
         counts = log_df["status"].value_counts(dropna=False).to_dict()
@@ -2024,9 +2256,6 @@ def convert_dicom_plan(
         pass
 
     return log_df
-
-
-
 
 # ------------------------------------------------------------------------
 # CLI entry point
@@ -2270,6 +2499,10 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
         action="store_true",
         help="Use the terminal ExamDirectory folder name as ExamAlias (may contain PHI) instead of a random 8-char alias."
     )
+    p.add_argument("--add_missing_derived", action="store_true",
+                   help="Identify derived scan types missing for each primary in an exam and add DERIVE jobs to the plan.")
+    p.add_argument("--make_derived_from_scratch", action="store_true",
+                   help="Ignore existing derived scans and plan DERIVE jobs for all supported derived types from primaries.")
     def _run_plan(a):
         plan_dicom_to_nifti_conversion(
             patient_metadata=a.patientMetadata,
@@ -2283,6 +2516,8 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             include_mr_subdirs=getattr(a, "mrSubdirs", None),
             min_slices=getattr(a, "minSlices", 10),
             use_actual_exam_ids=getattr(a, "use_actual_exam_ids", False),
+            add_missing_derived=getattr(a, "add_missing_derived", False),
+            make_derived_from_scratch=getattr(a, "make_derived_from_scratch", False),
         )
     p.set_defaults(func=_run_plan)
 
@@ -2309,7 +2544,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output NIfTI if present.")
     p.add_argument("--no_reorient", action="store_true", help="Disable reorientation to standard space.")
     p.add_argument("--no_compress", action="store_true", help="Write .nii instead of .nii.gz.")
-    p.add_argument("--logOut", default=None, help="Optional CSV/TSV/XLSX log path for results.")
+    p.add_argument("--logOut", default=None, help="Optional CSV/TSV log path for results.")
     def _run_convert(a):
         convert_dicom_plan(
             plan_path=a.plan,

@@ -10,6 +10,7 @@ try:
 except Exception:
     pydicom = None
 import re
+from collections import OrderedDict
 import datetime as _dt
 import pandas as pd
 import xlsxwriter
@@ -294,35 +295,62 @@ def _vendor_hints(ds):
     hints["b_value"] = bval
     return hints
 
-def _dwi_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
-    # Order matters: most specific first
-    if "adc" in tokens or "ADC" in imgtypes: return "ADC"
-    if re.search(r"\bfa\b", tokens) or "FA" in imgtypes: return "FA"
-    if "trace" in tokens or "isotropic" in tokens or "ISO" in imgtypes: return "TRACE"
-    if "avdc" in tokens: return "AvDC"
-    if "exp atten" in tokens or "expatten" in tokens: return "EXP_ATTEN"
+def _match_cat_from_spec(spec: "OrderedDict[str, dict]", tokens_lc: str, imgtypes_uc: set[str]) -> str | None:
+    """Return the first matching category key from spec based on synonyms or ImageType/FrameType tokens."""
+    for cat, meta in spec.items():
+        syn = [s.lower() for s in meta.get("syn", [])]
+        if any(s in tokens_lc for s in syn) or (cat.upper() in imgtypes_uc):
+            return cat
     return None
+
+# ---------- Single source of truth for derived families ----------
+# Each entry: { category_name: {"gen": generator_key, "syn": [name synonyms ...]} }
+DERIVED_CATEGORY_SPEC: dict[str, "OrderedDict[str, dict]"] = {
+    "DWI": OrderedDict([
+        ("TRACE",      {"gen": "dwi_trace",       "syn": ["trace", "tracew", "trace w", "isotropic", "iso"]}),
+        ("ADC",        {"gen": "dwi_adc",         "syn": ["adc"]}),
+        ("FA",         {"gen": "dwi_fa",          "syn": ["fa"]}),
+        ("MD",         {"gen": "dwi_md",          "syn": ["md", "mean diffusivity", "mean diff", "avdc"]}),
+        ("EXP_ATTEN",  {"gen": "dwi_exp_atten",   "syn": ["exp atten", "expatten"]}),
+        ("BEM",        {"gen": "dwi_bem",         "syn": ["bem", "bi-exp", "bi exponential", "biexp"]}),
+    ]),
+    "SWI": OrderedDict([
+        ("MIP",        {"gen": "swi_mip",         "syn": ["mip"]}),
+        ("MINIP",      {"gen": "swi_minip",       "syn": ["minip", "min ip"]}),
+        ("PHASE",      {"gen": "swi_phase",       "syn": ["phase", "pha", "filt pha", "filt_pha"]}),
+        ("MAG",        {"gen": "swi_mag",         "syn": ["mag", "magnitude"]}),
+        ("QSM",        {"gen": "swi_qsm",         "syn": ["qsm"]}),
+    ]),
+    # PERFUSION family includes both classic param maps and simple time summaries
+    "PERFUSION": OrderedDict([
+        ("CBV",        {"gen": "perf_cbv",        "syn": ["cbv"]}),
+        ("CBF",        {"gen": "perf_cbf",        "syn": ["cbf"]}),
+        ("MTT",        {"gen": "perf_mtt",        "syn": ["mtt"]}),
+        ("TTP",        {"gen": "perfusion_ttp_index", "syn": ["ttp"]}),
+        ("TMAX",       {"gen": "perf_tmax",       "syn": ["tmax"]}),
+        ("KTRANS",     {"gen": "dce_ktrans",      "syn": ["ktrans", "k trans"]}),
+        ("KEP",        {"gen": "dce_kep",         "syn": ["kep"]}),
+        ("VE",         {"gen": "dce_ve",          "syn": ["ve"]}),
+        ("VP",         {"gen": "dce_vp",          "syn": ["vp"]}),
+        ("LEAKAGE",    {"gen": "perf_leakage",    "syn": ["leakage"]}),
+        ("PARAM_MAP",  {"gen": "perf_param_map",  "syn": ["parametric", "param map", "parametric map"]}),
+        ("PBP",        {"gen": "perf_pbp",        "syn": ["pbp"]}),
+        ("GBP",        {"gen": "perf_gbp",        "syn": ["gbp"]}),
+        # Time-series summaries
+        ("MEAN",       {"gen": "perfusion_mean_t","syn": ["mean"]}),
+        ("MAX",        {"gen": "perfusion_max_t", "syn": ["max"]}),
+        ("AUC",        {"gen": "perfusion_auc_t", "syn": ["auc"]}),
+    ]),
+}
+
+def _dwi_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
+    return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["DWI"], tokens.lower(), set(t.upper() for t in imgtypes))
 
 def _swi_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
-    t = tokens
-    if "min ip" in t or "minip" in t or "MINIP" in imgtypes: return "MINIP"
-    if "mip" in t or "MIP" in imgtypes: return "MIP"
-    if any(k in t for k in ["pha", "filt pha", "filt_pha", "phase"]) or "PHASE" in imgtypes: return "PHASE"
-    if any(k in t for k in ["mag", "magnitude"]) or "MAGNITUDE" in imgtypes: return "MAG"
-    if "qsm" in t: return "QSM"
-    return None
+    return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["SWI"], tokens.lower(), set(t.upper() for t in imgtypes))
 
 def _perfusion_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
-    for key, lab in [
-        ("cbv","CBV"), ("cbf","CBF"), ("mtt","MTT"), ("ttp","TTP"),
-        ("tmax","TMAX"), ("ktrans","KTRANS"), ("k trans","KTRANS"),
-        ("kep","KEP"), ("ve","VE"), ("vp","VP"),
-        ("leakage","LEAKAGE"), ("parametric","PARAM_MAP"),
-        ("pbp","PBP"), ("gbp","GBP"),
-    ]:
-        if key in tokens: return lab
-    if "MIP" in imgtypes or "MINIP" in imgtypes: return "PROJECTION"
-    return None
+    return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["PERFUSION"], tokens.lower(), set(t.upper() for t in imgtypes))
 
 def _t1_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
     t = tokens
@@ -333,26 +361,41 @@ def _t1_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
 def _compute_is_derived(tokens_any, imgtypes: set[str], dcat: str | None) -> bool:
     """
     Decide whether a series should be flagged as 'derived'.
-
-    STRICT ORDER (requested):
-      1) If ANY ImageType/FrameType keywords are present in metadata:
-           → return True IFF a derived keyword is present (ignore PRIMARY/ORIGINAL).
-           → otherwise return False (do NOT fall back to sublabel/name).
-      2) If NO ImageType/FrameType keywords were present at all:
-           → fall back to sublabel (dcat), then name-only projection safety net.
+    Revised rule:
+      1) If ANY ImageType/FrameType keywords are present:
+           → return True if a derived keyword is present, OR if we matched a known derived sub-label (dcat).
+           → otherwise return False.
+      2) If NO ImageType/FrameType keywords are present:
+           → fall back to sub-label (dcat), then name-only projection checks (projections → derived).
     """
     # Normalize tokens for name-only fallback checks
     t = " ".join(sorted(tokens_any)).lower() if isinstance(tokens_any, set) else str(tokens_any).lower()
 
     DERIVED_TOKENS = {
         "DERIVED", "SECONDARY", "REFORMATTED", "RESAMPLED", "MPR",
-        "MIP", "MINIP", "T2_STAR", "TRACEW", "ADC", "FA", "EXP_ATTEN", "AVDC",
-        "AVERAGE", "MINIMUM", "MAXIMUM", "SUBTRACTION"
+        "SUBTRACTED", "PROJECTION", "MIP", "MINIP", "AVERAGE", "MINIMUM", "MAXIMUM", "SUBTRACTION",
+        # Many vendors include explicit map names in ImageType/FrameType:
+        "ADC", "FA", "TRACE", "TRACEW", "DIFFUSION",  # DWI maps
+        "PHASE", "MAGNITUDE", "QSM",                  # SWI family
+        "CBV", "CBF", "MTT", "TTP", "TMAX", "KTRANS", "KEP", "VE", "VP"  # perfusion maps
     }
 
-    # (1) Metadata present → trust only metadata
+    # (1) Metadata present → trust metadata, but allow sub-label to assert "derived"
     if imgtypes:
-        return bool(imgtypes & DERIVED_TOKENS)
+        if imgtypes & DERIVED_TOKENS:
+            return True
+        # If classifier already identified a known derived sub-label, honor it.
+        try:
+            from collections import OrderedDict
+            # Build the cross-family set once
+            all_cats = set()
+            for _fam, _spec in DERIVED_CATEGORY_SPEC.items():
+                all_cats.update(str(k).upper() for k in _spec.keys())
+        except Exception:
+            all_cats = set()
+        if dcat and str(dcat).upper() in all_cats:
+            return True
+        return False
 
     # (2) No metadata flags at all → allow fallbacks
     if dcat is not None:
@@ -890,8 +933,23 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
         # --- Strong families first: Localizer, DWI, SWI, Perfusion ---
         dcat_hint = _dwi_derived_category(t, imgtypes)
-        dwi_hit = (dcat_hint is not None) or any(k in t for k in ["dwi","diff","ep2d","ep b","trace w","trace"]) or \
-                  (b_value is not None and b_value > 0)
+        # Treat DWI as a strong family: name, b-value, vendor hints, or ImageType flags can light it up.
+        imgtype_has_diff = any((x or "").upper() == "DIFFUSION" for x in imgtypes)
+        dwi_hit = (
+            (dcat_hint is not None)
+            or any(k in t for k in ["dwi", "diff", "ep2d", "ep_b", "trace w", "trace"])
+            or (b_value is not None and b_value > 0)
+            or imgtype_has_diff
+        )
+        if not dwi_hit:
+            vh = _vendor_hints(ds)
+            psn = str(vh.get("pulse_sequence_name","") or "").lower()
+            ss  = str(vh.get("scanning_sequence","") or "").lower()
+            sv  = str(vh.get("sequence_variant","") or "").lower()
+            so  = str(vh.get("scan_options","") or "").lower()
+            if any(s in psn for s in ["ep2d", "diff", "dti"]) or \
+               ("diff" in ss) or ("diff" in sv) or ("diff" in so):
+                dwi_hit = True
 
         if _looks_localizer(t):
             base = "Localizer"
@@ -1249,3 +1307,163 @@ def _files_identical(a: str, b: str) -> bool:
         return _sha1_file(a) == _sha1_file(b)
     except Exception:
         return False
+
+# ============================================================
+# Derived-scan planning and generation helpers
+# ============================================================
+
+def enumerate_supported_derivatives(base_type: str, only_with_registered_generator: bool = False) -> List[Tuple[str,str]]:
+    """
+    Return [(final_label, generator_key)] for this base_type using DERIVED_CATEGORY_SPEC.
+    Labels match classifier style, e.g. "DWI(ADC)", "SWI(MIP)", "Perfusion(TTP)".
+    If only_with_registered_generator=True, include only categories with a registered generator.
+    """
+    bt = (base_type or "").strip().upper()
+    spec_key = "PERFUSION" if bt in ("PERFUSION","DSC","DCE") else bt
+    spec = DERIVED_CATEGORY_SPEC.get(spec_key, OrderedDict())
+    base_label = "Perfusion" if spec_key == "PERFUSION" else spec_key
+    pairs = [(f"{base_label}({cat})", meta.get("gen")) for cat, meta in spec.items()]
+    if only_with_registered_generator:
+        try:
+            from .generators import GENERATOR_REGISTRY
+            pairs = [(lab, key) for (lab, key) in pairs if key in GENERATOR_REGISTRY]
+        except Exception:
+            pass
+    return pairs
+
+
+def choose_primary_for_derivation(series_df):
+    """
+    Given a classify_exam_series() dataframe for an exam, return a list of dicts with:
+      - series_dir
+      - series_number
+      - final_label
+      - base_type
+    for candidate primaries to derive from (skip derived=True rows).
+    """
+    prims = []
+    try:
+        cols = series_df.columns
+        for _, r in series_df.iterrows():
+            if bool(r.get("is_derived", False)):
+                continue
+            base_type = str(r.get("base_type",""))
+            if not enumerate_supported_derivatives(base_type):
+                continue
+            prims.append({
+                # Prefer the column produced by classify_exam_series():
+                # 'folder' holds the on-disk series directory.
+                "series_dir": (
+                    r.get("series_dir")
+                    or r.get("folder")
+                    or r.get("SeriesPath")
+                    or r.get("path") or ""
+                ),
+                "series_number": r.get("series_number",""),
+                "final_label": r.get("final_label",""),
+                "base_type": base_type,
+            })
+    except Exception:
+        pass
+    return [p for p in prims if p["series_dir"]]
+
+
+def build_derived_output_name(exam_alias: str, out_root: str, primary_label: str, derived_label: str) -> str:
+    """
+    Simple deterministic destination:
+      {out_root}/{exam_alias}/{derived_label}.nii.gz
+    """
+    exam_alias = str(exam_alias).strip().replace(os.sep, "_")
+    derived_label = str(derived_label).strip().replace(" ", "_")
+    return os.path.join(out_root, exam_alias, f"{derived_label}.nii.gz")
+
+
+def _is_dicom_dir(path: str) -> bool:
+    try:
+        if not os.path.isdir(path):
+            return False
+        for name in os.listdir(path)[:8]:
+            if name.lower().endswith(".dcm"):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True):
+    """
+    Accept a DICOM series directory or a NIfTI file path.
+    If DICOM dir, convert to a temp NIfTI (keeping 4D if present). Prefer dcm2niix so that
+    DWI sidecars (*.bval/*.bvec) are emitted next to the temporary NIfTI, then fall back to
+    our dicom2nifti-based converter if dcm2niix is unavailable or fails.
+    Return (nifti_path, cleanup_temp_bool)
+    """
+    if _is_dicom_dir(input_path_or_dir):
+        import os, glob, tempfile, subprocess, shutil
+        # First try dcm2niix (emits .bval/.bvec when applicable)
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="dcm2niix_")
+            # -z y (gz), -f tmp (stable basename), -o tmpdir
+            proc = subprocess.run(
+                ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"dcm2niix failed ({proc.returncode})")
+            nii_candidates = glob.glob(os.path.join(tmpdir, "tmp.nii.gz")) \
+                           or glob.glob(os.path.join(tmpdir, "tmp.nii")) \
+                           or glob.glob(os.path.join(tmpdir, "*.nii.gz")) \
+                           or glob.glob(os.path.join(tmpdir, "*.nii"))
+            if not nii_candidates:
+                raise RuntimeError("dcm2niix produced no NIfTI")
+            # Use the first NIfTI it produced; sidecars (if any) are already beside it.
+            return nii_candidates[0], True
+        except Exception:
+            # Fall back to the built-in dicom2nifti path
+            from .preprocess import convert_dicom_to_nifti  # local import to avoid cycles
+            tmp_out = tempfile.mktemp(suffix=".nii.gz")
+            convert_dicom_to_nifti(
+                dicom_series_dir=input_path_or_dir,
+                output_path=tmp_out,
+                reorient=reorient,
+                compress=compress,
+            )
+            return tmp_out, True
+
+    # Assume it is a NIfTI file
+    return input_path_or_dir, False
+
+
+# ----------------------------
+# Minimal generator functions
+# ----------------------------
+
+def run_derived_generator(input_path_or_dicom_dir: str, output_path: str,
+                          generator_key: str, primary_label: str = "", derived_label: str = "") -> str:
+    """
+    Convert DICOM->NIfTI if needed, then run the requested generator and save output_path.
+    """
+    from .generators import GENERATOR_REGISTRY
+    nifti_path, cleanup = _nifti_from_any(input_path_or_dir=input_path_or_dicom_dir)
+    try:
+        fn = GENERATOR_REGISTRY.get(generator_key)
+        if fn is None:
+            raise ValueError(f"Unsupported generator '{generator_key}'")
+        return fn(nifti_path, output_path)
+    finally:
+        if cleanup:
+            try:
+                os.remove(nifti_path)
+            except Exception:
+                pass
+
+def _convert_one(rec: dict) -> dict:
+    rec = dict(rec)
+    out_path = rec.get("nii_out") or ""
+    series_dir = rec.get("series_path") or rec.get("SeriesPath") or rec.get("SourceSeriesPath") or ""
+    action = (rec.get("Action") or "CONVERT").upper()
+    rec.update({
+        "status": None,
+        "message": "",
+        "nii_path": "",
+    })
