@@ -8,7 +8,7 @@ import nibabel as nib
 DWI_SCALE = 1e6
 
 # Relaxed brain-mask threshold: keep voxels above 5% of S0 99th percentile
-BRAIN_MASK_FRAC = 0.05
+BRAIN_MASK_FRAC = 0.07
 
 # ---------- Debug helpers ----------
 def _pstats(name: str, arr: np.ndarray, mask: np.ndarray | None = None):
@@ -334,28 +334,6 @@ def gen_dwi_md(nifti_path: str, out_path: str) -> str:
     # Scale to µm^2/s for output
     return _save_like(img, md * DWI_SCALE, out_path, dtype=np.float32)
 
-def gen_dwi_bem(nifti_path: str, out_path: str) -> str:
-    """
-    Bi-exponential model (BEM) placeholder.
-    Target model: S(b) = S0 * [ f * exp(-b * D_fast) + (1 - f) * exp(-b * D_slow) ].
-    Notes:
-      - Requires ≥1 b≈0 volume and ≥2 distinct nonzero b-shells.
-      - Intended outputs (to be finalized): a 4D NIfTI with volumes [D_fast, D_slow, f].
-    For now, this is a stub that validates inputs and raises NotImplementedError.
-    """
-    print(f"[gen_dwi_bem] input NIfTI: {nifti_path}")
-    img = nib.load(nifti_path); S = img.get_fdata()
-    if S.ndim != 4 or S.shape[3] < 3:
-        raise ValueError("DWI BEM requires a 4D series with ≥3 volumes.")
-    bvals, _ = _maybe_load_bvals_bvecs(nifti_path)
-    if bvals is None or bvals.shape[0] != S.shape[3]:
-        raise ValueError("Missing or mismatched .bval for DWI BEM.")
-    uniq = np.unique(bvals)
-    print(f"[gen_dwi_bem] unique b-values={uniq.tolist()} (n={uniq.size})")
-    if not np.any(bvals < 10) or np.sum(bvals > 10) < 2:
-        raise ValueError("DWI BEM requires ≥1 b≈0 and ≥2 nonzero shells.")
-    raise NotImplementedError("DWI BEM fitting not yet implemented.")
-
 def gen_dwi_exp_atten(nifti_path: str, out_path: str) -> str:
     """
     Exponential attenuation (vendor-like, dimensionless):
@@ -415,21 +393,48 @@ def gen_swi_minip(nifti_path: str, out_path: str, slab_mm: int = 8) -> str:
         out[..., i] = vol[..., lo:hi].min(axis=2)
     return _save_like(img, out, out_path)
 
-def gen_swi_mag(nifti_path: str, out_path: str) -> str:
+def gen_swi_composite(inputs_or_path, out_path: str) -> str:
     """
-    Pass-through for magnitude input. If a 4D series, take first frame.
-    (We do not attempt to synthesize MAG from PHASE or complex data here.)
+    Build a composite SWI volume from MAG + PHASE using a simple negative-phase mask.
+    inputs_or_path:
+      - dict with keys {"MAG": <path/dir>, "PHASE": <path/dir>} (case-insensitive), or
+      - str path to an existing SWI (pass-through).
     """
-    img = nib.load(nifti_path); data = _ensure_3d(img.get_fdata())
-    return _save_like(img, data, out_path)
+    # Pass-through if a single path was provided
+    if isinstance(inputs_or_path, str):
+        img = nib.load(inputs_or_path)
+        data = _ensure_3d(img.get_fdata())
+        return _save_like(img, data, out_path)
 
-def gen_swi_phase(nifti_path: str, out_path: str) -> str:
-    """
-    Pass-through for phase input. Generating phase from magnitude is not feasible;
-    this generator assumes the primary series is phase.
-    """
-    img = nib.load(nifti_path); data = _ensure_3d(img.get_fdata())
-    return _save_like(img, data, out_path)
+    mag_key = next((k for k in inputs_or_path if str(k).upper() in ("MAG","SWI_MAG","SWIMAG")), None)
+    pha_key = next((k for k in inputs_or_path if str(k).upper() in ("PHASE","PHA","SWI_PHASE","SWIPHASE","PHI")), None)
+    if mag_key is None or pha_key is None:
+        raise ValueError("gen_swi_composite expected a dict with MAG and PHASE inputs")
+
+    img_mag = nib.load(inputs_or_path[mag_key]); mag = _ensure_3d(img_mag.get_fdata()).astype(np.float32)
+    img_pha = nib.load(inputs_or_path[pha_key]); pha = _ensure_3d(img_pha.get_fdata()).astype(np.float32)
+    if mag.shape != pha.shape:
+        raise ValueError(f"MAG and PHASE shapes differ: {mag.shape} vs {pha.shape}")
+
+    # Robustly map phase to [-pi, pi]
+    p99 = float(np.percentile(mag, 99.0))
+    thr = max(1e-6, 0.05 * p99)
+    mask = mag > thr
+    if not np.any(mask):
+        mask = mag > 0
+    pha_in = pha[mask]
+    med = float(np.median(pha_in))
+    p1, p99p = float(np.percentile(pha_in, 1.0)), float(np.percentile(pha_in, 99.0))
+    scale = max(1e-6, max(abs(p1 - med), abs(p99p - med)))
+    phi = np.clip((pha - med) / scale, -1.0, 1.0) * np.pi
+
+    # Haacke-style negative-phase mask (paramagnetic veins)
+    P = 4.0
+    m = np.ones_like(phi, dtype=np.float32)
+    neg = phi < 0
+    m[neg] = ((phi[neg] / np.pi) + 1.0) ** P
+    comp = (mag * m).astype(np.float32)
+    return _save_like(img_mag, comp, out_path)
 
 # NOTE: QSM would require a full pipeline (unwrap, background removal, dipole inversion).
 # Intentionally NOT registering QSM until a validated implementation is available.
@@ -480,12 +485,10 @@ GENERATOR_REGISTRY = {
     "dwi_fa":          gen_dwi_fa,
     "dwi_md":          gen_dwi_md,
     "dwi_exp_atten":   gen_dwi_exp_atten,
-    "dwi_bem":         gen_dwi_bem,
-    # SWI (pass-through or slab projections)
+    # SWI composite or slab projections)
     "swi_mip":         gen_swi_mip,
     "swi_minip":       gen_swi_minip,
-    "swi_mag":         gen_swi_mag,
-    "swi_phase":       gen_swi_phase,
+    "swi_composite":   gen_swi_composite,
     # Perfusion summaries
     "perfusion_mean_t":   gen_perfusion_mean_t,
     "perfusion_max_t":    gen_perfusion_max_t,

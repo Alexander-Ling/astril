@@ -304,42 +304,44 @@ def _match_cat_from_spec(spec: "OrderedDict[str, dict]", tokens_lc: str, imgtype
     return None
 
 # ---------- Single source of truth for derived families ----------
-# Each entry: { category_name: {"gen": generator_key, "syn": [name synonyms ...]} }
+# Each entry: { category_name: {"gen": generator_key, "syn": [name synonyms ...], "policy": [convert_only or derive or ignore]"} }
 DERIVED_CATEGORY_SPEC: dict[str, "OrderedDict[str, dict]"] = {
     "DWI": OrderedDict([
-        ("TRACE",      {"gen": "dwi_trace",       "syn": ["trace", "tracew", "trace w", "isotropic", "iso"]}),
-        ("ADC",        {"gen": "dwi_adc",         "syn": ["adc"]}),
-        ("FA",         {"gen": "dwi_fa",          "syn": ["fa"]}),
-        ("MD",         {"gen": "dwi_md",          "syn": ["md", "mean diffusivity", "mean diff", "avdc"]}),
-        ("EXP_ATTEN",  {"gen": "dwi_exp_atten",   "syn": ["exp atten", "expatten"]}),
-        ("BEM",        {"gen": "dwi_bem",         "syn": ["bem", "bi-exp", "bi exponential", "biexp"]}),
+        ("TRACE",      {"gen": "dwi_trace",       "syn": ["trace", "tracew", "trace w", "isotropic", "iso"],        "policy": "derive"}),
+        ("ADC",        {"gen": "dwi_adc",         "syn": ["adc"],                                                   "policy": "derive"}),
+        ("FA",         {"gen": "dwi_fa",          "syn": ["fa"],                                                    "policy": "derive"}),
+        ("MD",         {"gen": "dwi_md",          "syn": ["md", "mean diffusivity", "mean diff", "avdc"],           "policy": "derive"}),
+        ("EXP_ATTEN",  {"gen": "dwi_exp_atten",   "syn": ["exp atten", "expatten"],                                 "policy": "derive"}),
     ]),
     "SWI": OrderedDict([
-        ("MIP",        {"gen": "swi_mip",         "syn": ["mip"]}),
-        ("MINIP",      {"gen": "swi_minip",       "syn": ["minip", "min ip"]}),
-        ("PHASE",      {"gen": "swi_phase",       "syn": ["phase", "pha", "filt pha", "filt_pha"]}),
-        ("MAG",        {"gen": "swi_mag",         "syn": ["mag", "magnitude"]}),
-        ("QSM",        {"gen": "swi_qsm",         "syn": ["qsm"]}),
+        ("MIP",        {"gen": "swi_mip",         "syn": ["mip"],                                                   "policy": "derive"}),
+        ("MINIP",      {"gen": "swi_minip",       "syn": ["minip", "min ip"],                                       "policy": "derive"}),
+        ("QSM",        {"gen": None,              "syn": ["qsm"],                                                   "policy": "convert_only"}),
+    ]),
+    "SWI_GAD": OrderedDict([
+        ("MIP",        {"gen": "swi_mip",         "syn": ["mip"],                                                   "policy": "derive"}),
+        ("MINIP",      {"gen": "swi_minip",       "syn": ["minip", "min ip"],                                       "policy": "derive"}),
+        ("QSM",        {"gen": None,              "syn": ["qsm"],                                                   "policy": "convert_only"}),
     ]),
     # PERFUSION family includes both classic param maps and simple time summaries
     "PERFUSION": OrderedDict([
-        ("CBV",        {"gen": "perf_cbv",        "syn": ["cbv"]}),
-        ("CBF",        {"gen": "perf_cbf",        "syn": ["cbf"]}),
-        ("MTT",        {"gen": "perf_mtt",        "syn": ["mtt"]}),
-        ("TTP",        {"gen": "perfusion_ttp_index", "syn": ["ttp"]}),
-        ("TMAX",       {"gen": "perf_tmax",       "syn": ["tmax"]}),
-        ("KTRANS",     {"gen": "dce_ktrans",      "syn": ["ktrans", "k trans"]}),
-        ("KEP",        {"gen": "dce_kep",         "syn": ["kep"]}),
-        ("VE",         {"gen": "dce_ve",          "syn": ["ve"]}),
-        ("VP",         {"gen": "dce_vp",          "syn": ["vp"]}),
-        ("LEAKAGE",    {"gen": "perf_leakage",    "syn": ["leakage"]}),
-        ("PARAM_MAP",  {"gen": "perf_param_map",  "syn": ["parametric", "param map", "parametric map"]}),
-        ("PBP",        {"gen": "perf_pbp",        "syn": ["pbp"]}),
-        ("GBP",        {"gen": "perf_gbp",        "syn": ["gbp"]}),
+        ("CBV",        {"gen": "perf_cbv",        "syn": ["cbv"],                                                   "policy": "derive"}),
+        ("CBF",        {"gen": "perf_cbf",        "syn": ["cbf"],                                                   "policy": "derive"}),
+        ("MTT",        {"gen": "perf_mtt",        "syn": ["mtt"],                                                   "policy": "derive"}),
+        ("TTP",        {"gen": "perfusion_ttp_index", "syn": ["ttp"],                                               "policy": "derive"}),
+        ("TMAX",       {"gen": "perf_tmax",       "syn": ["tmax"],                                                  "policy": "derive"}),
+        ("KTRANS",     {"gen": "dce_ktrans",      "syn": ["ktrans", "k trans"],                                     "policy": "derive"}),
+        ("KEP",        {"gen": "dce_kep",         "syn": ["kep"],                                                   "policy": "derive"}),
+        ("VE",         {"gen": "dce_ve",          "syn": ["ve"],                                                    "policy": "derive"}),
+        ("VP",         {"gen": "dce_vp",          "syn": ["vp"],                                                    "policy": "derive"}),
+        ("LEAKAGE",    {"gen": "perf_leakage",    "syn": ["leakage"],                                               "policy": "derive"}),
+        ("PARAM_MAP",  {"gen": "perf_param_map",  "syn": ["parametric", "param map", "parametric map"],             "policy": "derive"}),
+        ("PBP",        {"gen": "perf_pbp",        "syn": ["pbp"],                                                   "policy": "derive"}),
+        ("GBP",        {"gen": "perf_gbp",        "syn": ["gbp"],                                                   "policy": "derive"}),
         # Time-series summaries
-        ("MEAN",       {"gen": "perfusion_mean_t","syn": ["mean"]}),
-        ("MAX",        {"gen": "perfusion_max_t", "syn": ["max"]}),
-        ("AUC",        {"gen": "perfusion_auc_t", "syn": ["auc"]}),
+        ("MEAN",       {"gen": "perfusion_mean_t","syn": ["mean"],                                                  "policy": "derive"}),
+        ("MAX",        {"gen": "perfusion_max_t", "syn": ["max"],                                                   "policy": "derive"}),
+        ("AUC",        {"gen": "perfusion_auc_t", "syn": ["auc"],                                                   "policy": "derive"}),
     ]),
 }
 
@@ -348,6 +350,32 @@ def _dwi_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
 
 def _swi_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
     return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["SWI"], tokens.lower(), set(t.upper() for t in imgtypes))
+
+def _swi_gad_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
+    return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["SWI_GAD"], tokens.lower(), set(t.upper() for t in imgtypes))
+
+def _swi_primary_subtype(tokens: str, imgtypes: set[str]) -> str | None:
+    """
+    Detect primary SWI subtypes (MAG or PHASE) from series description or ImageType/FrameType.
+    Returns "MAG" | "PHASE" | None.
+    NOTE: Use word-boundary matching so that "Images" does not falsely match "mag".
+    """
+    t_raw = tokens if isinstance(tokens, str) else str(tokens)
+    # normalize underscores/hyphens -> space; lowercase
+    t = re.sub(r"[_\-]+", " ", t_raw).lower()
+    iu = set(x.upper() for x in (imgtypes or set()))
+    # magnitude: token "mag" or "magnitude", or ImageType says MAGNITUDE
+    if re.search(r"(?<![a-z0-9])mag(?![a-z0-9])", t) or \
+       re.search(r"(?<![a-z0-9])magnitude(?![a-z0-9])", t) or \
+       ("MAGNITUDE" in iu):
+        return "MAG"
+    # phase: token "phase"/"pha"/"filt pha", or ImageType says PHASE
+    if re.search(r"(?<![a-z0-9])phase(?![a-z0-9])", t) or \
+       re.search(r"(?<![a-z0-9])pha(?![a-z0-9])", t) or \
+       re.search(r"(?<![a-z0-9])filt\s*pha(?![a-z0-9])", t) or \
+       ("PHASE" in iu):
+        return "PHASE"
+    return None
 
 def _perfusion_derived_category(tokens: str, imgtypes: set[str]) -> str | None:
     return _match_cat_from_spec(DERIVED_CATEGORY_SPEC["PERFUSION"], tokens.lower(), set(t.upper() for t in imgtypes))
@@ -376,7 +404,6 @@ def _compute_is_derived(tokens_any, imgtypes: set[str], dcat: str | None) -> boo
         "SUBTRACTED", "PROJECTION", "MIP", "MINIP", "AVERAGE", "MINIMUM", "MAXIMUM", "SUBTRACTION",
         # Many vendors include explicit map names in ImageType/FrameType:
         "ADC", "FA", "TRACE", "TRACEW", "DIFFUSION",  # DWI maps
-        "PHASE", "MAGNITUDE", "QSM",                  # SWI family
         "CBV", "CBF", "MTT", "TTP", "TMAX", "KTRANS", "KEP", "VE", "VP"  # perfusion maps
     }
 
@@ -968,17 +995,34 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             conf = 0.9 if dcat is None else 0.95
 
         elif any(k in t for k in ["swi","swan","suscept","venogr"]):
-            base = "SWI"
+            # Decide between SWI vs SWI_GAD using tokens or vendor/Enhanced hints
+            is_gad = ("gad" in t) or (str(acquisition_contrast).upper() == "CONTRAST") or bool(contrast_agent)
+            base = "SWI_GAD" if is_gad else "SWI"
             if "swan" in t: reason.append("SWI subtype=SWAN")
-            dcat_tokens = _swi_derived_category(t, set())
-            dcat_imgtyp = _swi_derived_category("", imgtypes)
-            # If name is generic SWI/SWAN (no mag/phase/mip/minip words), hold label at SWI
+            # First: detect primary subtypes MAG/PHASE
+            dsub_tokens = _swi_primary_subtype(t, set())
+            dsub_imgtyp = _swi_primary_subtype("", imgtypes)
+            primary_sub = dsub_tokens or dsub_imgtyp
+            # Then: detect true derived categories (e.g., MIP/MINIP)
+            if base == "SWI_GAD":
+                dcat_tokens = _swi_gad_derived_category(t, set())
+                dcat_imgtyp = _swi_gad_derived_category("", imgtypes)
+                is_post = True  # SWI_GAD is, by definition, post-contrast
+            else:
+                dcat_tokens = _swi_derived_category(t, set())
+                dcat_imgtyp = _swi_derived_category("", imgtypes)
+            # If name is generic SWI/SWAN (no subtype or derived words), keep label at SWI
             generic_swi_name = (("swi" in t or "swan" in t) and not any(w in t for w in ["pha","phase","mag","magnitude","min ip","minip","mip"]))
-            dcat = None if generic_swi_name else (dcat_tokens or dcat_imgtyp)
-            label = "SWI" if dcat is None else f"SWI({dcat})"
-            is_derived = _compute_is_derived(t, imgtypes, dcat)
-            reason.append(f"SWI family; derived={is_derived}; dcat={dcat}")
-            conf = 0.9 if dcat is None else 0.95
+            if primary_sub:
+                label = f"{base}({primary_sub})"
+                is_derived = False
+                dcat = None
+            else:
+                dcat = None if generic_swi_name else (dcat_tokens or dcat_imgtyp)
+                label = base if dcat is None else f"{base}({dcat})"
+                is_derived = _compute_is_derived(t, imgtypes, dcat)
+            reason.append(f"{base} family; derived={is_derived}; dcat={dcat}")
+            conf = 0.9 if (primary_sub or dcat is None) else 0.95
 
         elif any(k in t for k in ["perfusion","pwi","dsc","dce","asl","pcasl"]):
             base = "Perfusion"
@@ -1332,6 +1376,30 @@ def enumerate_supported_derivatives(base_type: str, only_with_registered_generat
     return pairs
 
 
+def _filter_derivatives_by_policy(base_type: str, plan_mode: str) -> List[Tuple[str,str]]:
+    """
+    plan_mode: "make" (make_derived_from_scratch), "add" (add_missing_derived), or "none".
+    Returns [(final_label, generator_key)] filtered by each sublabel's 'policy':
+       - "ignore"        → exclude always
+       - "convert_only"  → exclude for planning (still allowed if present as vendor DICOM)
+       - "derive"/None   → include when plan_mode in {"make","add"}
+    """
+    bt = (base_type or "").strip().upper()
+    spec_key = "PERFUSION" if bt in ("PERFUSION","DSC","DCE") else bt
+    spec = DERIVED_CATEGORY_SPEC.get(spec_key, OrderedDict())
+    base_label = "Perfusion" if spec_key == "PERFUSION" else spec_key
+    out: List[Tuple[str,str]] = []
+    for cat, meta in spec.items():
+        pol = str(meta.get("policy","derive")).lower()
+        if pol == "ignore":
+            continue
+        if plan_mode in ("make","add"):
+            if pol == "convert_only":
+                continue
+            out.append((f"{base_label}({cat})", meta.get("gen")))
+    return out
+
+
 def choose_primary_for_derivation(series_df):
     """
     Given a classify_exam_series() dataframe for an exam, return a list of dicts with:
@@ -1438,17 +1506,36 @@ def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True):
 # Minimal generator functions
 # ----------------------------
 
-def run_derived_generator(input_path_or_dicom_dir: str, output_path: str,
-                          generator_key: str, primary_label: str = "", derived_label: str = "") -> str:
+def run_derived_generator(input_path_or_dicom_dir, output_path: str, generator_key: str, primary_label: str = "", derived_label: str = "") -> str:
     """
     Convert DICOM->NIfTI if needed, then run the requested generator and save output_path.
+    Accepts either a single path/dir (str) or a dict of inputs (e.g., {"MAG": <path>, "PHASE": <path>}).
     """
     from .generators import GENERATOR_REGISTRY
+    fn = GENERATOR_REGISTRY.get(generator_key)
+    if fn is None:
+        raise ValueError(f"Unsupported generator '{generator_key}'")
+    # dict (multi-input) case
+    if isinstance(input_path_or_dicom_dir, dict):
+        nifti_inputs, cleanups = {}, {}
+        try:
+            for k, v in input_path_or_dicom_dir.items():
+                p, c = _nifti_from_any(input_path_or_dir=v)
+                ku = str(k).upper()
+                nifti_inputs[ku] = p
+                cleanups[ku] = c
+            written = fn(nifti_inputs, output_path)
+        finally:
+            for ku, c in cleanups.items():
+                try:
+                    if c:
+                        os.remove(nifti_inputs[ku])
+                except Exception:
+                    pass
+        return written
+    # single-input
     nifti_path, cleanup = _nifti_from_any(input_path_or_dir=input_path_or_dicom_dir)
     try:
-        fn = GENERATOR_REGISTRY.get(generator_key)
-        if fn is None:
-            raise ValueError(f"Unsupported generator '{generator_key}'")
         return fn(nifti_path, output_path)
     finally:
         if cleanup:

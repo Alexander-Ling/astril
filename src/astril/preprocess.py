@@ -1376,7 +1376,8 @@ def plan_dicom_to_nifti_conversion(
         _progress,                      # optional tqdm wrapper
         enumerate_supported_derivatives,
         choose_primary_for_derivation,
-        build_derived_output_name
+        build_derived_output_name,
+        _filter_derivatives_by_policy
     )
 
     # ---------- helpers ----------
@@ -1490,9 +1491,19 @@ def plan_dicom_to_nifti_conversion(
             f"These rows will be skipped."
         )
 
+    # Decide how to treat derivatives in this planning run
+    # "make" = plan all supported derivatives de-novo (ignore existing derived);
+    # "add"  = only add truly missing derived for which a primary exists;
+    # "none" = do not plan any new derived rows.
+    plan_mode = "make" if make_derived_from_scratch else ("add" if add_missing_derived else "none")
+
     # ---------- phase 1: discover all exam directories (progress over patients) ----------
     patient_rows = meta.to_dict(orient="records")
     discovered: list[dict] = []
+
+    def _log(prefix: str, msg: str):
+        """Cheap, contextual logger. Prefix is a short tag like 'DISCOVER', 'CLASSIFY', etc."""
+        print(f"[plan:{prefix}] {msg}")
 
     def _discover_one(row):
         patient_rel = row["Directory"]
@@ -1532,6 +1543,8 @@ def plan_dicom_to_nifti_conversion(
     for rec in discovered:
         dedup.setdefault(key(rec), rec)
     exams = list(dedup.values())
+    _log("DISCOVER", f"Found {len(exams)} exam(s) after de-duplication")
+
 
     # Optional MR-subdir filter (case-insensitive)
     if include_mr_subdirs:
@@ -1663,10 +1676,13 @@ def plan_dicom_to_nifti_conversion(
         day0     = rec["_day0"]
         mr_name  = rec["mr_subdir_name"]
         exam_rel = rec["ExamDirectory"]
+        def _elog(stage: str, msg: str):
+            _log(stage, f"patient={pid} exam='{exam_rel}' mr='{mr_name}': {msg}")
 
         try:
             df = classify_exam_series(exam_abs, mr_subdir=mr_name, verbose=False)
         except Exception as e:
+            _elog("CLASSIFY", f"ERROR classify_exam_series: {type(e).__name__}: {e}")
             return _pd.DataFrame([{
                 "Directory": rec["Directory"], "ExamDirectory": exam_rel, "patientID": pid,
                 "day0Date": rec["day0Date"], "mr_subdir_name": mr_name,
@@ -1674,6 +1690,7 @@ def plan_dicom_to_nifti_conversion(
             }])
 
         if df is None or df.empty:
+            _elog("CLASSIFY", "No series returned (empty dataframe)")
             return _pd.DataFrame()
 
         df = df.copy()
@@ -1687,6 +1704,18 @@ def plan_dicom_to_nifti_conversion(
         df["day0Date"]        = rec["day0Date"]
         df["mr_subdir_name"]  = mr_name
         df["series_identifier"] = df["folder"].map(lambda p: os.path.basename(str(p)) if pd.notna(p) else "")
+        # Quick classification summary
+        try:
+            n_total = len(df)
+            n_derived = int(df.get("is_derived", _pd.Series([False]*n_total)).astype(bool).sum())
+            top_labels = (
+                df.get("final_label", _pd.Series([""]*n_total))
+                  .astype(str).str.strip().replace("", "_NA_")
+                  .value_counts().head(8).to_dict()
+            )
+            _elog("CLASSIFY", f"rows={n_total}, derived={n_derived}, top labels={top_labels}")
+        except Exception:
+            pass
 
         # timepoint (int days from acq_dt to day0)
         def _tp(acq):
@@ -1733,6 +1762,14 @@ def plan_dicom_to_nifti_conversion(
             eligible &= df["n_slices"].fillna(-1).astype(float) >= float(min_slices)
 
         df["selected_for_conversion"] = False
+        try:
+            _elog(
+                "ELIGIBILITY",
+                f"eligible={int(eligible.sum())}/{len(eligible)} "
+                f"(min_slices={min_slices}, excluded_labels={sorted(excluded_labels)})"
+            )
+        except Exception:
+            pass
 
         def _select_best(group: _pd.DataFrame) -> int | None:
             g = group.copy()
@@ -1770,6 +1807,19 @@ def plan_dicom_to_nifti_conversion(
                     chosen.append(idx)
             if chosen:
                 df.loc[chosen, "selected_for_conversion"] = True
+        try:
+            n_sel = int(df["selected_for_conversion"].astype(bool).sum())
+            _elog("SELECT", f"selected_for_conversion={n_sel}/{len(df)} "
+                            f"unique_labels={len(df[label_col].astype(str).unique()) if label_col else 'NA'}")
+            if n_sel == 0:
+                # Show a hint of why nothing was picked
+                _elog("SELECT", f"Sample of labels with max slices/conf: " +
+                      str(df.groupby(df[label_col]).agg(
+                          n_slices=("n_slices","max"),
+                          confidence=("confidence","max")
+                      ).head(6).to_dict()) )
+        except Exception:
+            pass
 
         # proposed nifti paths (only for selected)
         def _proposed_path(r):
@@ -1799,6 +1849,12 @@ def plan_dicom_to_nifti_conversion(
             # Consider only PRIMARIES that were selected for conversion
             sel_mask = df.get("selected_for_conversion", False).astype(bool) & ~df.get("is_derived", False).astype(bool)
             sel_prim = df.loc[sel_mask].copy()
+            try:
+                _elog("DERIVE", f"primaries selected={len(sel_prim)}; have_labels={sorted(list(have_labels))[:8]}...")
+                if not len(sel_prim):
+                    _elog("DERIVE", "No primaries selected — skipping derivative planning for this exam")
+            except Exception:
+                pass
 
             def _norm_primary_label(lbl: str) -> str:
                 s = str(lbl or "")
@@ -1819,6 +1875,10 @@ def plan_dicom_to_nifti_conversion(
             derived_rows: list[dict] = []
 
             for norm_lbl, prim_row in prim_by_label.items():
+                try:
+                    _elog("DERIVE", f"primary base='{norm_lbl}' chosen='{prim_row.get('final_label','')}'")
+                except Exception:
+                    pass
                 # DWI family: force derivations to use the true DWI primary, never TRACE/AvDC
                 if str(norm_lbl).upper() == "DWI":
                     raw_lbl = str(prim_row.get(label_col, "")).upper()
@@ -1830,13 +1890,46 @@ def plan_dicom_to_nifti_conversion(
                         idx_fix = _select_best(_cands) if not _cands.empty else None
                         if idx_fix is not None:
                             prim_row = df.loc[idx_fix]
+                # SWI family: prefer vendor-composited SWI (no parentheses) when available
+                if str(norm_lbl).upper() == "SWI":
+                    raw_lbl = str(prim_row.get(label_col, "")).upper()
+                    if "(" in raw_lbl:
+                        _cands = sel_prim[
+                            (sel_prim[label_col].map(_norm_primary_label) == "SWI") &
+                            (~sel_prim[label_col].astype(str).str.contains(r"\("))
+                        ]
+                        idx_fix = _select_best(_cands) if not _cands.empty else None
+                        if idx_fix is not None:
+                            prim_row = df.loc[idx_fix]
+                # SWI_GAD family: prefer vendor-composited SWI_GAD (no parentheses) when available
+                if str(norm_lbl).upper() == "SWI_GAD":
+                    raw_lbl = str(prim_row.get(label_col, "")).upper()
+                    if "(" in raw_lbl:
+                        _cands = sel_prim[
+                            (sel_prim[label_col].map(_norm_primary_label) == "SWI_GAD") &
+                            (~sel_prim[label_col].astype(str).str.contains(r"\("))
+                        ]
+                        idx_fix = _select_best(_cands) if not _cands.empty else None
+                        if idx_fix is not None:
+                            prim_row = df.loc[idx_fix]
                 base_type = str(prim_row.get("base_type", norm_lbl)).strip()
                 prim_lbl  = str(prim_row.get("final_label", "")).strip()
                 if bool(prim_row.get("is_derived", False)):
                     continue
 
-                # Use the actual base_type variable (the old code used an undefined `base`)
-                for derived_lbl, gen_key in enumerate_supported_derivatives(base_type):
+                # Use the actual base_type variable and honor DERIVED_CATEGORY_SPEC['policy'].
+                # plan_mode is computed earlier in this function ("make" | "add" | "none").
+                from .preprocessing_utils import _filter_derivatives_by_policy
+                # First, filter by policy (respect "ignore" / "convert_only" / "derive")
+                _candidates = _filter_derivatives_by_policy(base_type, plan_mode)
+                # Then, require a registered generator (same behavior as before)
+                try:
+                    from .generators import GENERATOR_REGISTRY as _GENS
+                    _candidates = [(lab, key) for (lab, key) in _candidates if key in _GENS]
+                except Exception:
+                    # If registry can't be imported, keep whatever the policy allowed
+                    pass
+                for derived_lbl, gen_key in _candidates:
                     d_up = str(derived_lbl).strip().upper()
                     if d_up == prim_lbl.strip().upper():
                         continue
@@ -1876,6 +1969,49 @@ def plan_dicom_to_nifti_conversion(
                         "PrimarySeriesPath":     prim_row.get("folder") or prim_row.get("series_dir") or "",
                         "proposed_nifti_path":   out_path,
                     }
+                    # --- Special handling: composite SWI planning ---
+                    # If a vendor SWI already exists, DO NOT schedule any composite SWI derivation.
+                    if base_type.upper() == "SWI" and d_up == "SWI":
+                        # 1) If vendor SWI already present (non-derived "SWI"), skip scheduling a composite SWI.
+                        try:
+                            _vendor = df[(df.get("final_label","").astype(str).str.upper() == "SWI") & (~df.get("is_derived", False))]
+                            if not _vendor.empty:
+                                continue
+                        except Exception:
+                            # if any issue reading df, fall through to try MAG+PHASE
+                            pass
+                        # 2) If no vendor SWI: require MAG + PHASE primaries to synthesize one
+                        try:
+                            _mag = df[(df.get("final_label","").astype(str).str.upper() == "SWI(MAG)") & (~df.get("is_derived", False))]
+                            _pha = df[(df.get("final_label","").astype(str).str.upper() == "SWI(PHASE)") & (~df.get("is_derived", False))]
+                            mag_dir = (_mag.iloc[0].get("folder") or _mag.iloc[0].get("series_dir") or "")
+                            pha_dir = (_pha.iloc[0].get("folder") or _pha.iloc[0].get("series_dir") or "")
+                        except Exception:
+                            mag_dir = ""; pha_dir = ""
+                        if not (mag_dir and pha_dir):
+                            # Can't synthesize a composite → skip planning a derived SWI
+                            continue
+                        # 3) Transform the row to represent a *single* derived SWI using the composite generator
+                        rec["DerivedLabel"] = "SWI"                 # outward-facing label is plain SWI
+                        rec["final_label"]  = "SWI"
+                        rec["GeneratorKey"] = "swi_composite"       # still use the composite generator
+                        rec["DeriveInputs"] = {"MAG": mag_dir, "PHASE": pha_dir}
+                        # Make sure the proposed output filename uses "SWI.nii.gz"
+                        try:
+                            out_path = str(rec.get("proposed_nifti_path",""))
+                            if out_path:
+                                base = os.path.basename(out_path)
+                                # Replace whatever derived label was there with SWI
+                                base_swi = base.replace(_sanitize_label(derived_lbl), _sanitize_label("SWI"))
+                                rec["proposed_nifti_path"] = os.path.join(os.path.dirname(out_path), base_swi)
+                        except Exception:
+                            pass
+                        # record and move on
+                        derived_rows.append(rec)
+                        planned_labels.add("SWI")
+                        continue  # don't run the generic path below for this composite case
+
+                    # --- default derived planning path ---
                     derived_rows.append(rec)
                     planned_labels.add(d_up)
 
@@ -1900,8 +2036,9 @@ def plan_dicom_to_nifti_conversion(
                         if df is not None and not df.empty:
                             results.append(df)
                             _stream_block(df)  # stream per-exam block + blank line
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[plan:ERROR] {e.__class__.__name__}: {e}")
+                        raise
         else:
             for r in _progress(exams_to_process, total=len(exams_to_process), desc="Processing exams", unit="exam", enable=show_progress):
                 df = _process_exam(r)
@@ -2040,6 +2177,7 @@ def convert_dicom_plan(
 
     from .preprocessing_utils import (
         _read_table, _save_table, _progress,
+        _sanitize_label,
     )
 
     # ---------- read and validate plan ----------
@@ -2211,9 +2349,70 @@ def convert_dicom_plan(
                 generator_key = rec.get("GeneratorKey", "")
                 primary_label = rec.get("PrimaryLabel", "")
                 derived_label = rec.get("DerivedLabel", "")
-                src_path = rec.get("PrimarySeriesPath") or series_dir  # both are a DICOM dir per the plan
+                src_input = rec.get("DeriveInputs") or rec.get("PrimarySeriesPath") or series_dir  # dict for multi-input, else DICOM dir
+                # Enforce: SWI/SWI_GAD MIP/MINIP must use a composite of the same family (vendor or synthesized).
+                if str(rec.get("GeneratorKey","")) in ("swi_mip","swi_minip"):
+                    # Decide which family this derived label belongs to
+                    _derived_up = str(rec.get("DerivedLabel","")).upper()
+                    comp_base = "SWI_GAD" if _derived_up.startswith("SWI_GAD") else "SWI"
+                    base_name = os.path.basename(out_path)
+                    comp_name = base_name.replace(_sanitize_label(rec.get("DerivedLabel","")),
+                                                  _sanitize_label(comp_base))
+                    comp_path = os.path.join(os.path.dirname(out_path), comp_name)
+                    if os.path.isfile(comp_path):
+                        # 1) already-derived composite exists → use it
+                        src_input = comp_path
+                    else:
+                        # 2) try vendor composite primary for the same family (label == comp_base)
+                        vendor_swi_dir = ""
+                        vendor_swi_nii = ""
+                        try:
+                            _vendor = plan[(plan.get("final_label","").astype(str).str.upper()==comp_base) &
+                                           (~plan.get("is_derived", False))]
+                            if not _vendor.empty:
+                                vendor_swi_dir = (_vendor.iloc[0].get("folder") or
+                                                  _vendor.iloc[0].get("series_dir") or "")
+                                vendor_swi_nii = _vendor.iloc[0].get("proposed_nifti_path") or ""
+                        except Exception:
+                            pass
+                        if vendor_swi_dir or vendor_swi_nii:
+                            # Use the vendor composite directly (DICOM dir or existing NIfTI)
+                            src_input = vendor_swi_nii if (vendor_swi_nii and os.path.isfile(vendor_swi_nii)) \
+                                                       else vendor_swi_dir
+                        else:
+                            # 3) synthesize composite now from family-matched MAG + PHASE, then use it
+                            mag_dir = ""
+                            pha_dir = ""
+                            try:
+                                _mag = plan[(plan.get("final_label","").astype(str).str.upper()==f"{comp_base}(MAG)") &
+                                            (~plan.get("is_derived", False))]
+                                _pha = plan[(plan.get("final_label","").astype(str).str.upper()==f"{comp_base}(PHASE)") &
+                                            (~plan.get("is_derived", False))]
+                                if not _mag.empty:
+                                    mag_dir = (_mag.iloc[0].get("folder") or _mag.iloc[0].get("series_dir") or "")
+                                if not _pha.empty:
+                                    pha_dir = (_pha.iloc[0].get("folder") or _pha.iloc[0].get("series_dir") or "")
+                            except Exception:
+                                pass
+                            if mag_dir and pha_dir:
+                                _ = run_derived_generator(
+                                    input_path_or_dicom_dir={"MAG": mag_dir, "PHASE": pha_dir},
+                                    output_path=comp_path,
+                                    generator_key="swi_composite",
+                                    primary_label=comp_base,
+                                    derived_label=comp_base,
+                                )
+                                src_input = comp_path
+                            else:
+                                # Could not find vendor SWI or both MAG+PHASE → fail this row cleanly
+                                rec["status"] = "error"
+                                rec["message"] = (
+                                    f"{comp_base}(MIP/MINIP) requires a composite {comp_base}, but neither a vendor {comp_base} "
+                                    f"nor both {comp_base}(MAG) and {comp_base}(PHASE) were found."
+                                )
+                                return rec
                 written = run_derived_generator(
-                    input_path_or_dicom_dir=src_path,
+                    input_path_or_dicom_dir=src_input,
                     output_path=out_path,
                     generator_key=generator_key,
                     primary_label=primary_label,
