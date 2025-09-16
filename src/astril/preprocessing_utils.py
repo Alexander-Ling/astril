@@ -1471,7 +1471,7 @@ def _log_nifti_shape(nifti_path: str, orig_path: str | None, verbose=None):
         ndim = len(shape)
         is4d = (ndim == 4 and shape[3] >= 2)
         src = orig_path if orig_path else nifti_path
-        _dbg(verbose, f"input = {src}; shape={shape} (ndim={ndim}) → {'4D OK' if is4d else 'NOT 4D'}")    except Exception as e:
+        _dbg(verbose, f"input = {src}; shape={shape} (ndim={ndim}) → {'4D OK' if is4d else 'NOT 4D'}")
     except Exception as e:
         _dbg(verbose, "failed to inspect nifti:", e)
 
@@ -1510,18 +1510,23 @@ def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None) -> str | 
             # Best effort: skip this file; dcm2niix can still work with the rest
     return str(dst)
 
-def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True, *, verbose=None):
+def _nifti_from_any(input_path_or_dir: str,
+                    output_path: str | None = None,
+                    verbose=None,
+                    strict_deid: bool = True):
     """
     Accept a DICOM series directory or a NIfTI file path.
     If DICOM dir, convert to a temp NIfTI (keeping 4D if present).
-    Prefer dcm2niix first (emits bval/bvec when applicable); then fall back to our dicom2nifti-based converter.
-    Return (nifti_path, cleanup_temp_bool)
+    Uses dcm2niix (emits bval/bvec when applicable) with optional JPEG-lossless transcode+retry.
+    Return (nifti_path, cleanup_temp_bool). If output_path is provided, the returned path is output_path and cleanup=False.
     """
     if _is_dicom_dir(input_path_or_dir):
         _dbg(verbose, "Input is DICOM dir:", input_path_or_dir)
-        # Try dcm2niix first
+        # Ensure dcm2niix exists
+        if not _which("dcm2niix"):
+            raise RuntimeError("dcm2niix not found on PATH. Please install dcm2niix and ensure it is discoverable.")
+        # Try dcm2niix (with optional transcode+retry)
         try:
-            raise Exception("Forcing an exception to test dicom2nifti")
             tmpdir = tempfile.mkdtemp(prefix="dcm2niix_")
             cmd = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir]
             _dbg(verbose, "running:", " ".join(cmd))
@@ -1544,17 +1549,22 @@ def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True, *, ver
                             raise RuntimeError("dcm2niix retry produced no NIfTI")
                         nifti_path = nii_candidates[0]
                         _dbg(verbose, "dcm2niix retry output:", nifti_path)
-                        _log_nifti_shape(nifti_path, verbose)
+                        _log_nifti_shape(nifti_path, input_path_or_dir, verbose)
                         # Write PHI-safe JSON sidecar using ORIGINAL DICOM dir (not the decoded copy)
                         try:
-                            info = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
-                            write_json_sidecar(nifti_path, info)
+                            sidecar = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
+                            _merge_and_write_json_sidecar(nifti_path, sidecar, strict_deid=strict_deid)
                             _dbg(verbose, "wrote JSON sidecar next to NIfTI")
                         except Exception as e:
                             _dbg(verbose, "WARNING: failed to write JSON sidecar:", e)
+                        # Move/copy to output_path if requested
+                        if output_path:
+                            dest = _finalize_output(nifti_path, output_path)
+                            return dest, False
                         return nifti_path, True
                 # If transcode+retry did not succeed, fall through to fallback
-                raise RuntimeError(proc.stderr.strip()[:400])
+                err = (proc.stderr or proc.stdout or "").strip()
+                raise RuntimeError(f"dcm2niix failed:\n{err[:400]}")
             # Success path (original dcm2niix)
             nii_candidates = sorted(glob.glob(os.path.join(tmpdir, "tmp*.nii*"))) \
                           or sorted(glob.glob(os.path.join(tmpdir, "*.nii*")))
@@ -1565,30 +1575,108 @@ def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True, *, ver
             has_bval = os.path.exists(os.path.join(tmpdir, "tmp.bval"))
             has_bvec = os.path.exists(os.path.join(tmpdir, "tmp.bvec"))
             _dbg(verbose, f"sidecars: bval={has_bval} bvec={has_bvec}")
-            _log_nifti_shape(nifti_path, verbose)
-            # PHI-safe JSON sidecar
+            _log_nifti_shape(nifti_path, input_path_or_dir, verbose)
+            # write JSON sidecar
             try:
-                info = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
-                write_json_sidecar(nifti_path, info)
-                _dbg(verbose, "wrote JSON sidecar next to NIfTI")
+                sidecar = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
+                _merge_and_write_json_sidecar(nifti_path, sidecar, strict_deid=strict_deid)
+                if verbose:
+                    print("[nifti_from_any] wrote JSON sidecar next to NIfTI")
             except Exception as e:
                 _dbg(verbose, "WARNING: failed to write JSON sidecar:", e)
+            if output_path:
+                dest = _finalize_output(nifti_path, output_path)
+                return dest, False
             return nifti_path, True
         except Exception as e:
-            _dbg(verbose, "dcm2niix failed; falling back to dicom2nifti:", e)
-            # Fall back to our converter (writes a single output path)
-            tmp_root = tempfile.mkdtemp(prefix="dicom2nifti_")
-            tmpnii = os.path.join(tmp_root, "tmp.nii.gz")
-            from .preprocess import convert_dicom_to_nifti
-            nifti_path = convert_dicom_to_nifti(input_path_or_dir, tmpnii, reorient=reorient, compress=compress)
-            _dbg(verbose, "dicom2nifti output:", nifti_path)
-            # convert_dicom_to_nifti() now guarantees a single final NIfTI at nifti_path
-            _log_nifti_shape(nifti_path, verbose)
-            return nifti_path, True
+            # No fallback: surface the dcm2niix error clearly
+            msg = f"dcm2niix could not convert '{input_path_or_dir}': {type(e).__name__}: {e}"
+            _dbg(verbose, msg)
+            raise RuntimeError(msg)
     else:
-        _dbg(verbose, "Input is NIfTI:", input_path_or_dir)
         _log_nifti_shape(input_path_or_dir, input_path_or_dir, verbose)
+        # If caller asked for a specific output_path, copy to that path
+        if output_path:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(input_path_or_dir), str(output_path))
+            return output_path, False
         return input_path_or_dir, False
+
+def _scrub_sidecar(info: Dict[str, Any], *, strict: bool = True) -> Dict[str, Any]:
+    """Remove potentially identifying fields from a dcm2niix-style JSON.
+    This is conservative and intended for sharing outside the institution.
+    For internal use, set strict=False to keep everything.
+    """
+    if not strict or not isinstance(info, dict):
+        return info
+    drop_keys = {
+        # Site/equipment revealing fields
+        "InstitutionName", "InstitutionAddress", "StationName", "DeviceSerialNumber",
+        # Date/time of acquisition
+        "AcquisitionTime", "AcquisitionDate", "AcquisitionDateTime",
+        "SeriesDate", "SeriesTime", "StudyDate", "StudyTime",
+        "ContentDate", "ContentTime",
+        # Free-text that may carry PHI (site-dependent)
+        "StudyDescription", "SeriesDescription", "ProtocolName", "ProcedureStepDescription",
+    }
+    # Also drop any unexpected Patient* fields if present
+    info = {k: v for k, v in info.items() if (k not in drop_keys and not k.startswith("Patient"))}
+    return info
+
+def _nii_stem(p: str) -> str:
+    return p[:-7] if p.lower().endswith(".nii.gz") else os.path.splitext(p)[0]
+
+def _merge_and_write_json_sidecar(nifti_path: str, dynamic_info: Dict[str, Any], *, strict_deid: bool = True) -> None:
+    """If a dcm2niix JSON exists next to nifti_path, load it, scrub PHI,
+    then merge in dynamic_info (which takes precedence) and write back."""
+    base = _nii_stem(nifti_path)
+    src_json = base + ".json"
+    merged: Dict[str, Any] = {}
+    if os.path.exists(src_json):
+        try:
+            with open(src_json, "r", encoding="utf-8") as fh:
+                dcm2 = json.load(fh)
+            dcm2 = _scrub_sidecar(dcm2, strict=strict_deid)
+            if isinstance(dcm2, dict):
+                merged.update(dcm2)
+        except Exception:
+            pass
+    # dynamic info is already PHI-scrubbed and should override
+    if isinstance(dynamic_info, dict):
+        merged.update(dynamic_info)
+    # record deid mode
+    merged.setdefault("deidentification", {"strict": bool(strict_deid)})
+    try:
+        write_json_sidecar(nifti_path, merged)
+    except Exception:
+        # last resort: write the dynamic_info only
+        write_json_sidecar(nifti_path, dynamic_info)
+
+def _finalize_output(src_nii: str, dest_nii: str) -> str:
+    """
+    Copy the NIfTI and any sidecars (.json/.bval/.bvec) from the temp location
+    to the requested destination basename.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(dest_nii)), exist_ok=True)
+    shutil.copy2(src_nii, dest_nii)
+    # Map: src basename -> dest basename
+    def _base(p):
+        return p[:-7] if p.lower().endswith(".nii.gz") else os.path.splitext(p)[0]
+    sbase, dbase = _base(src_nii), _base(dest_nii)
+    for ext in (".json", ".bval", ".bvec"):
+        # prefer the canonical sidecar (e.g., tmp.json), but gracefully handle legacy tmp.nii.json
+        if ext == ".json":
+            primary = sbase + ".json"
+            legacy  = sbase + ".nii.json"
+            if os.path.exists(primary):
+                shutil.copy2(primary, dbase + ".json")
+            elif os.path.exists(legacy):
+                shutil.copy2(legacy, dbase + ".json")
+        else:
+            s = sbase + ext
+            if os.path.exists(s):
+                shutil.copy2(s, dbase + ext)
+    return dest_nii
 
 def _sanitize_label(lbl: str) -> str:
     if lbl is None: return "Unknown"
@@ -1779,7 +1867,7 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
     }
 
 def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = ".json") -> str:
-    out = os.path.splitext(nifti_path)[0] + suffix
+    out = _nii_stem(nifti_path) + suffix
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(info, fh, indent=2, ensure_ascii=False)
     return out

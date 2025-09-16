@@ -2086,15 +2086,11 @@ def plan_dicom_to_nifti_conversion(
 def convert_dicom_to_nifti(
     dicom_series_dir: str,
     output_path: str,
-    reorient: bool = True,
-    compress: bool = True,
-    *,
     verbose: bool | None = None,
 ) -> str:
-    import os, tempfile
+    import os
     from pathlib import Path
-    import dicom2nifti, nibabel as nib
-    import numpy as np
+    from .preprocessing_utils import _nifti_from_any
 
     def _dbg(*a):
         if (verbose is True) or (verbose is None and os.environ.get("ASTRIL_DEBUG_CONVERT","") not in ("","0","false","False","FALSE")):
@@ -2106,113 +2102,16 @@ def convert_dicom_to_nifti(
     if not series.exists():
         raise FileNotFoundError(f"Series directory not found: {series}")
 
-    _dbg("Converting via dicom2nifti:", series)
-    # Work in a PRIVATE temp dir so we never leak multiple outputs to the caller
-    with tempfile.TemporaryDirectory() as work:
-        dicom2nifti.convert_directory(
-            str(series),
-            work,
-            reorient=reorient,
-            compression=compress,
-        )
-        # Search recursively (some dicom2nifti versions create subfolders)
-        candidates = sorted(Path(work).rglob("*.nii*"))
-        _dbg(f"dicom2nifti candidates: {len(candidates)} -> {[c.name for c in candidates[:5]]}{'...' if len(candidates)>5 else ''}")
-        if not candidates:
-            raise RuntimeError(f"No NIfTI produced from {series}")
-
-        # Partition by dimensionality
-        four_d, three_d = [], []
-        for c in candidates:
-            try:
-                img = nib.load(str(c))
-                shp = img.header.get_data_shape()
-                if len(shp) == 4 and shp[3] >= 2:
-                    four_d.append((c, img, shp))
-                elif len(shp) == 3:
-                    three_d.append((c, img, shp))
-            except Exception as e:
-                _dbg("Skipping unreadable candidate:", c.name, e)
-
-        if four_d:
-            # Prefer an existing 4D file; pick the one with the largest T
-            pick = max(four_d, key=lambda t: t[2][3])
-            nib.save(pick[1], str(out))
-            _dbg("selected existing 4D candidate:", pick[0].name, "shape=", pick[2])
-        elif len(three_d) >= 2:
-            # Check consistent geometry + affine
-            shapes = {t[2] for t in three_d}
-            aff_ok = True
-            ref_aff = three_d[0][1].affine
-            for _, img, _ in three_d[1:]:
-                if not np.allclose(img.affine, ref_aff, atol=1e-5):
-                    aff_ok = False
-                    break
-            if len(shapes) == 1 and aff_ok:
-                # Prefer time-order using DICOM-derived frame times
-                try:
-                    from .preprocessing_utils import build_dynamic_sidecar_from_dicoms
-                    info = build_dynamic_sidecar_from_dicoms(str(series))
-                    times = info.get("frame_times_sec", None)
-                except Exception:
-                    info, times = None, None
-                if isinstance(times, list) and len(times) == len(three_d):
-                    idx_time = [(i, float('inf') if (t is None) else float(t)) for i, t in enumerate(times)]
-                    order = [i for i, _ in sorted(idx_time, key=lambda it: (it[1], it[0]))]
-                    three_d_sorted = [three_d[i] for i in order]
-                    _dbg("stack order: acquisition time (ascending)", [x[0].name for x in three_d_sorted[:5]], "...")
-                else:
-                    three_d_sorted = sorted(three_d, key=lambda t: t[0].name)
-                    _dbg("stack order: filename (fallback)", [x[0].name for x in three_d_sorted[:5]], "...")
-
-                # Stack all 3D volumes to 4D
-                data_stack = [img.get_fdata(dtype=np.float32) for _, img, _ in three_d_sorted]
-                data_4d = np.stack(data_stack, axis=3)
-                ref_img = three_d_sorted[0][1]
-                hdr = ref_img.header.copy()
-                # Set time units and TR if known
-                tr = None
-                try:
-                    if info:
-                        tr = info.get("estimated_TR_sec", None)
-                except Exception:
-                    tr = None
-                try:
-                    hdr.set_xyzt_units('mm', 'sec')
-                except Exception:
-                    pass
-                try:
-                    hdr["pixdim"][4] = float(tr) if (tr and tr > 0) else 1.0
-                except Exception:
-                    pass
-                nib.save(nib.Nifti1Image(data_4d, ref_img.affine, hdr), str(out))
-                _dbg("stacked", len(data_stack), "3D volumes → 4D:", data_4d.shape)
-            else:
-                # Shapes/affines disagree — be conservative: keep first
-                candidates[0].replace(out)
-                _dbg("WARNING: 3D outputs differ in shape/affine; using first candidate:", candidates[0].name)
-        else:
-            # Only a single 3D candidate — keep behavior (likely not dynamic)
-            candidates[0].replace(out)
-            _dbg("single 3D candidate:", candidates[0].name)
-
-        # Log final shape
-        try:
-            img = nib.load(str(out))
-            _dbg("final NIfTI:", out.name, "shape=", tuple(img.header.get_data_shape()))
-        except Exception as e:
-            _dbg("WARNING: failed to inspect final NIfTI shape:", e)
-
-        # PHI-safe JSON sidecar from ORIGINAL DICOM dir
-        try:
-            from .preprocessing_utils import build_dynamic_sidecar_from_dicoms, write_json_sidecar
-            info = build_dynamic_sidecar_from_dicoms(str(series))
-            if info:
-                write_json_sidecar(str(out), info)
-        except Exception:
-            pass
-
-    return str(out)
+    _dbg("Converting via dcm2niix:", series)
+    # Delegate to dcm2niix-first converter which also writes PHI-safe JSON sidecar
+    # and honors the requested output_path (including copying .bval/.bvec/.json if present).
+    final_path, _ = _nifti_from_any(
+        input_path_or_dir=str(series),
+        verbose=verbose,
+        output_path=str(out),
+    )
+    _dbg("final NIfTI:", Path(final_path).name)
+    return final_path
 
 
 # ------------------------------------------------------------
@@ -2222,8 +2121,6 @@ def convert_dicom_plan(
     plan_path: str,
     n_workers: int | None = None,
     overwrite: bool = False,
-    reorient: bool = True,
-    compress: bool = True,
     log_out: str | None = None,
     show_progress: bool = True,
 ):
@@ -2404,17 +2301,21 @@ def convert_dicom_plan(
                 written = convert_dicom_to_nifti(
                     dicom_series_dir=series_dir,
                     output_path=out_path,
-                    reorient=reorient,
-                    compress=compress,
                 )
                 rec["status"] = "ok"
                 rec["nii_path"] = written
+                print(f"CONVERT out_path = {out_path}")
+                print(f"CONVERT written = {written}")
             elif action == "DERIVE":
                 from .preprocessing_utils import run_derived_generator
                 generator_key = rec.get("GeneratorKey", "")
                 primary_label = rec.get("PrimaryLabel", "")
                 derived_label = rec.get("DerivedLabel", "")
                 src_input = rec.get("DeriveInputs") or rec.get("PrimarySeriesPath") or series_dir  # dict for multi-input, else DICOM dir
+                if "is_derived" in plan.columns:
+                    _not_derived = ~plan["is_derived"].map(_to_bool).fillna(False)
+                else:
+                    _not_derived = pd.Series(True, index=plan.index)
                 # Enforce: SWI/SWI_GAD MIP/MINIP must use a composite of the same family (vendor or synthesized).
                 if str(rec.get("GeneratorKey","")) in ("swi_mip","swi_minip"):
                     # Decide which family this derived label belongs to
@@ -2432,8 +2333,9 @@ def convert_dicom_plan(
                         vendor_swi_dir = ""
                         vendor_swi_nii = ""
                         try:
-                            _vendor = plan[(plan.get("final_label","").astype(str).str.upper()==comp_base) &
-                                           (~plan.get("is_derived", False))]
+                            _vendor = plan[
+                                (plan.get("final_label","").astype(str).str.strip().str.upper() == comp_base) & _not_derived
+                            ]
                             if not _vendor.empty:
                                 vendor_swi_dir = (_vendor.iloc[0].get("folder") or
                                                   _vendor.iloc[0].get("series_dir") or "")
@@ -2449,10 +2351,12 @@ def convert_dicom_plan(
                             mag_dir = ""
                             pha_dir = ""
                             try:
-                                _mag = plan[(plan.get("final_label","").astype(str).str.upper()==f"{comp_base}(MAG)") &
-                                            (~plan.get("is_derived", False))]
-                                _pha = plan[(plan.get("final_label","").astype(str).str.upper()==f"{comp_base}(PHASE)") &
-                                            (~plan.get("is_derived", False))]
+                                _mag = plan[
+                                    (plan.get("final_label","").astype(str).str.strip().str.upper() == f"{comp_base}(MAG)") & _not_derived
+                                ]
+                                _pha = plan[
+                                    (plan.get("final_label","").astype(str).str.strip().str.upper() == f"{comp_base}(PHASE)") & _not_derived
+                                ]
                                 if not _mag.empty:
                                     mag_dir = (_mag.iloc[0].get("folder") or _mag.iloc[0].get("series_dir") or "")
                                 if not _pha.empty:
@@ -2800,14 +2704,10 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p = sub.add_parser("convert_dicom_to_nifti", help="Convert one DICOM series directory to NIfTI (dicom2nifti).")
     p.add_argument("--dicom_dir", required=True, help="Directory containing one DICOM series")
     p.add_argument("--output_path", required=True, help="Output NIfTI path (.nii or .nii.gz)")
-    p.add_argument("--no_reorient", action="store_true", help="Disable reorientation to standard space")
-    p.add_argument("--no_compress", action="store_true", help="Write .nii instead of .nii.gz")
     def _run_c2n(a):
         convert_dicom_to_nifti(
             dicom_series_dir=a.dicom_dir,
             output_path=a.output_path,
-            reorient=not a.no_reorient,
-            compress=not a.no_compress,
         )
         print(f"Saved: {a.output_path}")
     p.set_defaults(func=_run_c2n)
@@ -2817,16 +2717,12 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--plan", required=True, help="Path to plan CSV/TSV/XLSX from plan_dicom_to_nifti_conversion.")
     p.add_argument("--n_workers", type=int, default=None, help="Parallel workers (I/O-bound).")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output NIfTI if present.")
-    p.add_argument("--no_reorient", action="store_true", help="Disable reorientation to standard space.")
-    p.add_argument("--no_compress", action="store_true", help="Write .nii instead of .nii.gz.")
     p.add_argument("--logOut", default=None, help="Optional CSV/TSV log path for results.")
     def _run_convert(a):
         convert_dicom_plan(
             plan_path=a.plan,
             n_workers=a.n_workers,
             overwrite=a.overwrite,
-            reorient=(not a.no_reorient),
-            compress=(not a.no_compress),
             log_out=a.logOut,
             show_progress=True,
         )
