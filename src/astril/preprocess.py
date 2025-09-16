@@ -1377,7 +1377,8 @@ def plan_dicom_to_nifti_conversion(
         enumerate_supported_derivatives,
         choose_primary_for_derivation,
         build_derived_output_name,
-        _filter_derivatives_by_policy
+        _filter_derivatives_by_policy,
+        _sanitize_label
     )
 
     # ---------- helpers ----------
@@ -1391,14 +1392,6 @@ def plan_dicom_to_nifti_conversion(
     def _safe_int(x, default=None):
         try: return int(x)
         except Exception: return default
-
-    def _sanitize_label(lbl: str) -> str:
-        if lbl is None: return "Unknown"
-        s = str(lbl).strip()
-        s = s.replace("(", "_").replace(")", "_")
-        s = re.sub(r"[^\w\-\+\.]+", "_", s)
-        s = re.sub(r"__+", "_", s).strip("_")
-        return s or "Unknown"
 
     def _discover_exams(patient_abs: str) -> list[tuple[str, str]]:
         """Return de-duplicated (exam_dir_abs, mr_subdir_name) based on .dcm leaves."""
@@ -2095,58 +2088,130 @@ def convert_dicom_to_nifti(
     output_path: str,
     reorient: bool = True,
     compress: bool = True,
+    *,
+    verbose: bool | None = None,
 ) -> str:
-    """
-    Convert a single DICOM series directory to NIfTI using dicom2nifti.
-
-    Parameters
-    ----------
-    dicom_series_dir : str
-        Path to a directory containing a single series of DICOM files.
-    output_path : str
-        Destination NIfTI path (.nii or .nii.gz). Parent directories will be created.
-    reorient : bool
-        If True, reorient to standard (dicom2nifti's default).
-    compress : bool
-        If True, create .nii.gz; else create .nii.
-
-    Returns
-    -------
-    str
-        The path written to (same as output_path).
-
-    Raises
-    ------
-    FileNotFoundError
-        If the series directory is missing.
-    RuntimeError
-        If dicom2nifti did not produce a NIfTI.
-    """
-    from .preprocessing_utils import ensure_dicom2nifti_installed
-    ensure_dicom2nifti_installed()
+    import os, tempfile
     from pathlib import Path
-    import tempfile
-    import dicom2nifti
+    import dicom2nifti, nibabel as nib
+    import numpy as np
+
+    def _dbg(*a):
+        if (verbose is True) or (verbose is None and os.environ.get("ASTRIL_DEBUG_CONVERT","") not in ("","0","false","False","FALSE")):
+            print("[convert_dicom_to_nifti]", *a, flush=True)
 
     series = Path(dicom_series_dir)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-
     if not series.exists():
         raise FileNotFoundError(f"Series directory not found: {series}")
 
-    # Run conversion into a temp folder, then move the first produced file to desired name.
-    with tempfile.TemporaryDirectory() as tmpdir:
+    _dbg("Converting via dicom2nifti:", series)
+    # Work in a PRIVATE temp dir so we never leak multiple outputs to the caller
+    with tempfile.TemporaryDirectory() as work:
         dicom2nifti.convert_directory(
             str(series),
-            tmpdir,
+            work,
             reorient=reorient,
             compression=compress,
         )
-        candidates = sorted(Path(tmpdir).glob("*.nii*"))  # .nii or .nii.gz
+        # Search recursively (some dicom2nifti versions create subfolders)
+        candidates = sorted(Path(work).rglob("*.nii*"))
+        _dbg(f"dicom2nifti candidates: {len(candidates)} -> {[c.name for c in candidates[:5]]}{'...' if len(candidates)>5 else ''}")
         if not candidates:
             raise RuntimeError(f"No NIfTI produced from {series}")
-        candidates[0].replace(out)
+
+        # Partition by dimensionality
+        four_d, three_d = [], []
+        for c in candidates:
+            try:
+                img = nib.load(str(c))
+                shp = img.header.get_data_shape()
+                if len(shp) == 4 and shp[3] >= 2:
+                    four_d.append((c, img, shp))
+                elif len(shp) == 3:
+                    three_d.append((c, img, shp))
+            except Exception as e:
+                _dbg("Skipping unreadable candidate:", c.name, e)
+
+        if four_d:
+            # Prefer an existing 4D file; pick the one with the largest T
+            pick = max(four_d, key=lambda t: t[2][3])
+            nib.save(pick[1], str(out))
+            _dbg("selected existing 4D candidate:", pick[0].name, "shape=", pick[2])
+        elif len(three_d) >= 2:
+            # Check consistent geometry + affine
+            shapes = {t[2] for t in three_d}
+            aff_ok = True
+            ref_aff = three_d[0][1].affine
+            for _, img, _ in three_d[1:]:
+                if not np.allclose(img.affine, ref_aff, atol=1e-5):
+                    aff_ok = False
+                    break
+            if len(shapes) == 1 and aff_ok:
+                # Prefer time-order using DICOM-derived frame times
+                try:
+                    from .preprocessing_utils import build_dynamic_sidecar_from_dicoms
+                    info = build_dynamic_sidecar_from_dicoms(str(series))
+                    times = info.get("frame_times_sec", None)
+                except Exception:
+                    info, times = None, None
+                if isinstance(times, list) and len(times) == len(three_d):
+                    idx_time = [(i, float('inf') if (t is None) else float(t)) for i, t in enumerate(times)]
+                    order = [i for i, _ in sorted(idx_time, key=lambda it: (it[1], it[0]))]
+                    three_d_sorted = [three_d[i] for i in order]
+                    _dbg("stack order: acquisition time (ascending)", [x[0].name for x in three_d_sorted[:5]], "...")
+                else:
+                    three_d_sorted = sorted(three_d, key=lambda t: t[0].name)
+                    _dbg("stack order: filename (fallback)", [x[0].name for x in three_d_sorted[:5]], "...")
+
+                # Stack all 3D volumes to 4D
+                data_stack = [img.get_fdata(dtype=np.float32) for _, img, _ in three_d_sorted]
+                data_4d = np.stack(data_stack, axis=3)
+                ref_img = three_d_sorted[0][1]
+                hdr = ref_img.header.copy()
+                # Set time units and TR if known
+                tr = None
+                try:
+                    if info:
+                        tr = info.get("estimated_TR_sec", None)
+                except Exception:
+                    tr = None
+                try:
+                    hdr.set_xyzt_units('mm', 'sec')
+                except Exception:
+                    pass
+                try:
+                    hdr["pixdim"][4] = float(tr) if (tr and tr > 0) else 1.0
+                except Exception:
+                    pass
+                nib.save(nib.Nifti1Image(data_4d, ref_img.affine, hdr), str(out))
+                _dbg("stacked", len(data_stack), "3D volumes → 4D:", data_4d.shape)
+            else:
+                # Shapes/affines disagree — be conservative: keep first
+                candidates[0].replace(out)
+                _dbg("WARNING: 3D outputs differ in shape/affine; using first candidate:", candidates[0].name)
+        else:
+            # Only a single 3D candidate — keep behavior (likely not dynamic)
+            candidates[0].replace(out)
+            _dbg("single 3D candidate:", candidates[0].name)
+
+        # Log final shape
+        try:
+            img = nib.load(str(out))
+            _dbg("final NIfTI:", out.name, "shape=", tuple(img.header.get_data_shape()))
+        except Exception as e:
+            _dbg("WARNING: failed to inspect final NIfTI shape:", e)
+
+        # PHI-safe JSON sidecar from ORIGINAL DICOM dir
+        try:
+            from .preprocessing_utils import build_dynamic_sidecar_from_dicoms, write_json_sidecar
+            info = build_dynamic_sidecar_from_dicoms(str(series))
+            if info:
+                write_json_sidecar(str(out), info)
+        except Exception:
+            pass
+
     return str(out)
 
 

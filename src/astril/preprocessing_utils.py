@@ -15,9 +15,13 @@ import datetime as _dt
 import pandas as pd
 import xlsxwriter
 import hashlib
+import tempfile
+import json
+import subprocess
+import glob
 from scipy.ndimage import zoom
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List
 try:
     from tqdm import tqdm
 except Exception:
@@ -1457,49 +1461,142 @@ def _is_dicom_dir(path: str) -> bool:
     except Exception:
         return False
 
+def _dbg(verbose, *a):
+    print("[nifti_from_any]", *a, flush=True)
 
-def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True):
+def _log_nifti_shape(nifti_path: str, orig_path: str | None, verbose=None):
+    try:
+        img = nib.load(nifti_path)
+        shape = tuple(img.header.get_data_shape())
+        ndim = len(shape)
+        is4d = (ndim == 4 and shape[3] >= 2)
+        src = orig_path if orig_path else nifti_path
+        _dbg(verbose, f"input = {src}; shape={shape} (ndim={ndim}) → {'4D OK' if is4d else 'NOT 4D'}")    except Exception as e:
+    except Exception as e:
+        _dbg(verbose, "failed to inspect nifti:", e)
+
+def _which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None) -> str | None:
+    """Return path to a temp dir with decoded DICOMs (Explicit VR Little Endian), or None if no tool is available."""
+    src = Path(src_dir)
+    if not src.is_dir():
+        return None
+    dst = Path(tempfile.mkdtemp(prefix="decoded_"))
+    use_gdcm = _which("gdcmconv")
+    use_dcmd = _which("dcmdjpeg")
+    if not (use_gdcm or use_dcmd):
+        _dbg(verbose, "No gdcmconv/dcmdjpeg found; cannot transcode.")
+        return None
+
+    dcm_files = sorted([p for p in src.iterdir() if p.suffix.lower()==".dcm"])
+    if not dcm_files:
+        _dbg(verbose, "No .dcm files to transcode.")
+        return None
+
+    _dbg(verbose, f"Transcoding {len(dcm_files)} DICOMs → {dst}")
+    for f in dcm_files:
+        out = dst / f.name
+        if use_gdcm:
+            # -w : write decompressed (Explicit VR Little Endian)
+            cmd = [use_gdcm, "-w", str(f), str(out)]
+        else:
+            # +te : transcode to Explicit VR Little Endian
+            cmd = [use_dcmd, "+te", str(f), str(out)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if res.returncode != 0:
+            _dbg(verbose, f"Transcode failed for {f.name}: {res.stdout.strip()[:200]}")
+            # Best effort: skip this file; dcm2niix can still work with the rest
+    return str(dst)
+
+def _nifti_from_any(input_path_or_dir: str, reorient=True, compress=True, *, verbose=None):
     """
     Accept a DICOM series directory or a NIfTI file path.
-    If DICOM dir, convert to a temp NIfTI (keeping 4D if present). Prefer dcm2niix so that
-    DWI sidecars (*.bval/*.bvec) are emitted next to the temporary NIfTI, then fall back to
-    our dicom2nifti-based converter if dcm2niix is unavailable or fails.
+    If DICOM dir, convert to a temp NIfTI (keeping 4D if present).
+    Prefer dcm2niix first (emits bval/bvec when applicable); then fall back to our dicom2nifti-based converter.
     Return (nifti_path, cleanup_temp_bool)
     """
     if _is_dicom_dir(input_path_or_dir):
-        import os, glob, tempfile, subprocess, shutil
-        # First try dcm2niix (emits .bval/.bvec when applicable)
+        _dbg(verbose, "Input is DICOM dir:", input_path_or_dir)
+        # Try dcm2niix first
         try:
+            raise Exception("Forcing an exception to test dicom2nifti")
             tmpdir = tempfile.mkdtemp(prefix="dcm2niix_")
-            # -z y (gz), -f tmp (stable basename), -o tmpdir
-            proc = subprocess.run(
-                ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-            )
+            cmd = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir]
+            _dbg(verbose, "running:", " ".join(cmd))
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            _dbg(verbose, f"dcm2niix returncode={proc.returncode}")
             if proc.returncode != 0:
-                raise RuntimeError(f"dcm2niix failed ({proc.returncode})")
-            nii_candidates = glob.glob(os.path.join(tmpdir, "tmp.nii.gz")) \
-                           or glob.glob(os.path.join(tmpdir, "tmp.nii")) \
-                           or glob.glob(os.path.join(tmpdir, "*.nii.gz")) \
-                           or glob.glob(os.path.join(tmpdir, "*.nii"))
+                # NEW: try to transcode JPEG-lossless to Explicit LE, then retry dcm2niix
+                _dbg(verbose, "dcm2niix failed; attempting JPEG-lossless transcode and retry.")
+                decoded = _transcode_dicom_dir_to_explicit_le(input_path_or_dir, verbose=verbose)
+                if decoded:
+                    tmpdir2 = tempfile.mkdtemp(prefix="dcm2niix_")
+                    cmd2 = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir2, decoded]
+                    _dbg(verbose, "retry:", " ".join(cmd2))
+                    proc2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    _dbg(verbose, f"dcm2niix retry returncode={proc2.returncode}")
+                    if proc2.returncode == 0:
+                        nii_candidates = sorted(glob.glob(os.path.join(tmpdir2, "tmp*.nii*"))) \
+                                     or sorted(glob.glob(os.path.join(tmpdir2, "*.nii*")))
+                        if not nii_candidates:
+                            raise RuntimeError("dcm2niix retry produced no NIfTI")
+                        nifti_path = nii_candidates[0]
+                        _dbg(verbose, "dcm2niix retry output:", nifti_path)
+                        _log_nifti_shape(nifti_path, verbose)
+                        # Write PHI-safe JSON sidecar using ORIGINAL DICOM dir (not the decoded copy)
+                        try:
+                            info = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
+                            write_json_sidecar(nifti_path, info)
+                            _dbg(verbose, "wrote JSON sidecar next to NIfTI")
+                        except Exception as e:
+                            _dbg(verbose, "WARNING: failed to write JSON sidecar:", e)
+                        return nifti_path, True
+                # If transcode+retry did not succeed, fall through to fallback
+                raise RuntimeError(proc.stderr.strip()[:400])
+            # Success path (original dcm2niix)
+            nii_candidates = sorted(glob.glob(os.path.join(tmpdir, "tmp*.nii*"))) \
+                          or sorted(glob.glob(os.path.join(tmpdir, "*.nii*")))
             if not nii_candidates:
                 raise RuntimeError("dcm2niix produced no NIfTI")
-            # Use the first NIfTI it produced; sidecars (if any) are already beside it.
-            return nii_candidates[0], True
-        except Exception:
-            # Fall back to the built-in dicom2nifti path
-            from .preprocess import convert_dicom_to_nifti  # local import to avoid cycles
-            tmp_out = tempfile.mktemp(suffix=".nii.gz")
-            convert_dicom_to_nifti(
-                dicom_series_dir=input_path_or_dir,
-                output_path=tmp_out,
-                reorient=reorient,
-                compress=compress,
-            )
-            return tmp_out, True
+            nifti_path = nii_candidates[0]
+            _dbg(verbose, "dcm2niix output:", nifti_path)
+            has_bval = os.path.exists(os.path.join(tmpdir, "tmp.bval"))
+            has_bvec = os.path.exists(os.path.join(tmpdir, "tmp.bvec"))
+            _dbg(verbose, f"sidecars: bval={has_bval} bvec={has_bvec}")
+            _log_nifti_shape(nifti_path, verbose)
+            # PHI-safe JSON sidecar
+            try:
+                info = build_dynamic_sidecar_from_dicoms(input_path_or_dir)
+                write_json_sidecar(nifti_path, info)
+                _dbg(verbose, "wrote JSON sidecar next to NIfTI")
+            except Exception as e:
+                _dbg(verbose, "WARNING: failed to write JSON sidecar:", e)
+            return nifti_path, True
+        except Exception as e:
+            _dbg(verbose, "dcm2niix failed; falling back to dicom2nifti:", e)
+            # Fall back to our converter (writes a single output path)
+            tmp_root = tempfile.mkdtemp(prefix="dicom2nifti_")
+            tmpnii = os.path.join(tmp_root, "tmp.nii.gz")
+            from .preprocess import convert_dicom_to_nifti
+            nifti_path = convert_dicom_to_nifti(input_path_or_dir, tmpnii, reorient=reorient, compress=compress)
+            _dbg(verbose, "dicom2nifti output:", nifti_path)
+            # convert_dicom_to_nifti() now guarantees a single final NIfTI at nifti_path
+            _log_nifti_shape(nifti_path, verbose)
+            return nifti_path, True
+    else:
+        _dbg(verbose, "Input is NIfTI:", input_path_or_dir)
+        _log_nifti_shape(input_path_or_dir, input_path_or_dir, verbose)
+        return input_path_or_dir, False
 
-    # Assume it is a NIfTI file
-    return input_path_or_dir, False
+def _sanitize_label(lbl: str) -> str:
+    if lbl is None: return "Unknown"
+    s = str(lbl).strip()
+    s = s.replace("(", "_").replace(")", "_")
+    s = re.sub(r"[^\w\-\+\.]+", "_", s)
+    s = re.sub(r"__+", "_", s).strip("_")
+    return s or "Unknown"
 
 
 # ----------------------------
@@ -1554,3 +1651,135 @@ def _convert_one(rec: dict) -> dict:
         "message": "",
         "nii_path": "",
     })
+
+# ----------------------------
+# PHI-safe sidecar helpers
+# ----------------------------
+
+def _seconds_from_time_str(t: str) -> Optional[float]:
+    """Parse 'HHMMSS' or 'HHMMSS.FFFFFF' -> seconds from midnight."""
+    if not t:
+        return None
+    t = str(t)
+    try:
+        if "." in t:
+            main, frac = t.split(".")
+            frac = float("0." + frac)
+        else:
+            main, frac = t, 0.0
+        main = main.zfill(6)
+        hh = int(main[0:2]); mm = int(main[2:4]); ss = int(main[4:6])
+        return hh * 3600 + mm * 60 + ss + frac
+    except Exception:
+        return None
+
+def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) -> Dict[str, Any]:
+    """PHI-safe per-frame timing (relative) & diffusion summary from a DICOM series directory."""
+    if pydicom is None:
+        return {"warning": "pydicom_not_available", "source": "dicom"}
+    try:
+        import glob
+        files = sorted(glob.glob(os.path.join(dicom_dir, "*.dcm")))
+    except Exception:
+        files = []
+    if not files:
+        return {"warning": "no_dicom_files_found", "source": "dicom"}
+    files = files[:max_files]
+
+    recs = []
+    for fp in files:
+        try:
+            ds = pydicom.dcmread(fp, stop_before_pixels=True, specific_tags=[
+                (0x0008,0x0032),  # AcquisitionTime
+                (0x0018,0x1060),  # TriggerTime (ms)
+                (0x0020,0x0013),  # InstanceNumber
+                (0x0020,0x0032),  # ImagePositionPatient
+                (0x0020,0x1041),  # SliceLocation
+                (0x0018,0x9087),  # Diffusion b-value
+                (0x0018,0x9089),  # Diffusion Gradient Orientation
+                (0x0018,0x0080),  # RepetitionTime (ms)
+            ])
+            acq_time = _seconds_from_time_str(getattr(ds, "AcquisitionTime", None))
+            trig = getattr(ds, "TriggerTime", None)
+            if trig is not None:
+                try:
+                    trig = float(trig) / 1000.0
+                except Exception:
+                    trig = None
+            inst = getattr(ds, "InstanceNumber", None)
+            ipp  = getattr(ds, "ImagePositionPatient", None)
+            sl   = getattr(ds, "SliceLocation", None)
+            bval = getattr(ds, "DiffusionBValue", None)
+            grad = getattr(ds, "DiffusionGradientOrientation", None)
+            recs.append({
+                "acq_time_s": acq_time,
+                "trigger_time_s": trig,
+                "instance": inst,
+                "z": float(ipp[2]) if (ipp is not None and len(ipp)>=3) else (float(sl) if sl is not None else None),
+                "bval": float(bval) if bval is not None else None,
+                "bvec": [float(x) for x in grad] if grad is not None else None,
+            })
+        except Exception:
+            continue
+
+    if not recs:
+        return {"warning": "dicom_unreadable", "source": "dicom"}
+
+    zs = [r["z"] for r in recs if r.get("z") is not None]
+    if zs:
+        slices_per_vol = len(sorted({round(z, 3) for z in zs}))
+    else:
+        slices_per_vol = None
+
+    use_trigger = any(r.get("trigger_time_s") is not None for r in recs)
+    key = "trigger_time_s" if use_trigger else "acq_time_s"
+
+    times = []
+    if slices_per_vol:
+        for i in range(0, len(recs), slices_per_vol):
+            chunk = recs[i:i+slices_per_vol]
+            tvals = [r.get(key) for r in chunk if r.get(key) is not None]
+            times.append(min(tvals) if tvals else None)
+    else:
+        times = [r.get(key) for r in recs]
+
+    first = next((t for t in times if t is not None), None)
+    if first is not None:
+        times = [None if t is None else max(0.0, float(t) - first) for t in times]
+
+    bvals = [r["bval"] for r in recs if r.get("bval") is not None]
+    unique_bvals = sorted({round(float(b), 2) for b in bvals}) if bvals else None
+
+    bvecs = [r["bvec"] for r in recs if r.get("bvec") is not None]
+    if bvecs and slices_per_vol:
+        B = []
+        for i in range(0, len(bvecs), slices_per_vol):
+            chunk = [v for v in bvecs[i:i+slices_per_vol] if v is not None]
+            if chunk:
+                B.append(np.mean(np.asarray(chunk), axis=0).tolist())
+            else:
+                B.append(None)
+        bvecs = B
+    else:
+        bvecs = None
+
+    diffs = [j - i for i, j in zip(times[:-1], times[1:]) if (i is not None and j is not None)]
+    est_TR = float(np.median(diffs)) if diffs else None
+
+    return {
+        "source": "dicom",
+        "phi_scrubbed": True,
+        "frame_times_sec": times,
+        "n_frames": len(times),
+        "slices_per_volume": int(slices_per_vol) if slices_per_vol else None,
+        "estimated_TR_sec": est_TR,
+        "unique_bvals": unique_bvals,
+        "bvecs_per_frame": bvecs,
+        "notes": "Times normalized to first frame; no absolute dates/times stored."
+    }
+
+def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = ".json") -> str:
+    out = os.path.splitext(nifti_path)[0] + suffix
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=2, ensure_ascii=False)
+    return out
