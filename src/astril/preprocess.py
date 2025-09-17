@@ -1496,7 +1496,9 @@ def plan_dicom_to_nifti_conversion(
 
     def _log(prefix: str, msg: str):
         """Cheap, contextual logger. Prefix is a short tag like 'DISCOVER', 'CLASSIFY', etc."""
-        print(f"[plan:{prefix}] {msg}")
+        #Disabling print logging for now
+        #print(f"[plan:{prefix}] {msg}")
+        return None
 
     def _discover_one(row):
         patient_rel = row["Directory"]
@@ -1735,13 +1737,15 @@ def plan_dicom_to_nifti_conversion(
                 _ns=g.get("n_slices", _pd.Series(index=g.index, dtype="float")).fillna(-1).astype(float),
                 _conf=g.get("confidence", _pd.Series(index=g.index, dtype="float")).fillna(0.0).astype(float),
                 _acq=g.get("acq_dt", _pd.Series(index=g.index)).map(lambda x: _pd.to_datetime(x) if pd.notna(x) else pd.NaT),
-            ).sort_values(by=["_ns","_conf","_acq"], ascending=[False, False, True])
+            ).sort_values(by=["_conf","_ns","_acq"], ascending=[False, False, True])
             return None if g.empty else int(g.index[0])
 
         label_col = "final_label" if "final_label" in df.columns else ("base_type" if "base_type" in df.columns else None)
 
         # Eligibility masks affect selection ONLY (rows still appear in plan)
-        excluded_labels = {"unknown", "unknown-derived","localizer"}
+        # Never select Calibration / FieldMap (FMAP) for conversion
+        excluded_labels = {"unknown", "unknown-derived", "localizer",
+                           "calibration", "fieldmap", "fmap"}
         eligible = pd.Series(True, index=df.index)
 
         # Exclude by label
@@ -1788,7 +1792,7 @@ def plan_dicom_to_nifti_conversion(
                 _ns=g.get("n_slices", _pd.Series(index=g.index, dtype="float")).fillna(-1).astype(float),
                 _conf=g.get("confidence", _pd.Series(index=g.index, dtype="float")).fillna(0.0).astype(float),
                 _acq=g.get("acq_dt", _pd.Series(index=g.index)).map(lambda x: _pd.to_datetime(x) if pd.notna(x) else pd.NaT),
-            ).sort_values(by=["_ns","_conf","_acq"], ascending=[False, False, True])
+            ).sort_values(by=["_conf","_ns","_acq"], ascending=[False, False, True])
 
             return None if g.empty else int(g.index[0])
 
@@ -2304,8 +2308,6 @@ def convert_dicom_plan(
                 )
                 rec["status"] = "ok"
                 rec["nii_path"] = written
-                print(f"CONVERT out_path = {out_path}")
-                print(f"CONVERT written = {written}")
             elif action == "DERIVE":
                 from .preprocessing_utils import run_derived_generator
                 generator_key = rec.get("GeneratorKey", "")

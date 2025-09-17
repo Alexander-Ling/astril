@@ -314,7 +314,7 @@ DERIVED_CATEGORY_SPEC: dict[str, "OrderedDict[str, dict]"] = {
         ("TRACE",      {"gen": "dwi_trace",       "syn": ["trace", "tracew", "trace w", "isotropic", "iso"],        "policy": "derive"}),
         ("ADC",        {"gen": "dwi_adc",         "syn": ["adc"],                                                   "policy": "derive"}),
         ("FA",         {"gen": "dwi_fa",          "syn": ["fa"],                                                    "policy": "derive"}),
-        ("MD",         {"gen": "dwi_md",          "syn": ["md", "mean diffusivity", "mean diff", "avdc"],           "policy": "derive"}),
+        ("MD",         {"gen": "dwi_md",          "syn": ["md", "mean diffusivity", "mean diff", "avdc"],           "policy": "derive"}), #Note that AvDC scans are average (mean) diffusivity while ADC scans are apparent diffusivity.
         ("EXP_ATTEN",  {"gen": "dwi_exp_atten",   "syn": ["exp atten", "expatten"],                                 "policy": "derive"}),
     ]),
     "SWI": OrderedDict([
@@ -535,6 +535,36 @@ def _localizer_subtype(t: str) -> str | None:
     if re.search(r"\bmpr(_| )?tra\b", t): return "MPR_TRA"
     if re.search(r"(?<![a-z])mpr(?!age)\b", t): return "MPR"  # MPR but not MPRAGE
     return None
+
+def _looks_calibration(t: str) -> bool:
+    """
+    Parallel-imaging and prescan/reference calibrations:
+    GE: ASSET/ARC; Philips: SENSE; Siemens: reference scans/prescans.
+    We keep tokens conservative to avoid false positives.
+    """
+    # common forms seen in SeriesDescription / ProtocolName
+    hard_tokens = [
+        "assetcal", "asset cal", "arc calib", "arc calibration",
+        "prescan", "pre-scan", "pre scan",
+        "refscan", "ref scan", "reference scan",
+        "coil survey", "coil_survey",
+    ]
+    # Allow “sense” only when paired with calib/ref wording to avoid noise
+    if "sense" in t and any(k in t for k in ["cal", "calib", "reference", "ref", "refscan"]):
+        return True
+    return any(k in t for k in hard_tokens) or ("asset" in t and "cal" in t)
+
+def _looks_fieldmap(t: str) -> bool:
+    """
+    Field mapping (B0/phase/gre field map) sequences should never fall through to T1/T2 physics.
+    """
+    keys = [
+        "fieldmap", "field map", "fmap",
+        "b0map", "b0 map", "b0 ",
+        "phase map", "phasediff", "phase-diff",
+        "topup", "gre field map", "dual echo field map",
+    ]
+    return any(k in t for k in keys)
 
 def _safe_int(x):
     try:
@@ -803,6 +833,9 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         series_desc   = _nz(getattr(ds, "SeriesDescription", None))
         protocol_name = _nz(getattr(ds, "ProtocolName", None))
         sequence_name = _nz(getattr(ds, "SequenceName", None))
+        study_desc    = _nz(getattr(ds, "StudyDescription", None))
+        procstep_desc = _nz(getattr(ds, "PerformedProcedureStepDescription", None)) or \
+                        _nz(getattr(ds, "ProcedureStepDescription", None))
         manufacturer  = _nz(getattr(ds, "Manufacturer", None))
         modality      = _nz(getattr(ds, "Modality", None))
         image_type    = _to_list_upper(getattr(ds, "ImageType", []))
@@ -840,6 +873,65 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         # prefer explicit counts (Enhanced→NumberOfFrames, then ImagesInAcquisition, then Locations, then file count)
         n_slices_est = num_frames or images_in_acq or loc_in_acq or num_dicoms
 
+        # For multiframe (4D) series, estimate slices PER 3D VOLUME by counting unique slice positions.
+        # This prevents 4D series (e.g., DWI/Perfusion) from inflating n_slices via total frames.
+        n_slices_per_vol_est = None
+        try:
+            if num_frames and hasattr(ds, "PerFrameFunctionalGroupsSequence") and ds.PerFrameFunctionalGroupsSequence:
+                # Orientation (row/col) → slice normal
+                iop = None
+                try:
+                    sfg = getattr(ds, "SharedFunctionalGroupsSequence", None)
+                    if sfg:
+                        pos = getattr(sfg[0], "PlaneOrientationSequence", None)
+                        if pos:
+                            iop = getattr(pos[0], "ImageOrientationPatient", None)
+                except Exception:
+                    pass
+                if iop is None:
+                    iop = getattr(ds, "ImageOrientationPatient", None)
+
+                n_vec = None
+                if iop and len(iop) >= 6:
+                    _row = np.array(iop[:3], dtype=float)
+                    _col = np.array(iop[3:6], dtype=float)
+                    _n = np.cross(_row, _col)
+                    _norm = float(np.linalg.norm(_n))
+                    if _norm > 0:
+                        n_vec = (_n / _norm)
+
+                # Project frame positions onto the slice normal (or fallback to z)
+                vals = []
+                # Cap frames inspected to keep header-only iteration light
+                _max = int(num_frames) if int(num_frames) < 1500 else 1500
+                for item in ds.PerFrameFunctionalGroupsSequence[:_max]:
+                    ipp = None
+                    try:
+                        pps = getattr(item, "PlanePositionSequence", None)
+                        if pps:
+                            ipp = getattr(pps[0], "ImagePositionPatient", None)
+                    except Exception:
+                        ipp = None
+                    if ipp is None:
+                        continue
+                    try:
+                        if n_vec is not None:
+                            ip = np.array([float(ipp[0]), float(ipp[1]), float(ipp[2])], dtype=float)
+                            vals.append(float(np.dot(ip, n_vec)))
+                        else:
+                            vals.append(float(ipp[2]))
+                    except Exception:
+                        continue
+                if vals:
+                    # Bin with a tolerance to merge nearly identical positions
+                    bin_mm = float(z_mm) / 2.0 if (z_mm is not None and float(z_mm) > 0) else 0.2
+                    if bin_mm <= 0:
+                        bin_mm = 0.2
+                    arr = np.asarray(vals, dtype=float)
+                    n_slices_per_vol_est = int(np.unique(np.round(arr / bin_mm)).size)
+        except Exception:
+            n_slices_per_vol_est = None
+
         # Try common vendor B-value locations (not guaranteed)
         bval = None
         for tag in [("DiffusionBValue",), ("Private_0019_100c",), ("Private_0043_1039",)]:
@@ -871,6 +963,7 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             acq_dt=acq_dt, acq_dt_iso=acq_iso,
             manufacturer=manufacturer, modality=modality,
             series_description=series_desc, protocol_name=protocol_name, sequence_name=sequence_name,
+            study_description=study_desc, procedure_step_description=procstep_desc,
             image_type=";".join(image_type),
             imgtype_flags=";".join(sorted(list(imgtype_flags))) if imgtype_flags else "",
             te=te, tr=tr, ti=ti, flip_angle=fa, b_value=bval,
@@ -883,7 +976,7 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             slice_thickness_mm=st_mm, spacing_between_slices_mm=sbs_mm,
             z_spacing_mm=z_mm,
             num_frames=num_frames, images_in_acq=images_in_acq, locations_in_acq=loc_in_acq,
-            num_dicoms=num_dicoms, n_slices_est=n_slices_est,
+            num_dicoms=num_dicoms, n_slices_est=n_slices_est, n_slices_per_vol_est=n_slices_per_vol_est,
             # vendor/context fields (debuggable and optional)
             pulse_sequence_name = vh.get("pulse_sequence_name"),
             scanning_sequence   = vh.get("scanning_sequence"),
@@ -901,12 +994,37 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
     df = pd.DataFrame(rows)
 
-    # 2) Compute exam-level context ONCE (e.g., inferred contrast time)
+    # 2) Compute exam-level context ONCE (e.g., inferred contrast time & non-contrast flag)
+    def _looks_noncontrast(tok: str) -> bool:
+        # conservative but inclusive: capture common "no contrast" and "pre-contrast" phrasing
+        return any(k in tok for k in [
+            "w/o contrast","wo contrast","without contrast","no contrast",
+            "non-contrast","noncontrast","precontrast","pre contrast","pre-contrast",
+            "without gad","no gad","no gado"
+        ])
+
+    # Build an exam-level non-contrast hint from Study/Procedure descriptions
+    exam_noncontrast = False
+    try:
+        import pandas as _pd
+        pool_text = _norm_text(
+            " ".join(df.get("study_description", _pd.Series(dtype=str)).dropna().astype(str).tolist()),
+            " ".join(df.get("procedure_step_description", _pd.Series(dtype=str)).dropna().astype(str).tolist()),
+        )
+        exam_noncontrast = _looks_noncontrast(_name_tokens(pool_text))
+    except Exception:
+        exam_noncontrast = False
+
     # Perfusion or explicit post-contrast cues are our best proxy.
     def _looks_perfusion(tok):
         return any(k in tok for k in ["perfusion","pwi","dsc","dce","asl","pcasl"])
+    # Ignore generic "with contrast" tokens when the exam is explicitly non-contrast
+    _allow_generic_with = not exam_noncontrast
     def _looks_post(tok):
-        return any(k in tok for k in ["post","c+","gad","gadolinium","with contrast","w/ contrast","t1c"])
+        base = any(k in tok for k in ["post","c+","gad","gadolinium","t1c"])
+        if _allow_generic_with:
+            base = base or any(k in tok for k in ["with contrast","w/ contrast"])
+        return base
     def _looks_t1(tok):
         return ("t1" in tok) or ("mprage" in tok) or ("bravo" in tok) or ("spgr" in tok) or ("vibe" in tok)
     # earliest perfusion OR earliest explicit post-contrast cue OR earliest T1 with post-y tokens
@@ -1045,6 +1163,21 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             reason.append("FLAIR in name")
             conf = 0.9
 
+        # --- Calibration / Fieldmap families (avoid physics fallthrough) ---
+        elif _looks_fieldmap(t):
+            base = "FMAP"
+            label = "FieldMap"
+            is_derived = _compute_is_derived(t, imgtypes, None)
+            reason.append("Fieldmap tokens")
+            conf = 0.9
+
+        elif _looks_calibration(t):
+            base = "Calibration"
+            label = "Calibration"
+            is_derived = _compute_is_derived(t, imgtypes, None)
+            reason.append("Calibration tokens (ASSET/SENSE/ARC/Prescan/RefScan)")
+            conf = 0.95
+
         # --- T2 vs T1 (physics + names) ---
         else:
             if "t2" in t:
@@ -1057,9 +1190,14 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             elif ("t1" in t) or any(k in t for k in ["mprage","bravo","spgr","vibe"]):
                 base = "T1"
                 # decide pre/post from explicit vendor/contrast cues or timing
-                post_hint = any(k in t for k in ["post","c+","gad","with contrast","w/ contrast","t1c"])
+                post_hint = _looks_post(t)
+                noncontrast_hint = _looks_noncontrast(t)
                 vendor_post = bool(contrast_agent) or ("CONTRAST" in str(acquisition_contrast).upper())
-                if post_hint:
+                # explicit non-contrast on the series overrides generic post tokens
+                if noncontrast_hint:
+                    is_post = False
+                    reason.append("explicit non-contrast tokens")
+                elif post_hint:
                     is_post = True
                     reason.append("explicit post-contrast tokens")
                 elif vendor_post:
@@ -1089,13 +1227,28 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
                     reason.append(f"TE/TR suggest T2 (TE={te}, TR={tr})")
                     conf = 0.7
                 elif te and tr and te <= 20 and tr <= 1000:
-                    base = "T1"
-                    is_post = False
-                    dcat = None
-                    label = "T1n"
-                    is_derived = _compute_is_derived(t, imgtypes, dcat)
-                    reason.append(f"TE/TR suggest T1 (TE={te}, TR={tr})")
-                    conf = 0.65
+                    # Guardrail: only allow T1 physics fallback if it *also* looks like T1
+                    # by name/vendor tokens OR has enough slices to be plausible anatomy.
+                    looks_t1_name = ("t1" in t) or any(k in t for k in ["mprage","bravo","spgr","vibe"])
+                    enough_slices = False
+                    try:
+                        enough_slices = (int(r.get("n_slices_est") or 0) >= 8)
+                    except Exception:
+                        pass
+                    if looks_t1_name or enough_slices:
+                        base = "T1"
+                        is_post = False
+                        dcat = None
+                        label = "T1n"
+                        is_derived = _compute_is_derived(t, imgtypes, dcat)
+                        reason.append(f"TE/TR suggest T1 (TE={te}, TR={tr}); gate ok (name={looks_t1_name}, slices≥8={enough_slices})")
+                        conf = 0.65
+                    else:
+                        base = None
+                        label = "Unknown"
+                        is_derived = _compute_is_derived(t, imgtypes, None)
+                        reason.append("TE/TR suggest T1 but rejected by gate (no T1 tokens, few slices) → Unknown")
+                        conf = 0.3
                 else:
                     base = None
                     label = "Unknown"
@@ -1139,7 +1292,19 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         a, b, c = r.pixdim_row_mm, r.pixdim_col_mm, r.z_spacing_mm
         return None if (a is None or b is None) else (f"{a:.2f}x{b:.2f}" + (f"x{c:.2f}" if c else ""))
     df["voxel_mm"] = df.apply(_voxel_str, axis=1)
+    # Use per-volume slice count for true 4D (multiframe) series when available; else fall back.
     df["n_slices"] = df["n_slices_est"]
+    try:
+        # Avoid FutureWarning by coercing to numeric before fillna/casting
+        num_frames = pd.to_numeric(df.get("num_frames", pd.Series(index=df.index)), errors="coerce")
+        is4d = num_frames.fillna(0).astype("int64") > 0
+        pervol = pd.to_numeric(df.get("n_slices_per_vol_est", pd.Series(index=df.index)), errors="coerce")
+        has_pervol = pervol.notna() & (pervol > 0)
+        mask = is4d & has_pervol
+        if mask.any():
+            df.loc[mask, "n_slices"] = pervol.loc[mask]
+    except Exception:
+        pass
 
     # Post-process: inherit in-plane spacing for derived series missing spacing
     try:
@@ -1462,7 +1627,9 @@ def _is_dicom_dir(path: str) -> bool:
         return False
 
 def _dbg(verbose, *a):
-    print("[nifti_from_any]", *a, flush=True)
+    #Disable logging for now
+    #print("[nifti_from_any]", *a, flush=True)
+    return None
 
 def _log_nifti_shape(nifti_path: str, orig_path: str | None, verbose=None):
     try:
