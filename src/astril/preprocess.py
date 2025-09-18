@@ -533,7 +533,13 @@ def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", de
     subprocess.run(cmd, check=True)
 
     if mask_path:
-        expected_mask = hd_bet_output.replace(".nii.gz", "_mask.nii.gz")
+        # Only change the final extension, not every occurrence in the path
+        if hd_bet_output.endswith(".nii.gz"):
+            expected_mask = hd_bet_output[:-7] + "_mask.nii.gz"
+        elif hd_bet_output.endswith(".nii"):
+            expected_mask = hd_bet_output[:-4] + "_mask.nii"
+        else:
+            expected_mask = hd_bet_output + "_mask"
         if not os.path.exists(expected_mask):
             raise FileNotFoundError(f"Expected mask file not found: {expected_mask}")
         os.replace(expected_mask, mask_path)

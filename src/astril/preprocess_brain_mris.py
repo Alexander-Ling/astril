@@ -51,7 +51,15 @@ def run_preprocessing_pipeline(
     temp_transform_dir = os.path.join(temp_dir, transform_basedir)
     os.makedirs(temp_transform_dir, exist_ok=True)
 
-    name_fields = os.path.basename(t1c_path).split('_')
+    # Derive IDs from T1c filename, but strip .nii / .nii.gz so scanID == "T1c"
+    _base = os.path.basename(t1c_path)
+    if _base.lower().endswith(".nii.gz"):
+        _stem = _base[:-7]
+    elif _base.lower().endswith(".nii"):
+        _stem = _base[:-4]
+    else:
+        _stem = os.path.splitext(_base)[0]
+    name_fields = _stem.split('_')
 
     if patientID is None:
         if len(name_fields) >= 1:
@@ -83,7 +91,8 @@ def run_preprocessing_pipeline(
             )
     print(f"[Info] ScanID = {scanID}")
 
-    basename_prefix = f"{patientID}_{timepoint}_{scanID}"
+    # Output names should not include the source scanID; use PatientID_Timepoint only
+    basename_prefix = f"{patientID}_{timepoint}"
         
     print("[Step 1] Register T1n, T2f, T2w to T1c")
     t1n_reg = os.path.join(temp_dir, f"{basename_prefix}_T1n_reg.nii.gz")

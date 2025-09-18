@@ -10,35 +10,6 @@ DWI_SCALE = 1e6
 # Relaxed brain-mask threshold: keep voxels above 5% of S0 99th percentile
 BRAIN_MASK_FRAC = 0.07
 
-# ---------- Debug helpers ----------
-def _pstats(name: str, arr: np.ndarray, mask: np.ndarray | None = None):
-    """Print robust percentiles for diagnostics; no algorithm changes."""
-    try:
-        x = arr[mask] if (mask is not None) else arr
-        x = np.asarray(x, dtype=np.float64)
-        if x.size == 0:
-            print(f"[{name}] stats: EMPTY")
-            return
-        p = np.nanpercentile(x, [0, 1, 5, 50, 95, 99, 100])
-        print(f"[{name}] min={p[0]:.3e} p1={p[1]:.3e} p5={p[2]:.3e} "
-              f"med={p[3]:.3e} p95={p[4]:.3e} p99={p[5]:.3e} max={p[6]:.3e}")
-    except Exception as e:
-        print(f"[{name}] stats error: {e!r}")
-
-def _maybe_make_inbrain_mask_from_S0(S0: np.ndarray) -> np.ndarray:
-    """
-    Cheap in-brain proxy using S0: voxels above 10% of S0 99th percentile.
-    Avoids background dominating global stats.
-    """
-    try:
-        p99 = float(np.nanpercentile(S0, 99.0))
-        thr = BRAIN_MASK_FRAC * max(p99, 1e-6)
-        m = S0 > thr
-        print(f"[debug] in-brain mask: thr={thr:.3e}, frac={(m.sum()/m.size):.3f}")
-        return m
-    except Exception:
-        return np.ones_like(S0, dtype=bool)
-
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -177,26 +148,19 @@ def gen_dwi_adc(nifti_path: str, out_path: str) -> str:
     Debug logging prints input path, shape, voxel sizes, and bval/bvec summaries.
     """
     # ---- debug logging ----
-    try:
-        print(f"[gen_dwi_adc] input NIfTI: {nifti_path}")
-    except Exception:
-        pass
     img = nib.load(nifti_path); data = img.get_fdata()
     try:
         hdr = img.header
         zooms = tuple(float(z) for z in hdr.get_zooms())
-        print(f"[gen_dwi_adc] shape={tuple(data.shape)}, zooms={zooms}")
     except Exception:
         pass
     bvals, bvecs = _maybe_load_bvals_bvecs(nifti_path)
     try:
-        print(f"[gen_dwi_adc] bvals present: {bvals is not None}; bvecs present: {bvecs is not None}")
         if bvals is not None:
             uv, uc = np.unique(bvals, return_counts=True)
             # show up to first 12 unique b-values to keep logs compact
             preview = list(map(float, uv[:12]))
             counts  = list(map(int, uc[:12]))
-            print(f"[gen_dwi_adc] unique b-values (first 12)={preview}; counts={counts}; total_vols={len(bvals)}")
     except Exception:
         pass
 
@@ -205,37 +169,7 @@ def gen_dwi_adc(nifti_path: str, out_path: str) -> str:
         raise ValueError("DWI ADC requires a 4D diffusion series (>=2 volumes).")
     if bvals is None or bvals.shape[0] != data.shape[3]:
         raise ValueError("Missing or mismatched .bval/.bvec for DWI ADC.")
-    # Optional deeper diagnostics (no algorithm changes)
-    try:
-        is_b0 = bvals < 10
-        if np.any(is_b0):
-            S0 = np.maximum(data[..., is_b0].mean(axis=-1), 1e-6)
-            inbrain = _maybe_make_inbrain_mask_from_S0(S0)
-            pos = bvals > 10
-            if np.any(pos):
-                Sb = data[..., pos]
-                ratio = np.clip(Sb / S0[..., None], 1e-6, None)
-                frac_clamped = float(np.mean(ratio <= 1.0e-6))
-                _pstats("gen_dwi_adc/ratio_all", ratio)
-                # Broadcast the 3D in-brain mask across b>0 frames
-                try:
-                    _pstats("gen_dwi_adc/ratio_inbrain", ratio,
-                            mask=np.broadcast_to(inbrain[..., None], ratio.shape))
-                except Exception as e:
-                    print(f"[gen_dwi_adc] ratio_inbrain log error: {e!r}")
-                print(f"[gen_dwi_adc] frac(ratio==1e-6)={frac_clamped:.4f} (all voxels, all b>0)")
-            _pstats("gen_dwi_adc/S0_all", S0)
-            _pstats("gen_dwi_adc/S0_inbrain", S0, mask=inbrain)
-    except Exception as e:
-        print(f"[gen_dwi_adc] debug prefit error: {e!r}")
     adc = _estimate_adc_from_logfit(data, bvals)
-    # --- debug stats before save ---
-    try:
-        _pstats("gen_dwi_adc/ADC_all_mm2_per_s", adc)
-        _pstats("gen_dwi_adc/ADC_all_x1e6", adc * 1.0e6)
-        print(f"[gen_dwi_adc] writing units: x1e6 mm^2/s (scale={DWI_SCALE:g})")
-    except Exception:
-        pass
     # Scale to µm^2/s for output
     return _save_like(img, adc * DWI_SCALE, out_path, dtype=np.float32)
 
@@ -309,11 +243,6 @@ def gen_dwi_fa(nifti_path: str, out_path: str) -> str:
     if bvals is None or bvecs is None or bvals.shape[0] != data.shape[3]:
         raise ValueError("Missing or mismatched .bval/.bvec for DWI FA.")
     md, fa = _fit_tensor(data, bvals, bvecs)
-    # --- debug stats before save ---
-    try:
-        _pstats("gen_dwi_fa/FA_all", fa)
-    except Exception:
-        pass
     return _save_like(img, fa, out_path, dtype=np.float32)
 
 def gen_dwi_md(nifti_path: str, out_path: str) -> str:
@@ -324,13 +253,6 @@ def gen_dwi_md(nifti_path: str, out_path: str) -> str:
     if bvals is None or bvecs is None or bvals.shape[0] != data.shape[3]:
         raise ValueError("Missing or mismatched .bval/.bvec for DWI MD.")
     md, fa = _fit_tensor(data, bvals, bvecs)
-    # --- debug stats before save ---
-    try:
-        _pstats("gen_dwi_md/MD_all_mm2_per_s", md)
-        _pstats("gen_dwi_md/MD_all_x1e6", md * 1.0e6)
-        print(f"[gen_dwi_md] writing units: x1e6 mm^2/s (scale={DWI_SCALE:g})")
-    except Exception:
-        pass
     # Scale to µm^2/s for output
     return _save_like(img, md * DWI_SCALE, out_path, dtype=np.float32)
 
