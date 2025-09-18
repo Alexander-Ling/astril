@@ -1,381 +1,327 @@
-"""
-preprocess_brain_mris.py
-Author: Alex Ling
-E. Antonio Chiocca Group, BWH
-Description: Full MRI preprocessing pipeline for brain scans (T1c, T1n, T2f, T2w), replicating legacy shell pipeline.
-"""
-
+from __future__ import annotations
+import argparse
+import csv
 import os
 import sys
-import argparse
-import tempfile
-import shutil
-import json
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-from astril.preprocess import (
-    register_images,
-    perform_mri_math,
-    run_hd_bet,
-    normalize_masked_image,
-    resize_mri,
-)
+# We import and call your existing function directly (no subprocess).
+# If your package layout differs (e.g., installed as astril), adjust the import:
+from .preprocess_single_brain_mri import preprocess_single_brain_mri  # type: ignore
 
-def run_preprocessing_pipeline(
-    t1c_path,
-    t1n_path,
-    t2f_path,
-    t2w_path,
-    output_dir,
-    temp_dir,
-    co_register_path=None,
-    save_scans_with_skulls=False,
-    final_dims=(240, 240, 155),
-    final_voxels=(1.0, 1.0, 1.0),
-    patientID=None,
-    timepoint=None,
-    scanID=None,
-    debug=False,
-):
-    print(f"[Info] Using temporary directory: {temp_dir}")
 
-    transform_records = {
-        "T1c": {},
-        "T1n": {},
-        "T2f": {},
-        "T2w": {},
-    }
+# ----------------------------
+# Helpers
+# ----------------------------
 
-    transform_basedir = "transforms"
-    transform_dir = os.path.join(output_dir, transform_basedir)
-    os.makedirs(transform_dir, exist_ok=True)
-    temp_transform_dir = os.path.join(temp_dir, transform_basedir)
-    os.makedirs(temp_transform_dir, exist_ok=True)
+REQ_LABELS = ("T1c", "T1n", "T2f", "T2w")
 
-    # Derive IDs from T1c filename, but strip .nii / .nii.gz so scanID == "T1c"
-    _base = os.path.basename(t1c_path)
-    if _base.lower().endswith(".nii.gz"):
-        _stem = _base[:-7]
-    elif _base.lower().endswith(".nii"):
-        _stem = _base[:-4]
-    else:
-        _stem = os.path.splitext(_base)[0]
-    name_fields = _stem.split('_')
+def _find_required_scans(exam_dir: Path) -> dict[str, Path] | None:
+    """
+    Return dict with keys T1c,T1n,T2f,T2w -> Path if all present, else None.
+    Prefers .nii.gz over .nii if both exist.
+    """
+    found: dict[str, Path] = {}
+    for lbl in REQ_LABELS:
+        # Prefer .nii.gz
+        gz = list(exam_dir.glob(f"*_{lbl}.nii.gz"))
+        ni = list(exam_dir.glob(f"*_{lbl}.nii"))
+        cand = gz[0] if gz else (ni[0] if ni else None)
+        if cand is None:
+            return None
+        found[lbl] = cand
+    return found
 
-    if patientID is None:
-        if len(name_fields) >= 1:
-            patientID = name_fields[0]
-        else:
-            raise ValueError(
-                "[Error] Could not extract patientID from T1c filename. "
-                "Please provide it explicitly with --patientID."
-            )
-    print(f"[Info] PatientID = {patientID}")
 
-    if timepoint is None:
-        if len(name_fields) >= 2:
-            timepoint = name_fields[1]
-        else:
-            raise ValueError(
-                "[Error] Could not extract timepoint from T1c filename. "
-                "Please provide it explicitly with --timepoint."
-            )
-    print(f"[Info] Timepoint = {timepoint}")
+def _parse_patient_exam(exam_dir: Path) -> tuple[str, str]:
+    """
+    Parse patient and exam names from the directory structure:
+        {in_dir}/{patient}/{exam}/
+    """
+    patient = exam_dir.parent.name
+    exam = exam_dir.name
+    return patient, exam
 
-    if scanID is None:
-        if len(name_fields) >= 3:
-            scanID = name_fields[2]
-        else:
-            raise ValueError(
-                "[Error] Could not extract scanID from T1c filename. "
-                "Please provide it explicitly with --scanID."
-            )
-    print(f"[Info] ScanID = {scanID}")
 
-    # Output names should not include the source scanID; use PatientID_Timepoint only
-    basename_prefix = f"{patientID}_{timepoint}"
-        
-    print("[Step 1] Register T1n, T2f, T2w to T1c")
-    t1n_reg = os.path.join(temp_dir, f"{basename_prefix}_T1n_reg.nii.gz")
-    t2f_reg = os.path.join(temp_dir, f"{basename_prefix}_T2f_reg.nii.gz")
-    t2w_reg = os.path.join(temp_dir, f"{basename_prefix}_T2w_reg.nii.gz")
+def _parse_timepoint_from_exam_name(exam_name: str) -> tuple[int, bool]:
+    """
+    Exam dir format is typically: {patient}_{timepoint}_{ExamAlias}
+    e.g. '032_d1690_SH8JJOMZ' or '020_d-1539_2NLZ8ZMA'
 
-    tfm_t1n = os.path.join(temp_dir, "T1n_to_T1c.tfm")
-    tfm_t2f = os.path.join(temp_dir, "T2f_to_T1c.tfm")
-    tfm_t2w = os.path.join(temp_dir, "T2w_to_T2f.tfm")
+    Returns (day_number, has_day), where day_number is an integer (can be negative).
+    If parsing fails, returns (0, False) so those sort after valid day entries.
+    """
+    parts = exam_name.split("_", 2)
+    if len(parts) < 2:
+        return (0, False)
+    tp = parts[1]  # e.g., 'd1690' or 'd-1539'
+    if not tp or tp[0].lower() != "d":
+        return (0, False)
+    try:
+        day = int(tp[1:])
+        return (day, True)
+    except ValueError:
+        return (0, False)
 
-    register_images(t1c_path, t1n_path, t1n_reg, transform_path=tfm_t1n, save_dummy_ref=True, verbose=False)
-    register_images(t1c_path, t2f_path, t2f_reg, transform_path=tfm_t2f, save_dummy_ref=True, verbose=False)
-    register_images(t2f_reg, t2w_path, t2w_reg, transform_path=tfm_t2w, save_dummy_ref=True, verbose=False)
 
-    for tfm, label in zip([tfm_t1n, tfm_t2f, tfm_t2w], ["T1n", "T2f", "T2w"]):
-        
-        tfm_dest = os.path.join(transform_dir, os.path.basename(tfm))
-        shutil.move(tfm, tfm_dest)
-        
-        moving_ref_dummy = tfm.replace(".tfm", "_moving_ref.nii.gz")
-        tfm_moving_ref_dest = os.path.join(transform_dir, os.path.basename(moving_ref_dummy))
-        shutil.move(moving_ref_dummy, tfm_moving_ref_dest)
+def _choose_reference_for_patient(
+    patient_dir: Path,
+    in_dir: Path,
+    old_coreg_maps: dict[str, Path] | None,
+) -> Path | None:
+    """
+    If old_coreg_maps has an entry for this patient, reuse it (if it exists).
+    Else pick earliest timepoint (smallest 'day') that has a T1c.
+    Returns absolute Path to the reference T1c, or None if not found.
+    """
+    patient = patient_dir.name
 
-        fixed_ref_dummy = tfm.replace(".tfm", "_fixed_ref.nii.gz")
-        tfm_fixed_ref_dest = os.path.join(transform_dir, os.path.basename(fixed_ref_dummy))
-        shutil.move(fixed_ref_dummy, tfm_fixed_ref_dest)
-        
-        transform_records[label]["initial_registration"] = {
-            "transform": f"./{transform_basedir}/{os.path.basename(tfm)}",
-            "fixed_reference": f"./{transform_basedir}/{os.path.basename(fixed_ref_dummy)}",
-            "moving_reference": f"./{transform_basedir}/{os.path.basename(moving_ref_dummy)}"
-        }
+    # A) Old logs preference
+    if old_coreg_maps and patient in old_coreg_maps:
+        candidate = in_dir / old_coreg_maps[patient]
+        if candidate.exists():
+            return candidate
 
-    if co_register_path:
-        print("[Step 2] Co-register all scans to provided reference")
-        t1c_coreg = os.path.join(temp_dir, f"{basename_prefix}_T1c_coreg.nii.gz")
-        coreg_tfm = os.path.join(temp_dir, "T1c_to_coreg.tfm")
-        
-        register_images(co_register_path, t1c_path, t1c_coreg, transform_path=coreg_tfm, save_dummy_ref=True, verbose=False)
-
-        coreg_tfm_dest = os.path.join(transform_dir, os.path.basename(coreg_tfm))
-        shutil.move(coreg_tfm, coreg_tfm_dest)
-
-        coreg_moving_ref_dummy = coreg_tfm.replace(".tfm", "_moving_ref.nii.gz")
-        coreg_tfm_moving_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_moving_ref_dummy))
-        shutil.move(coreg_moving_ref_dummy, coreg_tfm_moving_ref_dest)
-
-        coreg_fixed_ref_dummy = coreg_tfm.replace(".tfm", "_fixed_ref.nii.gz")
-        coreg_tfm_fixed_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_fixed_ref_dummy))
-        shutil.move(coreg_fixed_ref_dummy, coreg_tfm_fixed_ref_dest)
-
-        t1n_reg_coreg = os.path.join(temp_dir, f"{basename_prefix}_T1n_coreg.nii.gz")
-        t2f_reg_coreg = os.path.join(temp_dir, f"{basename_prefix}_T2f_coreg.nii.gz")
-        t2w_reg_coreg = os.path.join(temp_dir, f"{basename_prefix}_T2w_coreg.nii.gz")
-        
-        for label, src, out in zip(["T1n", "T2f", "T2w"], [t1n_reg, t2f_reg, t2w_reg], [t1n_reg_coreg, t2f_reg_coreg, t2w_reg_coreg]):
-            register_images(co_register_path, src, out, transform_path=coreg_tfm_dest, apply_only=True, save_dummy_ref=False, verbose=False)
-            
-        for label in ["T1c", "T1n", "T2f", "T2w"]:
-            transform_records[label]["coregistration"] = {
-                "transform": f"./{transform_basedir}/{os.path.basename(coreg_tfm)}",
-                "fixed_reference": f"./{transform_basedir}/{os.path.basename(coreg_fixed_ref_dummy)}",
-                "moving_reference": f"./{transform_basedir}/{os.path.basename(coreg_moving_ref_dummy)}"
-            }
-
-        t1c_reg_final = t1c_coreg
-        t1n_reg_final = t1n_reg_coreg
-        t2f_reg_final = t2f_reg_coreg
-        t2w_reg_final = t2w_reg_coreg
-
-    else:
-        t1c_reg_final = t1c_path
-        t1n_reg_final = t1n_reg
-        t2f_reg_final = t2f_reg
-        t2w_reg_final = t2w_reg
-
-    outputs_to_save = []
-    if save_scans_with_skulls:
-        for label, path in zip(["T1c", "T1n", "T2f", "T2w"], [t1c_reg_final, t1n_reg_final, t2f_reg_final, t2w_reg_final]):
-            out_path = os.path.join(temp_dir, f"{basename_prefix}_{label}.nii.gz")
-            resize_mri(
-                input_filepath=path,
-                output_filepath=out_path,
-                target_shape=final_dims,
-                target_voxel_dims=final_voxels,
-                interp=1,
-                save_padding_record=False
-            )
-            outputs_to_save.append(out_path)
-
-    print("[Step 3] Skull-strip and mask all scans")
-    brain_mask = os.path.join(temp_dir, f"{basename_prefix}_brainmask_temp.nii.gz")
-    t1c_brain = os.path.join(temp_dir, f"{basename_prefix}_T1c_brain_temp.nii.gz")
-    run_hd_bet(t1c_reg_final, output_path=t1c_brain, mask_path=brain_mask, overwrite_existing=1, device="cpu")
-
-    masked_paths = {}
-    for label, path in zip(["T1n", "T2f", "T2w"], [t1n_reg_final, t2f_reg_final, t2w_reg_final]):
-        out_path = os.path.join(temp_dir, f"{basename_prefix}_{label}_brain_temp.nii.gz")
-        class Args: pass
-        args = Args()
-        args.applymask = True
-        args.input = path
-        args.mask = brain_mask
-        args.output = out_path
-        args.average = args.operation = args.inputs = None
-        perform_mri_math(args)
-        masked_paths[label] = out_path
-
-    print("[Step 4] Normalize brain-extracted scans")
-    norm_paths = {}
-    for label in ["T1c", "T1n", "T2f", "T2w"]:
-        input_path = t1c_brain if label == "T1c" else masked_paths[label]
-        norm_out = os.path.join(temp_dir, f"{basename_prefix}_{label}_brain_norm_temp.nii.gz")
-        normalize_masked_image(input_path, brain_mask, norm_out)
-        norm_paths[label] = norm_out
-
-    print("[Step 5] Resize and collect all output images")
-    for label in ["T1c", "T1n", "T2f", "T2w"]:
-        for suffix in ["brain_temp", "brain_norm_temp"]:
-            path = os.path.join(temp_dir, f"{basename_prefix}_{label}_{suffix}.nii.gz")
-            suffix_clean = suffix.replace("_temp", "")
-            resized = os.path.join(temp_dir, f"{basename_prefix}_{label}_{suffix_clean}.nii.gz")
-
-            if os.path.exists(path):
-
-                if debug:
-                    print(f"[Debug] Appending resized file to outputs: {os.path.basename(resized)}")
-                    
-                if suffix == "brain_temp":
-                    pad_basename = f"{label}_padding.txt"
-                    pad_path = os.path.join(transform_dir, pad_basename)
-                    record_path = f"./{transform_basedir}/{pad_basename}"
-                    resize_mri(
-                        input_filepath=path,
-                        output_filepath=resized,
-                        target_shape=final_dims,
-                        target_voxel_dims=final_voxels,
-                        interp=1,
-                        save_padding_record=True,
-                        padding_record_path=pad_path
-                    )
-                    outputs_to_save.append(resized)
-                    transform_records[label]["final_resize"] = record_path
-                else:
-                    resize_mri(
-                        input_filepath=path,
-                        output_filepath=resized,
-                        target_shape=final_dims,
-                        target_voxel_dims=final_voxels,
-                        interp=1,
-                        save_padding_record=False
-                    )
-                    outputs_to_save.append(resized)
-            else:
-                raise ValueError(
-                    f"[Error] Attempted to resize {path}, but file does not exist."
-                )
-
-    brainmask_resized = os.path.join(temp_dir, f"{basename_prefix}_brainmask.nii.gz")
-    resize_mri(
-        input_filepath=brain_mask,
-        output_filepath=brainmask_resized,
-        target_shape=final_dims,
-        target_voxel_dims=final_voxels,
-        interp=0,
-        save_padding_record=False
+    # B) Earliest timepoint with T1c
+    exams = [p for p in patient_dir.iterdir() if p.is_dir()]
+    # Sort by parsed day; invalids go last
+    exams_sorted = sorted(
+        exams,
+        key=lambda p: (_parse_timepoint_from_exam_name(p.name)[1] is False,
+                       _parse_timepoint_from_exam_name(p.name)[0])
     )
-    outputs_to_save.append(brainmask_resized)
-
-    print("[Final Step] Moving outputs to:", output_dir)
-    
-    if debug:
-        print("[Debug] Outputs to save:")
-
-    for src in outputs_to_save:
-        if debug:
-            print(" -", os.path.basename(src))
-        shutil.move(src, os.path.join(output_dir, os.path.basename(src)))
-
-    for label, record in transform_records.items():
-        with open(os.path.join(output_dir, f"{basename_prefix}_{label}_transform_record.json"), 'w') as f:
-            json.dump(record, f, indent=2)
-
-    print("[Done] All selected outputs saved to:", output_dir)
+    for ex in exams_sorted:
+        t1c = list(ex.glob("*_T1c.nii.gz")) or list(ex.glob("*_T1c.nii"))
+        if t1c:
+            return t1c[0]
+    return None
 
 
-def preprocess_brain_mris(
-    t1c_path,
-    t1n_path,
-    t2f_path,
-    t2w_path,
-    output_dir,
-    co_register_path=None,
-    save_scans_with_skulls=False,
-    final_dims=(240, 240, 155),
-    final_voxels=(1.0, 1.0, 1.0),
-    debug=False,
-    patientID=None,
-    timepoint=None,
-    scanID=None,
-):
-    os.makedirs(output_dir, exist_ok=True)
+def _read_old_coreg_logs(paths: list[Path]) -> dict[str, Path]:
+    """
+    Read one or more prior coreg logs and build patient -> relative path mapping.
+    If duplicates occur, the first file wins (earlier in the provided list).
+    Expected headers include at least: Patient, ReferenceRelativePath
+    """
+    mapping: dict[str, Path] = {}
+    for p in paths:
+        if not p.exists():
+            continue
+        with p.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            # Flexible header handling
+            patient_key = None
+            path_key = None
+            for k in reader.fieldnames or []:
+                lk = k.strip().lower()
+                if lk in ("patient", "patientid", "patient_id"):
+                    patient_key = k
+                if lk in ("referencerelativepath", "reference_relative_path", "relative_ref_path"):
+                    path_key = k
+            if not patient_key or not path_key:
+                continue
+            for row in reader:
+                pat = (row.get(patient_key) or "").strip()
+                rel = (row.get(path_key) or "").strip()
+                if pat and rel and pat not in mapping:
+                    mapping[pat] = Path(rel)
+    return mapping
 
-    if debug:
-        temp_dir = tempfile.mkdtemp()
-        print(f"[Debug] Temporary directory retained at: {temp_dir}")
-        try:
-            run_preprocessing_pipeline(
-                t1c_path=t1c_path,
-                t1n_path=t1n_path,
-                t2f_path=t2f_path,
-                t2w_path=t2w_path,
-                output_dir=output_dir,
-                co_register_path=co_register_path,
-                save_scans_with_skulls=save_scans_with_skulls,
-                final_dims=final_dims,
-                final_voxels=final_voxels,
-                temp_dir=temp_dir,
-                patientID=patientID,
-                timepoint=timepoint,
-                scanID=scanID,
-                debug=True
-            )
-        except Exception as e:
-            print(f"[Error] {e}")
-            raise
-        # Do not remove temp_dir
+
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# ----------------------------
+# Core batch function
+# ----------------------------
+
+def preprocess_library(
+    in_dir: str | Path,
+    out_dir: str | Path,
+    preprocess_log: str | Path | None = None,
+    coreg_log: str | Path | None = None,
+    old_coreg_log: list[str | Path] | None = None,
+    dont_coregister: bool = False,
+    n_workers: int = 1,
+    # Passthrough options to preprocess_single_brain_mri
+    final_dims: list[int] | None = None,
+    final_voxels: list[float] | None = None,
+    save_scans_with_skulls: bool = False,
+    debug: bool = False,
+) -> tuple[Path, Path]:
+    """
+    Walk {in_dir}/{patient}/{exam}, find T1c/T1n/T2f/T2w in each exam,
+    optionally pick a patient-level reference T1c for co-registration,
+    and run preprocess_single_brain_mri on each exam into {out_dir}/{patient}/{exam}.
+
+    Returns (preprocess_log_path, coreg_log_path).
+    """
+    in_dir = Path(in_dir).resolve()
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Default log paths
+    if preprocess_log is None:
+        preprocess_log = out_dir / f"preprocess_log_{_now_stamp()}.csv"
     else:
-        with tempfile.TemporaryDirectory() as temp_dir:
-             run_preprocessing_pipeline(
-                t1c_path=t1c_path,
-                t1n_path=t1n_path,
-                t2f_path=t2f_path,
-                t2w_path=t2w_path,
-                output_dir=output_dir,
-                co_register_path=co_register_path,
-                save_scans_with_skulls=save_scans_with_skulls,
+        preprocess_log = Path(preprocess_log)
+        preprocess_log.parent.mkdir(parents=True, exist_ok=True)
+
+    if coreg_log is None:
+        coreg_log = out_dir / f"coreg_log_{_now_stamp()}.csv"
+    else:
+        coreg_log = Path(coreg_log)
+        coreg_log.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build patient list
+    patient_dirs = [p for p in in_dir.iterdir() if p.is_dir()]
+
+    # Read previous reference logs (optional)
+    old_maps: dict[str, Path] | None = None
+    if old_coreg_log:
+        old_paths = [Path(p) for p in old_coreg_log]
+        old_maps = _read_old_coreg_logs(old_paths)
+
+    # Determine a reference for each patient (or None)
+    patient_ref: dict[str, Path | None] = {}
+    for pd in patient_dirs:
+        if dont_coregister:
+            patient_ref[pd.name] = None
+        else:
+            patient_ref[pd.name] = _choose_reference_for_patient(pd, in_dir, old_maps)
+
+    # Write the coreg log up front (what we will try to use)
+    with coreg_log.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Patient", "ReferenceRelativePath"])
+        for pat, ref in sorted(patient_ref.items(), key=lambda kv: kv[0]):
+            rel = ""
+            if ref is not None:
+                # Relative to in_dir as requested
+                try:
+                    rel = str(ref.resolve().relative_to(in_dir))
+                except Exception:
+                    # If ref isn't under in_dir, still record absolute path
+                    rel = str(ref)
+            w.writerow([pat, rel])
+
+    # Collect exam tasks
+    tasks: list[tuple[Path, Path, dict[str, Path], Path | None]] = []
+    for pd in patient_dirs:
+        for ex in sorted(p for p in pd.iterdir() if p.is_dir()):
+            scans = _find_required_scans(ex)
+            if scans is None:
+                # We will log a skip later
+                tasks.append((pd, ex, {}, patient_ref[pd.name]))
+            else:
+                tasks.append((pd, ex, scans, patient_ref[pd.name]))
+
+    # Prepare the preprocess log
+    with preprocess_log.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "Patient", "Exam", "Status", "Message",
+            "InExamDir", "OutExamDir",
+            "T1c", "T1n", "T2f", "T2w",
+            "CoregisterRefUsed"
+        ])
+
+    # Worker function
+    def _run_exam(pd: Path, ex: Path, scans: dict[str, Path], ref: Path | None) -> tuple[str, list[str]]:
+        patient, exam = _parse_patient_exam(ex)
+        out_exam = out_dir / patient / exam
+        out_exam.mkdir(parents=True, exist_ok=True)
+
+        if not scans:
+            msg = "Missing required scans; skipped."
+            return "SKIPPED", [patient, exam, "SKIPPED", msg, str(ex), str(out_exam), "", "", "", "", str(ref or "NONE")]
+
+        t1c = str(scans["T1c"])
+        t1n = str(scans["T1n"])
+        t2f = str(scans["T2f"])
+        t2w = str(scans["T2w"])
+
+        started = time.time()
+        try:
+            preprocess_single_brain_mri(
+                t1c_path=t1c,
+                t1n_path=t1n,
+                t2f_path=t2f,
+                t2w_path=t2w,
+                output_dir=str(out_exam),
+                co_register=None if dont_coregister else (str(ref) if ref else None),
+                # passthroughs
                 final_dims=final_dims,
                 final_voxels=final_voxels,
-                temp_dir=temp_dir,
-                patientID=patientID,
-                timepoint=timepoint,
-                scanID=scanID,
-                debug=False
+                save_scans_with_skulls=save_scans_with_skulls,
+                debug=debug,
             )
-            
+            dur = f"{time.time() - started:.1f}s"
+            return "OK", [patient, exam, "OK", dur, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE")]
+        except Exception as e:
+            msg = f"ERROR: {e.__class__.__name__}: {e}"
+            return "ERROR", [patient, exam, "ERROR", msg, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE")]
 
+    # Execute (optionally parallel)
+    if n_workers and n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool, preprocess_log.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            futs = {pool.submit(_run_exam, *t): t for t in tasks}
+            for fut in as_completed(futs):
+                status, row = fut.result()
+                w.writerow(row)
+    else:
+        with preprocess_log.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for t in tasks:
+                status, row = _run_exam(*t)
+                w.writerow(row)
+
+    return Path(preprocess_log), Path(coreg_log)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Full MRI preprocessing pipeline for T1c, T1n, T2f, T2w")
-    parser.add_argument("--t1c", required=True, help="T1c image path")
-    parser.add_argument("--t1n", required=True, help="T1n image path")
-    parser.add_argument("--t2f", required=True, help="T2f image path")
-    parser.add_argument("--t2w", required=True, help="T2w image path")
-    parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--patientID", help="Flag to indicate which patient this scan is from. If not provided, defaults to the first _ separated field of the input T1c filename.")
-    parser.add_argument("--timepoint", help="Flag to indicate timepoint of this scan. If not provided, defaults to the second _ separated field of the input T1c filename.")
-    parser.add_argument("--scanID", help="Unique identifier for this sequence of scans. If not provided, defaults to the third _ separated field of the input T1c filename.")
-    parser.add_argument("--co_register", help="Optional reference image to co-register all scans to")
-    parser.add_argument("--save_scans_with_skulls", action="store_true", help="Save scans after registration but before skull-stripping. WARNING: May contain PHI in the form of a patient's face scan unless input scans were de-faced prior to processing.")
-    parser.add_argument("--final_dims", default="240,240,155", help="Final data dimensions (default: 240,240,155)")
-    parser.add_argument("--final_voxels", default="1.0,1.0,1.0", help="Final voxel sizes (default: 1.0,1.0,1.0)")
-    parser.add_argument("--debug", action="store_true", help="Keep intermediate files and temp directory after execution")
+    p = argparse.ArgumentParser(
+        description="Batch brain MRI preprocessing over a NIFTI library (patient/exam tree)."
+    )
+    p.add_argument("--in_dir", required=True, help="Path to NIFTI library root (converted by convert_dicom_plan).")
+    p.add_argument("--out_dir", required=True, help="Path to write preprocessed outputs (patient/exam structure).")
+    p.add_argument("--preprocess_log", default=None, help="CSV path for per-exam outcomes. Auto-generated if omitted.")
+    p.add_argument("--coreg_log", default=None, help="CSV path for chosen per-patient reference. Auto-generated if omitted.")
+    p.add_argument("--old_coreg_log", nargs="*", default=None, help="One or more prior coreg logs to reuse references.")
+    p.add_argument("--dont_coregister", action="store_true", help="Disable co-registration; run each exam independently.")
+    p.add_argument("--n_workers", type=int, default=1, help="Parallel workers (threaded). Use 1 to run serially.")
 
+    # Passthroughs to preprocess_single_brain_mri
+    p.add_argument("--final_dims", type=int, nargs=3, default=None, metavar=("NX", "NY", "NZ"),
+                   help="Final dimensions (e.g., 192 224 160).")
+    p.add_argument("--final_voxels", type=float, nargs=3, default=None, metavar=("SX", "SY", "SZ"),
+                   help="Final voxel sizes in mm (e.g., 1.0 1.0 1.0).")
+    p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
+    p.add_argument("--debug", action="store_true", help="Keep temp dirs from underlying preprocessing.")
 
-    args = parser.parse_args()
-    dims = tuple(map(int, args.final_dims.split(",")))
-    voxels = tuple(map(float, args.final_voxels.split(",")))
+    args = p.parse_args()
 
-    preprocess_brain_mris(
-        t1c_path=args.t1c,
-        t1n_path=args.t1n,
-        t2f_path=args.t2f,
-        t2w_path=args.t2w,
-        output_dir=args.output,
-        co_register_path=args.co_register,
+    preprocess_library(
+        in_dir=args.in_dir,
+        out_dir=args.out_dir,
+        preprocess_log=args.preprocess_log,
+        coreg_log=args.coreg_log,
+        old_coreg_log=args.old_coreg_log,
+        dont_coregister=args.dont_coregister,
+        n_workers=args.n_workers,
+        final_dims=args.final_dims,
+        final_voxels=args.final_voxels,
         save_scans_with_skulls=args.save_scans_with_skulls,
-        final_dims=dims,
-        final_voxels=voxels,
         debug=args.debug,
-        patientID=args.patientID,
-        timepoint=args.timepoint,
-        scanID=args.scanID,
     )
 
 

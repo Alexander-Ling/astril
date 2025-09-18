@@ -10,7 +10,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.6.41"
+version = "0.6.50"
 description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -36,6 +36,7 @@ merge-seg-volumes = "astril.merge_seg_volumes:main"
 quantify-volumes = "astril.quantify_volumes:main"
 segment-gbm = "astril.segment_GBM:main"
 visualize-model = "astril.visualize_model:main"
+preprocess_single_brain_mri = "astril.preprocess_single_brain_mri:main"
 preprocess_brain_mris = "astril.preprocess_brain_mris:main"
 convert-dicom-series = "astril.dicom_conversion:main"
 astril-make-models-json = "astril.models_manifest:cli_make_models_json"
