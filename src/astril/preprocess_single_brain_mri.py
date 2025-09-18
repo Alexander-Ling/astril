@@ -35,8 +35,10 @@ def run_preprocessing_pipeline(
     timepoint=None,
     scanID=None,
     debug=False,
+    verbose=False
 ):
-    print(f"[Info] Using temporary directory: {temp_dir}")
+    if verbose:
+        print(f"[Info] Using temporary directory: {temp_dir}")
 
     transform_records = {
         "T1c": {},
@@ -69,7 +71,9 @@ def run_preprocessing_pipeline(
                 "[Error] Could not extract patientID from T1c filename. "
                 "Please provide it explicitly with --patientID."
             )
-    print(f"[Info] PatientID = {patientID}")
+
+    if verbose:
+        print(f"[Info] PatientID = {patientID}")
 
     if timepoint is None:
         if len(name_fields) >= 2:
@@ -79,7 +83,9 @@ def run_preprocessing_pipeline(
                 "[Error] Could not extract timepoint from T1c filename. "
                 "Please provide it explicitly with --timepoint."
             )
-    print(f"[Info] Timepoint = {timepoint}")
+
+    if verbose:
+        print(f"[Info] Timepoint = {timepoint}")
 
     if scanID is None:
         if len(name_fields) >= 3:
@@ -89,12 +95,16 @@ def run_preprocessing_pipeline(
                 "[Error] Could not extract scanID from T1c filename. "
                 "Please provide it explicitly with --scanID."
             )
-    print(f"[Info] ScanID = {scanID}")
+
+    if verbose:
+        print(f"[Info] ScanID = {scanID}")
 
     # Output names should not include the source scanID; use PatientID_Timepoint only
     basename_prefix = f"{patientID}_{timepoint}"
-        
-    print("[Step 1] Register T1n, T2f, T2w to T1c")
+    
+    if verbose:
+        print("[Step 1] Register T1n, T2f, T2w to T1c")
+
     t1n_reg = os.path.join(temp_dir, f"{basename_prefix}_T1n_reg.nii.gz")
     t2f_reg = os.path.join(temp_dir, f"{basename_prefix}_T2f_reg.nii.gz")
     t2w_reg = os.path.join(temp_dir, f"{basename_prefix}_T2w_reg.nii.gz")
@@ -127,7 +137,8 @@ def run_preprocessing_pipeline(
         }
 
     if co_register_path:
-        print("[Step 2] Co-register all scans to provided reference")
+        if verbose:
+            print("[Step 2] Co-register all scans to provided reference")
         t1c_coreg = os.path.join(temp_dir, f"{basename_prefix}_T1c_coreg.nii.gz")
         coreg_tfm = os.path.join(temp_dir, "T1c_to_coreg.tfm")
         
@@ -182,11 +193,13 @@ def run_preprocessing_pipeline(
                 save_padding_record=False
             )
             outputs_to_save.append(out_path)
+    
+    if verbose:
+        print("[Step 3] Skull-strip and mask all scans")
 
-    print("[Step 3] Skull-strip and mask all scans")
     brain_mask = os.path.join(temp_dir, f"{basename_prefix}_brainmask_temp.nii.gz")
     t1c_brain = os.path.join(temp_dir, f"{basename_prefix}_T1c_brain_temp.nii.gz")
-    run_hd_bet(t1c_reg_final, output_path=t1c_brain, mask_path=brain_mask, overwrite_existing=1, device="cpu")
+    run_hd_bet(t1c_reg_final, output_path=t1c_brain, mask_path=brain_mask, overwrite_existing=1, device="cpu", quiet=not verbose)
 
     masked_paths = {}
     for label, path in zip(["T1n", "T2f", "T2w"], [t1n_reg_final, t2f_reg_final, t2w_reg_final]):
@@ -201,15 +214,19 @@ def run_preprocessing_pipeline(
         perform_mri_math(args)
         masked_paths[label] = out_path
 
-    print("[Step 4] Normalize brain-extracted scans")
+    if verbose:
+        print("[Step 4] Normalize brain-extracted scans")
+
     norm_paths = {}
     for label in ["T1c", "T1n", "T2f", "T2w"]:
         input_path = t1c_brain if label == "T1c" else masked_paths[label]
         norm_out = os.path.join(temp_dir, f"{basename_prefix}_{label}_brain_norm_temp.nii.gz")
         normalize_masked_image(input_path, brain_mask, norm_out)
         norm_paths[label] = norm_out
+    
+    if verbose:
+        print("[Step 5] Resize and collect all output images")
 
-    print("[Step 5] Resize and collect all output images")
     for label in ["T1c", "T1n", "T2f", "T2w"]:
         for suffix in ["brain_temp", "brain_norm_temp"]:
             path = os.path.join(temp_dir, f"{basename_prefix}_{label}_{suffix}.nii.gz")
@@ -262,7 +279,8 @@ def run_preprocessing_pipeline(
     )
     outputs_to_save.append(brainmask_resized)
 
-    print("[Final Step] Moving outputs to:", output_dir)
+    if verbose:
+        print("[Final Step] Moving outputs to:", output_dir)
     
     if debug:
         print("[Debug] Outputs to save:")
@@ -276,10 +294,11 @@ def run_preprocessing_pipeline(
         with open(os.path.join(output_dir, f"{basename_prefix}_{label}_transform_record.json"), 'w') as f:
             json.dump(record, f, indent=2)
 
-    print("[Done] All selected outputs saved to:", output_dir)
+    if verbose:
+        print("[Done] All selected outputs saved to:", output_dir)
 
 
-def preprocess_brain_mris(
+def preprocess_single_brain_mri(
     t1c_path,
     t1n_path,
     t2f_path,
@@ -293,6 +312,7 @@ def preprocess_brain_mris(
     patientID=None,
     timepoint=None,
     scanID=None,
+    verbose=False
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -314,7 +334,8 @@ def preprocess_brain_mris(
                 patientID=patientID,
                 timepoint=timepoint,
                 scanID=scanID,
-                debug=True
+                debug=True,
+                verbose=verbose
             )
         except Exception as e:
             print(f"[Error] {e}")
@@ -336,7 +357,8 @@ def preprocess_brain_mris(
                 patientID=patientID,
                 timepoint=timepoint,
                 scanID=scanID,
-                debug=False
+                debug=False,
+                verbose=verbose
             )
             
 
@@ -356,13 +378,14 @@ def main():
     parser.add_argument("--final_dims", default="240,240,155", help="Final data dimensions (default: 240,240,155)")
     parser.add_argument("--final_voxels", default="1.0,1.0,1.0", help="Final voxel sizes (default: 1.0,1.0,1.0)")
     parser.add_argument("--debug", action="store_true", help="Keep intermediate files and temp directory after execution")
+    parser.add_argument("--quiet", action="store_true", help="Suppress verbose print logging.")
 
 
     args = parser.parse_args()
     dims = tuple(map(int, args.final_dims.split(",")))
     voxels = tuple(map(float, args.final_voxels.split(",")))
 
-    preprocess_brain_mris(
+    preprocess_single_brain_mri(
         t1c_path=args.t1c,
         t1n_path=args.t1n,
         t2f_path=args.t2f,
@@ -376,6 +399,7 @@ def main():
         patientID=args.patientID,
         timepoint=args.timepoint,
         scanID=args.scanID,
+        verbose=not args.quiet
     )
 
 

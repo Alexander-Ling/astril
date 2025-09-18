@@ -11,6 +11,7 @@ import sys
 import argparse
 import shutil
 import subprocess
+import contextlib
 import re
 import ast
 import json
@@ -494,7 +495,7 @@ def inverse_transform_image(
 # Function to run hd-bet for brainmask creation
 # ---------------------------------------------------------------------------------------
 
-def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", device="cpu", tta=0, pp=1, overwrite_existing=0):
+def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", device="cpu", tta=0, pp=1, overwrite_existing=0, quiet=False):
     from .preprocessing_utils import ensure_hd_bet_installed
     ensure_hd_bet_installed()
 
@@ -529,8 +530,13 @@ def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", de
         "--save_mask", str(save_mask_flag),
     ]
 
-    print("Running command:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    if not quiet:
+        print("Running command:", " ".join(cmd))
+    # suppress HD-BET console output if quiet
+    with contextlib.ExitStack() as stack:
+        stdout = subprocess.DEVNULL if quiet else None
+        stderr = subprocess.DEVNULL if quiet else None
+        subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr)
 
     if mask_path:
         # Only change the final extension, not every occurrence in the path

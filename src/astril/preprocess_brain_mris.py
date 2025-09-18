@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from datetime import datetime
 
 # We import and call your existing function directly (no subprocess).
@@ -18,6 +19,12 @@ from .preprocess_single_brain_mri import preprocess_single_brain_mri  # type: ig
 # ----------------------------
 
 REQ_LABELS = ("T1c", "T1n", "T2f", "T2w")
+
+try:
+    # auto picks the right frontend (console/notebook) and tends to behave better on Windows/PwSh
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None  # fallback to a simple counter
 
 def _find_required_scans(exam_dir: Path) -> dict[str, Path] | None:
     """
@@ -45,6 +52,46 @@ def _parse_patient_exam(exam_dir: Path) -> tuple[str, str]:
     exam = exam_dir.name
     return patient, exam
 
+def _exam_prefix_from_dir(exam_dir: Path) -> str:
+    """
+    Expected exam dir name: {patient}_{timepoint}_{ExamAlias}
+    We want output prefix == "{patient}_{timepoint}" to match the single-run outputs.
+    """
+    parts = exam_dir.name.split("_", 2)
+    if len(parts) >= 2:
+        return f"{parts[0]}_{parts[1]}"
+    # Fallback: try to derive from any T1c file name
+    t1c = list(exam_dir.glob("*_T1c.nii.gz")) or list(exam_dir.glob("*_T1c.nii"))
+    if t1c:
+        stem = t1c[0].name
+        if stem.lower().endswith(".nii.gz"):
+            stem = stem[:-7]
+        elif stem.lower().endswith(".nii"):
+            stem = stem[:-4]
+        # drop trailing "_T1c"
+        if stem.endswith("_T1c"):
+            stem = stem[:-5]
+        return stem
+    # Worst case, return dir name
+    return exam_dir.name
+
+def _outputs_complete(out_exam: Path, prefix: str) -> bool:
+    """
+    Check for the full set of expected single-run outputs in out_exam:
+      - brainmask
+      - for each modality in REQ_LABELS: *_brain.nii.gz and *_brain_norm.nii.gz
+      - transform_record.json per modality
+    """
+    expected = [
+        out_exam / f"{prefix}_brainmask.nii.gz",
+    ]
+    for mod in REQ_LABELS:
+        expected += [
+            out_exam / f"{prefix}_{mod}_brain.nii.gz",
+            out_exam / f"{prefix}_{mod}_brain_norm.nii.gz",
+            out_exam / f"{prefix}_{mod}_transform_record.json",
+        ]
+    return all(p.exists() for p in expected)
 
 def _parse_timepoint_from_exam_name(exam_name: str) -> tuple[int, bool]:
     """
@@ -147,6 +194,7 @@ def preprocess_library(
     old_coreg_log: list[str | Path] | None = None,
     dont_coregister: bool = False,
     n_workers: int = 1,
+    overwrite: bool = False,
     # Passthrough options to preprocess_single_brain_mri
     final_dims: list[int] | None = None,
     final_voxels: list[float] | None = None,
@@ -220,25 +268,60 @@ def preprocess_library(
             else:
                 tasks.append((pd, ex, scans, patient_ref[pd.name]))
 
-    # Prepare the preprocess log
-    with preprocess_log.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+    # Prepare the preprocess log (delimiter from extension; line-buffered)
+    delim = "\t" if str(preprocess_log).lower().endswith(".tsv") else ","
+    with preprocess_log.open("w", newline="", encoding="utf-8", buffering=1) as f:
+        w = csv.writer(f, delimiter=delim)
         w.writerow([
             "Patient", "Exam", "Status", "Message",
             "InExamDir", "OutExamDir",
             "T1c", "T1n", "T2f", "T2w",
-            "CoregisterRefUsed"
+            "CoregisterRefUsed",
+            "final_dims", "final_voxels", "save_scans_with_skulls"
         ])
+        f.flush()
+        os.fsync(f.fileno())
+
+    # Progress setup
+    total = len(tasks)
+    lock = threading.Lock()
+    if tqdm:
+        # tie to stdout explicitly; dynamic_ncols helps with odd terminals; leave=False keeps console tidy
+        pbar = tqdm(total=total, desc="Preprocessing exams", unit="exam",
+                    dynamic_ncols=True, leave=False, file=sys.stdout)
+    else:
+        pbar = None
+        done_count = 0
+
+    def _advance():
+        nonlocal done_count
+        if pbar:
+            pbar.update(1)
+            # Force a redraw so progress is visible even when other processes are spamming stdout
+            pbar.refresh()
+        else:
+            with lock:
+                done_count += 1
+                print(f"[Progress] {done_count}/{total} exams completed", flush=True)
 
     # Worker function
     def _run_exam(pd: Path, ex: Path, scans: dict[str, Path], ref: Path | None) -> tuple[str, list[str]]:
         patient, exam = _parse_patient_exam(ex)
         out_exam = out_dir / patient / exam
-        out_exam.mkdir(parents=True, exist_ok=True)
 
         if not scans:
             msg = "Missing required scans; skipped."
-            return "SKIPPED", [patient, exam, "SKIPPED", msg, str(ex), str(out_exam), "", "", "", "", str(ref or "NONE")]
+            return "SKIPPED", [patient, exam, "SKIPPED", msg, str(ex), str(out_exam), "", "", "", "", str(ref or "NONE"), str(final_dims), str(final_voxels), save_scans_with_skulls]
+
+        # Skip if outputs already complete and not overwriting
+        prefix = _exam_prefix_from_dir(ex)
+        if (not overwrite) and _outputs_complete(out_exam, prefix):
+            msg = "Already processed (all expected outputs present); skipped."
+            return "SKIPPED", [patient, exam, "SKIPPED", msg, str(ex), str(out_exam),
+                               str(scans['T1c']), str(scans['T1n']), str(scans['T2f']), str(scans['T2w']),
+                               str(ref or "NONE"), str(final_dims), str(final_voxels), save_scans_with_skulls]
+
+        out_exam.mkdir(parents=True, exist_ok=True)
 
         t1c = str(scans["T1c"])
         t1n = str(scans["T1n"])
@@ -253,7 +336,7 @@ def preprocess_library(
                 t2f_path=t2f,
                 t2w_path=t2w,
                 output_dir=str(out_exam),
-                co_register=None if dont_coregister else (str(ref) if ref else None),
+                co_register_path=None if dont_coregister else (str(ref) if ref else None),
                 # passthroughs
                 final_dims=final_dims,
                 final_voxels=final_voxels,
@@ -261,26 +344,39 @@ def preprocess_library(
                 debug=debug,
             )
             dur = f"{time.time() - started:.1f}s"
-            return "OK", [patient, exam, "OK", dur, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE")]
+            return "OK", [patient, exam, "OK", dur, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE"), str(final_dims), str(final_voxels), save_scans_with_skulls]
         except Exception as e:
             msg = f"ERROR: {e.__class__.__name__}: {e}"
-            return "ERROR", [patient, exam, "ERROR", msg, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE")]
+            return "ERROR", [patient, exam, "ERROR", msg, str(ex), str(out_exam), t1c, t1n, t2f, t2w, str(ref or "NONE"), str(final_dims), str(final_voxels), save_scans_with_skulls]
 
     # Execute (optionally parallel)
     if n_workers and n_workers > 1:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool, preprocess_log.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool, \
+             preprocess_log.open("a", newline="", encoding="utf-8", buffering=1) as f:
+            w = csv.writer(f, delimiter=delim)
             futs = {pool.submit(_run_exam, *t): t for t in tasks}
             for fut in as_completed(futs):
-                status, row = fut.result()
-                w.writerow(row)
+                try:
+                    status, row = fut.result()
+                    w.writerow(row)
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    _advance()
     else:
-        with preprocess_log.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
+        with preprocess_log.open("a", newline="", encoding="utf-8", buffering=1) as f:
+            w = csv.writer(f, delimiter=delim)
             for t in tasks:
-                status, row = _run_exam(*t)
-                w.writerow(row)
+                try:
+                    status, row = _run_exam(*t)
+                    w.writerow(row)
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    _advance()
 
+    if pbar:
+        pbar.close()
     return Path(preprocess_log), Path(coreg_log)
 
 
@@ -299,11 +395,13 @@ def main():
     p.add_argument("--old_coreg_log", nargs="*", default=None, help="One or more prior coreg logs to reuse references.")
     p.add_argument("--dont_coregister", action="store_true", help="Disable co-registration; run each exam independently.")
     p.add_argument("--n_workers", type=int, default=1, help="Parallel workers (threaded). Use 1 to run serially.")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs instead of skipping completed exams.")
+
 
     # Passthroughs to preprocess_single_brain_mri
-    p.add_argument("--final_dims", type=int, nargs=3, default=None, metavar=("NX", "NY", "NZ"),
+    p.add_argument("--final_dims", type=int, nargs=3, default=(240, 240, 155), metavar=("NX", "NY", "NZ"),
                    help="Final dimensions (e.g., 192 224 160).")
-    p.add_argument("--final_voxels", type=float, nargs=3, default=None, metavar=("SX", "SY", "SZ"),
+    p.add_argument("--final_voxels", type=float, nargs=3, default=(1.0, 1.0, 1.0), metavar=("SX", "SY", "SZ"),
                    help="Final voxel sizes in mm (e.g., 1.0 1.0 1.0).")
     p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
     p.add_argument("--debug", action="store_true", help="Keep temp dirs from underlying preprocessing.")
@@ -318,6 +416,7 @@ def main():
         old_coreg_log=args.old_coreg_log,
         dont_coregister=args.dont_coregister,
         n_workers=args.n_workers,
+        overwrite=args.overwrite,
         final_dims=args.final_dims,
         final_voxels=args.final_voxels,
         save_scans_with_skulls=args.save_scans_with_skulls,
