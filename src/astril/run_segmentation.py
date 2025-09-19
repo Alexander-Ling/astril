@@ -21,6 +21,15 @@ import tensorflow as tf
 from pathlib import Path
 from tensorflow.keras.models import load_model
 
+
+# Keras 3 layers (for wrapping legacy SavedModel)
+try:
+    import keras
+    from keras.layers import TFSMLayer
+except Exception:  # pragma: no cover
+    keras = None
+    TFSMLayer = None
+
 # Import data loading functions from your package.
 from .data_loading import (
     read_paths_from_file,
@@ -50,6 +59,91 @@ custom_objects_dict = {
     'DynamicAttentionResUNet': DynamicAttentionResUNet
 }
 
+
+########################################################################
+# SavedModel helpers (Keras 3 no longer loads these via load_model)
+########################################################################
+def _is_tf_saved_model_dir(path: str | Path) -> bool:
+    p = Path(path)
+    if not p.is_dir():
+        return False
+    return (p / "saved_model.pb").exists() or (p / "saved_model.pbtxt").exists()
+
+
+def _wrap_saved_model_as_keras(saved_model_dir: str,
+                               input_channels: int,
+                               call_endpoint: str = "serving_default"):
+    """
+    Wrap a TF SavedModel as a Keras Model for inference using Keras 3 TFSMLayer.
+    The wrapped model has Input shape (None, None, None, input_channels) and
+    returns the first tensor if the SavedModel outputs a dict.
+    """
+    if TFSMLayer is None or keras is None:
+        raise ImportError(
+            "Keras 3 is required to load TensorFlow SavedModel via TFSMLayer. "
+            "Install `keras>=3` or convert your model to `.keras`."
+        )
+    inp = keras.Input(shape=(None, None, input_channels), dtype=tf.float32, name="input")
+    layer = TFSMLayer(saved_model_dir, call_endpoint=call_endpoint)
+    out = layer(inp)
+    if isinstance(out, dict):
+        # deterministically pick the first output
+        out = next(iter(out.values()))
+    return keras.Model(inp, out, name="wrapped_saved_model")
+
+########################################################################
+# Shared helper: load a list of models given config-derived arrays
+########################################################################
+def load_models_for_config(
+    model_paths: list[str],
+    model_train_config_files: list[str],
+    model_num_input_slices: list[int],
+    model_min_hw: list[int],
+    num_modal_channels: int,
+    model_call_endpoints: list[str] | None = None,
+):
+    """
+    Unified model loader used by run_segmentation.py and segment_GBM.py.
+    Supports .keras, legacy .h5 (weights-only), and TF SavedModel directories.
+    """
+    if model_call_endpoints is None:
+        model_call_endpoints = ["serving_default"] * len(model_paths)
+
+    loaded = []
+    for i, mp in enumerate(model_paths):
+        mp = mp.strip()
+        print(f"[INFO] Loading model {i+1}/{len(model_paths)} => {mp}")
+
+        # 1) Native Keras v3 model
+        if mp.endswith(".keras"):
+            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
+            loaded.append(model)
+            continue
+
+        # 2) Legacy weight-only HDF5
+        if mp.endswith(".h5"):
+            train_cfg = model_train_config_files[i].strip()
+            min_hw_val = model_min_hw[i]
+            input_slices = model_num_input_slices[i]
+            model = load_pretrained_model(mp, train_cfg, min_hw_val, input_slices)
+            loaded.append(model)
+            continue
+
+        # 3) Legacy TF SavedModel directory (Keras 3 path via TFSMLayer)
+        if os.path.isdir(mp) and _is_tf_saved_model_dir(mp):
+            input_slices = model_num_input_slices[i]
+            input_channels = num_modal_channels * input_slices
+            call_ep = model_call_endpoints[i] if i < len(model_call_endpoints) else "serving_default"
+            print(f"  [INFO] Detected TF SavedModel; wrapping via TFSMLayer (endpoint='{call_ep}').")
+            model = _wrap_saved_model_as_keras(mp, input_channels=input_channels, call_endpoint=call_ep)
+            loaded.append(model)
+            continue
+
+        # 4) Fallback: try Keras loader (covers directories that might be Keras)
+        model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
+        loaded.append(model)
+
+    return loaded
 
 ########################################################################
 # Helper: Build model from a model training config file.
@@ -222,6 +316,13 @@ def run_segmentation(
     if len(model_paths) != len(model_slicing_planes):
         raise ValueError("Mismatch between the number of model paths and model_train_slicing_planes.")
 
+    # Optional: per-model SavedModel call endpoints (defaults to 'serving_default')
+    _endpoints_str = config_parser["DEFAULT"].get("model_call_endpoints", None)
+    if _endpoints_str:
+        model_call_endpoints = [s.strip() for s in _endpoints_str.split(",")]
+    else:
+        model_call_endpoints = ["serving_default"] * len(model_paths)
+
     maskPattern = config_parser["DEFAULT"]["maskpattern"]
     segmentSuffix = config_parser["DEFAULT"]["segmentsuffix"]
 
@@ -237,7 +338,7 @@ def run_segmentation(
 
     num_subjects = len(mask_paths)
     if num_subjects == 0:
-        raise ValueError(f"No subjects found in {mask_cfg_file}. Check that it's not empty!")
+        raise ValueError(f"No exams found in {mask_cfg_file}. Check that it's not empty!")
     for cfiles in channel_file_lists:
         if len(cfiles) != num_subjects:
             raise ValueError("Mismatch in number of lines across channel cfg and mask cfg.")
@@ -246,23 +347,16 @@ def run_segmentation(
     volume_paths_list = [list(vp) for vp in volume_paths_list]
 
     # --- B) Load models ---
-    loaded_models = []
-    for i, mp in enumerate(model_paths):
-        mp = mp.strip()
-        print(f"[INFO] Loading model {i+1}/{len(model_paths)} => {mp}")
-        if os.path.isdir(mp) or mp.endswith('.keras'):
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-            loaded_models.append(model)
-        elif mp.endswith('.h5'):
-            train_cfg = model_train_config_files[i].strip()
-            # Use the minimum_hw and num_input_slices values for this model from the segmentation config.
-            min_hw_val = model_min_hw[i]
-            input_slices = model_num_input_slices[i]
-            model = load_pretrained_model(mp, train_cfg, min_hw_val, input_slices)
-            loaded_models.append(model)
-        else:
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-            loaded_models.append(model)
+    # How many MRI channels per sample (e.g., T1n, T1c, T2f, ...)
+    num_modal_channels = len(channel_file_lists)
+    loaded_models = load_models_for_config(
+        model_paths=model_paths,
+        model_train_config_files=model_train_config_files,
+        model_num_input_slices=model_num_input_slices,
+        model_min_hw=model_min_hw,
+        num_modal_channels=num_modal_channels,
+        model_call_endpoints=model_call_endpoints,
+    )
 
     # --- C) Define merging function ---
     def merge_predictions(volumes_4d, method=merging_method):
@@ -293,9 +387,9 @@ def run_segmentation(
                 seg_name += "_seg.nii.gz"
         out_path = out_dir / seg_name
 
-        print(f"\n[INFO] Subject {subj_idx+1}/{num_subjects} | {seg_name}")
+        print(f"\n[INFO] Exam {subj_idx+1}/{num_subjects} | {seg_name}")
         if out_path.exists() and not overwrite:
-            print(f"[INFO] Skipping subject {subj_idx+1}: {out_path} already exists.")
+            print(f"[INFO] Skipping exam {subj_idx+1}: {out_path} already exists.")
             continue
 
         mask_nib = nib.load(mask_path)
@@ -332,7 +426,7 @@ def run_segmentation(
                 all_preds.append(batch_pred)
 
             if not all_preds:
-                print(f"[WARNING] No slices processed for subject {subj_idx+1} ({base_name}).")
+                print(f"[WARNING] No slices processed for exam {subj_idx+1} ({base_name}).")
                 # Instead of using the post-alignment shape, use the original mask dimensions.
                 reassembled_4d = np.zeros((oh, ow, od, n_cls), dtype=np.float32)
                 # Bypass the transformation steps for an empty prediction.
@@ -378,7 +472,7 @@ def run_segmentation(
         nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
         print(f"[INFO] Final seg => {out_path}")
 
-    print("[INFO] All subjects done.")
+    print("[INFO] All exams done.")
 
 
 ########################################################################

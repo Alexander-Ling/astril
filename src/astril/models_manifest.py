@@ -60,7 +60,7 @@ def generate_models_json(
     models_dir: Union[str, Path, None] = None,
     output_path: Union[str, Path, None] = None,
     url_mapping: Optional[Union[Dict[str, str], str, Path]] = None,
-    include: Optional[Sequence[str]] = ("*.h5", "*.cfg"),
+    include: Optional[Sequence[str]] = ("*.keras", "*.h5", "*.cfg", "*.zip"),
     exclude: Optional[Sequence[str]] = (".git*", "*.gitignore", "*.gitkeep", "models.json", "osf_urls.json", "*.txt"),
     overwrite: bool = True,
     pretty: bool = True,
@@ -110,12 +110,44 @@ def generate_models_json(
     manifest: Dict[str, Dict[str, object]] = {}
     for p in files:
         st = p.stat()
-        manifest[p.name] = {
+        record: Dict[str, object] = {
             "url": url_map.get(p.name, ""),   # empty if not in map (and no default map)
             "sha256": _sha256(p),
             "bytes": st.st_size,
             "version": _iso8601_utc(st.st_mtime),
         }
+
+        # Heuristics for SavedModel archives (.zip)
+        if p.suffix.lower() == ".zip":
+            import zipfile, posixpath
+            try:
+                with zipfile.ZipFile(p, "r") as zf:
+                    names = zf.namelist()
+                    # Normalize names to forward slashes
+                    names = [n if isinstance(n, str) else n.decode("utf-8", "ignore") for n in names]
+                    # Detect single top-level directory (e.g., Axial_1/*)
+                    top_levels = {n.split("/", 1)[0] for n in names if "/" in n}
+                    topdir = None
+                    if len(top_levels) == 1:
+                        candidate = next(iter(top_levels))
+                        if f"{candidate}/saved_model.pb" in names:
+                            topdir = candidate
+                    # Or flat zip (saved_model.pb at root)
+                    has_root_pb = "saved_model.pb" in names
+
+                    if topdir or has_root_pb:
+                        record["kind"] = "saved_model_zip"
+                        record["extract_to"] = topdir or p.stem
+                        # Minimum expectations (variables shard filename can vary; check index file)
+                        record["expect"] = [
+                            "saved_model.pb",
+                            "variables/variables.index"
+                        ]
+            except Exception:
+                # If inspection fails, we still include the zip without annotations
+                pass
+
+        manifest[p.name] = record
 
     # Write output
     out = Path(output_path).resolve() if output_path else (models_dir / "models.json")
@@ -141,7 +173,7 @@ def cli_make_models_json(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--url-map", type=str, default=None,
                    help=("Path to filename->URL JSON. If omitted, "
                          "defaults to <models_dir>/osf_urls.json when present."))
-    p.add_argument("--include", type=str, default="*.h5,*.cfg",
+    p.add_argument("--include", type=str, default="*.keras,*.h5,*.cfg,*.zip",
                    help="Comma-separated include globs")
     p.add_argument("--exclude", type=str, default=".git*,*.gitignore,*.gitkeep,models.json,osf_urls.json,*.txt",
                    help="Comma-separated exclude globs")

@@ -274,11 +274,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate config files for MRI segmentation using multiple channels & models, with training configs for each model.")
     parser.add_argument("--workingDirectory", default=".", help="Directory to store generated config files.")
     parser.add_argument("--inputChannels", nargs="+", required=True,
-                        help="Names of input channels (e.g. T1, T2, FLAIR).")
+                        help="Names of input channels (e.g. T1n, T2w, T2f).")
     parser.add_argument("--channelPatterns", nargs="+", required=True,
-                        help="Patterns for each channel's input data (e.g. -T1.nii.gz, -T2.nii.gz, etc.).")
+                        help="Patterns for each channel's input data (e.g. T1c_brain_norm.nii.gz, T2w_brain_norm.nii.gz, etc.).")
     parser.add_argument("--maskPattern", required=True,
-                        help="Pattern to identify mask files (e.g. -brainmask.nii.gz).")
+                        help="Pattern to identify mask files (e.g. brainmask.nii.gz).")
     parser.add_argument("--model_paths", nargs="+", required=True,
                         help="Paths to model checkpoints/directories. One per slicing plane.")
     parser.add_argument("--modelTrainConfigFiles", nargs="+", required=True,

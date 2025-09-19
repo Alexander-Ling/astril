@@ -18,7 +18,6 @@ import configparser
 
 # Import existing segmentation pipeline functions.
 from .create_segmentation_config import create_segmentation_config, parse_train_config_for_model_parameters
-from .run_segmentation import run_segmentation  # legacy use
 from .remap_gt_classes import remap_gt_classes
 from .merge_seg_volumes import merge_seg_volumes
 from .quantify_volumes import quantify_segmentation_volumes
@@ -32,47 +31,78 @@ from .run_segmentation import (
     apply_inverse_canonical_4d,
     majority_vote,
     custom_objects_dict,
-    load_pretrained_model
+    load_pretrained_model,
+    load_models_for_config,
 )
 import nibabel as nib
 import numpy as np
 from tensorflow.keras.models import load_model
-from .models_download import locate_model, locate_models_dir
+from .models_download import locate_models_dir
 
 # ------------------------------------------------------------
-# Model availability check
+# Model set specification (single source of truth)
 # ------------------------------------------------------------
-def _required_model_filenames() -> list[str]:
-    # Update this list if you rename/add files in models.json
-    return [
-        # Ensembles – model set 1
-        "Axial_1.h5", "Coronal_1.h5", "Sagittal_1.h5",
-        "Axial_1_train_parameters.cfg", "Coronal_1_train_parameters.cfg", "Sagittal_1_train_parameters.cfg",
-        # Ensembles – model set 2
-        "Axial_2.h5", "Coronal_2.h5", "Sagittal_2.h5",
-        "Axial_2_train_parameters.cfg", "Coronal_2_train_parameters.cfg", "Sagittal_2_train_parameters.cfg",
-    ]
+GBM_V1_SPEC = {
+    # name: {plane, model_dir (SavedModel folder name), train_cfg filename}
+    "Axial_1":     {"plane": "Axial",    "dir": "Axial_1",    "cfg": "Axial_1_train_parameters.cfg"},
+    "Coronal_1":   {"plane": "Coronal",  "dir": "Coronal_1",  "cfg": "Coronal_1_train_parameters.cfg"},
+    "Sagittal_1":  {"plane": "Sagittal", "dir": "Sagittal_1", "cfg": "Sagittal_1_train_parameters.cfg"},
+    "Axial_2":     {"plane": "Axial",    "dir": "Axial_2",    "cfg": "Axial_2_train_parameters.cfg"},
+    "Coronal_2":   {"plane": "Coronal",  "dir": "Coronal_2",  "cfg": "Coronal_2_train_parameters.cfg"},
+    "Sagittal_2":  {"plane": "Sagittal", "dir": "Sagittal_2", "cfg": "Sagittal_2_train_parameters.cfg"},
+}
+
+def _resolve_gbm_family_root(family: str = "GBM_seg_v1") -> Path:
+    """Base directory where the GBM model family lives inside package models/."""
+    return Path(locate_models_dir()) / family
+
+def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1"):
+    """
+    For the given list of logical model names (keys in GBM_V1_SPEC),
+    return parallel lists: model_paths (dirs/.keras/.h5), train_cfg_paths, planes.
+    """
+    root = _resolve_gbm_family_root(family)
+    model_paths, train_cfgs, planes = [], [], []
+    for name in names:
+        spec = GBM_V1_SPEC[name]
+        model_dir = root / spec["dir"]
+        keras_file = (root / f"{spec['dir']}.keras")
+        h5_file = (root / f"{spec['dir']}.h5")
+        # Prefer directory SavedModel (what your downloader now produces)
+        if model_dir.is_dir():
+            model_paths.append(str(model_dir))
+        elif keras_file.is_file():
+            model_paths.append(str(keras_file))
+        elif h5_file.is_file():
+            model_paths.append(str(h5_file))
+        else:
+            # Leave an unresolved path to fail fast later
+            model_paths.append(str(model_dir))  # expected SavedModel dir
+        train_cfgs.append(str(root / spec["cfg"]))
+        planes.append(spec["plane"])
+    return model_paths, train_cfgs, planes
+
+def _required_gbm_paths(family: str = "GBM_seg_v1") -> tuple[list[Path], list[Path]]:
+    """Return (required_model_dirs_or_files, required_cfg_files) for presence checks."""
+    root = _resolve_gbm_family_root(family)
+    dirs_or_files = [root / spec["dir"] for spec in GBM_V1_SPEC.values()]
+    cfgs = [root / spec["cfg"] for spec in GBM_V1_SPEC.values()]
+    return dirs_or_files, cfgs
 
 def _ensure_models_available() -> None:
-    missing: list[str] = []
-    for name in _required_model_filenames():
-        try:
-            # locate_model() also verifies the resolved path exists
-            locate_model(name)
-        except FileNotFoundError:
-            missing.append(name)
+    need_dirs, need_cfgs = _required_gbm_paths("GBM_seg_v1")
+    missing = [p for p in (need_dirs + need_cfgs) if not p.exists()]
     if missing:
-        target = locate_models_dir()
-        msg = [
-            "Required Astril model files are missing:",
-            *[f"  - {m}" for m in missing],
-            "",
-            "To download them now, run:",
-            "  astril-download-models",
-            "",
-            f"Downloaded files will be placed in:\n  {target}",
-        ]
-        print("\n".join(msg), file=sys.stderr)
+        target = _resolve_gbm_family_root("GBM_seg_v1")
+        items = "\n".join(f"  - {m}" for m in missing)
+        print(
+            "Required Astril GBM v1 model artifacts are missing:\n"
+            f"{items}\n\n"
+            "To fetch them, run:\n"
+            "  astril-download-models\n\n"
+            f"Artifacts are expected under:\n  {target}",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
 def cleanup_intermediate_files(root_dir):
@@ -165,7 +195,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     channel_file_lists = [read_paths_from_file(f) for f in channel_cfg_files]
     mask_paths = read_paths_from_file(mask_cfg_file)
     if subject_index >= len(mask_paths):
-        raise ValueError("Subject index out of range!")
+        raise ValueError("Exam index out of range!")
     volume_paths_list = list(zip(*channel_file_lists))
     volume_paths_list = [list(vp) for vp in volume_paths_list]
 
@@ -190,7 +220,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     out_path = out_dir / seg_name
     # Check if the final output file exists.
     if out_path.exists() and not overwrite:
-        print(f"[INFO] Skipping subject {subject_index+1}: final segmentation file {out_path} already exists.")
+        print(f"[INFO] Skipping exam {subject_index+1}: final segmentation file {out_path} already exists.")
         return
 
     # Otherwise, proceed with processing.
@@ -214,7 +244,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         out_sl = model_num_output_slices[m_idx]
         n_cls = model_num_classes[m_idx]
         min_HW = model_min_hw[m_idx]
-        print(f"[INFO] Subject {subject_index+1} | Using model {m_idx+1}: plane={plane}, in_slices={in_sl}, out_slices={out_sl}, n_cls={n_cls}, minHW={min_HW}")
+        print(f"[INFO] Exam {subject_index+1} | Using model {m_idx+1}: plane={plane}, in_slices={in_sl}, out_slices={out_sl}, n_cls={n_cls}, minHW={min_HW}")
         (X_data, _, M_data, z_indices, transform_infos) = load_val_data(
             scan_indexes=[subject_index],
             volume_paths_list=volume_paths_list,
@@ -234,7 +264,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             batch_pred = model.predict(x_batch)
             all_preds.append(batch_pred)
         if not all_preds:
-            print(f"[WARNING] No predictions for subject {subject_index+1} (model {m_idx+1}).")
+            print(f"[WARNING] No predictions for exam {subject_index+1} (model {m_idx+1}).")
             reassembled_4d = np.zeros((oh, ow, od, n_cls), dtype=np.float32)
             reoriented_4d = reassembled_4d
         else:
@@ -259,7 +289,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
 
         (Xf, Yf, Zf, _) = reoriented_4d.shape
         if (Xf, Yf, Zf) != (oh, ow, od):
-            raise ValueError(f"[ERROR] Mismatch after transforms for subject {subject_index+1}! Expected {(oh, ow, od)}, got {(Xf, Yf, Zf)}.")
+            raise ValueError(f"[ERROR] Mismatch after transforms for exam {subject_index+1}! Expected {(oh, ow, od)}, got {(Xf, Yf, Zf)}.")
         mask_original = (mask_nib.get_fdata() > 0.5)
         for c in range(n_cls):
             reoriented_4d[..., c] *= mask_original
@@ -269,7 +299,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             nib.save(nib.Nifti1Image(dbg_lbl, affine), str(dbg_path))
             print(f"[DEBUG] Wrote per-model debug label to {dbg_path}")
         plane_outputs.append(reoriented_4d)
-    print(f"[INFO] Merging predictions for subject {subject_index+1} via {merging_method}...")
+    print(f"[INFO] Merging predictions for exam {subject_index+1} via {merging_method}...")
     merged_label = majority_vote(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
     nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
     print(f"[INFO] Final segmentation saved: {out_path}")
@@ -290,10 +320,10 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
       6. Clean up intermediate files in the subject's directory immediately.
     """
     if channel_patterns is None:
-        channel_patterns = ["_T1c_normalized.nii.gz",
-                            "_T1n_normalized.nii.gz",
-                            "_T2f_normalized.nii.gz",
-                            "_T2w_normalized.nii.gz"]
+        channel_patterns = ["_T1c_brain_norm.nii.gz",
+                            "_T1n_brain_norm.nii.gz",
+                            "_T2f_brain_norm.nii.gz",
+                            "_T2w_brain_norm.nii.gz"]
     channels = ["t1c", "t1n", "t2f", "t2w"]
     
     working_dir = os.path.join(input_dir, "Segmentation_Configs")
@@ -302,16 +332,8 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     #########################################
     # STEP 1: Prepare segmentation config for Model 1.
     #########################################
-    model1_paths = [
-        str(locate_model("Axial_1.h5")),
-        str(locate_model("Coronal_1.h5")),
-        str(locate_model("Sagittal_1.h5")),
-    ]
-    model1_train_configs = [
-        str(locate_model("Axial_1_train_parameters.cfg")),
-        str(locate_model("Coronal_1_train_parameters.cfg")),
-        str(locate_model("Sagittal_1_train_parameters.cfg")),
-    ]
+    model1_names = ["Axial_1", "Coronal_1", "Sagittal_1"]
+    model1_paths, model1_train_configs, model1_planes = _resolve_model_artifacts(model1_names, "GBM_seg_v1")
     seg_config_model1 = create_segmentation_config(
         workingDirectory=working_dir,
         inputChannels=channels,
@@ -334,45 +356,44 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     #########################################
     print("[INFO] Loading Model 1 weights...")
     loaded_models_model1 = []
-    for i, mp in enumerate(model1_paths):
-        mp = mp.strip()
-        if os.path.isdir(mp) or mp.endswith('.keras'):
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        elif mp.endswith('.h5'):
-            train_cfg = model1_train_configs[i].strip()
-            params = parse_train_config_for_model_parameters(train_cfg)
-            min_hw = params.get("minimum_height_width", 256)
-            num_input_slices = params.get("num_input_slices", 3)
-            model = load_pretrained_model(mp, train_cfg, min_hw, num_input_slices)
-        else:
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        loaded_models_model1.append(model)
+    # derive lists needed by the unified loader from the model_1 config we just created
+    cp_tmp = configparser.ConfigParser()
+    cp_tmp.read(seg_config_model1)
+    cfg1 = cp_tmp["DEFAULT"]
+    m1_num_in = list(map(int, cfg1["model_train_num_input_slices"].split(",")))
+    m1_min_hw = list(map(int, cfg1["model_train_minimum_hw"].split(",")))
+    num_modal_channels = len(channels)  # for Model 1
+    loaded_models_model1 = load_models_for_config(
+        model_paths=model1_paths,
+        model_train_config_files=model1_train_configs,
+        model_num_input_slices=m1_num_in,
+        model_min_hw=m1_min_hw,
+        num_modal_channels=num_modal_channels,
+        model_call_endpoints=None,
+    )
     
     print("[INFO] Loading Model 2 weights...")
-    loaded_models_model2 = []
-    model2_paths = [
-        str(locate_model("Axial_2.h5")),
-        str(locate_model("Coronal_2.h5")),
-        str(locate_model("Sagittal_2.h5")),
-    ]
-    model2_train_configs = [
-        str(locate_model("Axial_2_train_parameters.cfg")),
-        str(locate_model("Coronal_2_train_parameters.cfg")),
-        str(locate_model("Sagittal_2_train_parameters.cfg")),
-    ]
-    for i, mp in enumerate(model2_paths):
-        mp = mp.strip()
-        if os.path.isdir(mp) or mp.endswith('.keras'):
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        elif mp.endswith('.h5'):
-            train_cfg = model2_train_configs[i].strip()
-            params = parse_train_config_for_model_parameters(train_cfg)
-            min_hw = params.get("minimum_height_width", 256)
-            num_input_slices = params.get("num_input_slices", 3)
-            model = load_pretrained_model(mp, train_cfg, min_hw, num_input_slices)
-        else:
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        loaded_models_model2.append(model)
+    model2_names = ["Axial_2", "Coronal_2", "Sagittal_2"]
+    model2_paths, model2_train_configs, model2_planes = _resolve_model_artifacts(model2_names, "GBM_seg_v1")
+    # Build a single-subject Model 2 config template (values used for loader dims)
+    # We'll still generate per-subject configs later for file lists.
+    dummy_cp2 = configparser.ConfigParser()
+    # mimic create_segmentation_config scalar arrays for dims; we only need dims here
+    # by reading train cfgs (safer) to avoid drifting from training settings
+    m2_num_in, m2_min_hw = [], []
+    for cfg_path in model2_train_configs:
+        params = parse_train_config_for_model_parameters(cfg_path)
+        m2_num_in.append(params.get("num_input_slices", 3))
+        m2_min_hw.append(params.get("minimum_height_width", 256))
+    # Model 2 uses 3 channels: t1c, t2f, mod1DB
+    loaded_models_model2 = load_models_for_config(
+        model_paths=model2_paths,
+        model_train_config_files=model2_train_configs,
+        model_num_input_slices=m2_num_in,
+        model_min_hw=m2_min_hw,
+        num_modal_channels=3,
+        model_call_endpoints=None,
+    )
     
     #########################################
     # STEP 3: Process each subject sequentially.
@@ -382,7 +403,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     mask_cfg_file = cp_model1["DEFAULT"]["mask_paths_file"]
     mask_paths = read_paths_from_file(mask_cfg_file)
     num_subjects = len(mask_paths)
-    print(f"[INFO] Found {num_subjects} subject(s) to process in {input_dir}.")
+    print(f"[INFO] Found {num_subjects} exam(s) to process in {input_dir}.")
     
     for subj_idx in range(num_subjects):
         # BEFORE ANY PROCESSING: Check if the final segmentation file already exists.
@@ -394,7 +415,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             continue
 
         print("\n==============================")
-        print(f"[INFO] Processing subject {subj_idx+1} of {num_subjects} with Model 1...")
+        print(f"[INFO] Processing exam {subj_idx+1} of {num_subjects} with Model 1...")
         process_subject_with_models(seg_config_model1, subj_idx, loaded_models_model1,
                                     slice_batch_size, overwrite_existing_outputs, "_Model_1_seg.nii.gz",
                                     tiebreaker_model=0, debug_models=debug_models)
@@ -412,7 +433,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         
         # For Model 2, generate a config file for this subject (using --silent)
         # Use a subject-specific working directory.
-        subject_mod2_working_dir = os.path.join(working_dir, "Mod2", f"Subject_{subj_idx+1}")
+        subject_mod2_working_dir = os.path.join(working_dir, "Mod2", f"Exam_{subj_idx+1}")
         Path(subject_mod2_working_dir).mkdir(parents=True, exist_ok=True)
         seg_config_model2 = create_segmentation_config(
             workingDirectory=subject_mod2_working_dir,
@@ -428,14 +449,14 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             output_config_filename="model_2_parameters.cfg",
             silent=True
         )
-        print(f"[INFO] Processing subject {subj_idx+1} with Model 2...")
+        print(f"[INFO] Processing exam {subj_idx+1} with Model 2...")
         # Since the generated Model 2 config corresponds to a single subject, use index 0.
         process_subject_with_models(seg_config_model2, 0, loaded_models_model2,
                                     slice_batch_size, overwrite_existing_outputs, segment_suffix,
                                     tiebreaker_model=0, debug_models=debug_models)
         
         # Clean up intermediate files in the subject's directory immediately.
-        print(f"[INFO] Cleaning up intermediate files in subject directory: {subject_dir}")
+        print(f"[INFO] Cleaning up intermediate files in exam directory: {subject_dir}")
         cleanup_intermediate_files(subject_dir)
     
     #########################################
@@ -471,7 +492,7 @@ def main():
                         help="Overwrite existing segmentation outputs if they exist.")
     parser.add_argument("--channel_patterns", nargs="+",
                         help=("List of filename patterns for the input scans (in order: T1-post, T1-pre, T2-FLAIR, and T2). "
-                              "Default: _T1c_normalized.nii.gz _T1n_normalized.nii.gz _T2f_normalized.nii.gz _T2w_normalized.nii.gz"))
+                              "Default: _T1c_brain_norm.nii.gz _T1n_brain_norm.nii.gz _T2f_brain_norm.nii.gz _T2w_brain_norm.nii.gz"))
     parser.add_argument("--brainmask_pattern", type=str, default="_brainmask.nii.gz",
                         help="Brainmask pattern for Model 1 (default: _brainmask.nii.gz)")
     parser.add_argument("--segment_suffix", type=str, default="_GBM_seg.nii.gz",
