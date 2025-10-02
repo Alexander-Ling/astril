@@ -199,6 +199,7 @@ def preprocess_library(
     final_dims: list[int] | None = None,
     final_voxels: list[float] | None = None,
     save_scans_with_skulls: bool = False,
+    use_gpu: bool = False,
     debug: bool = False,
 ) -> tuple[Path, Path]:
     """
@@ -341,6 +342,8 @@ def preprocess_library(
                 final_dims=final_dims,
                 final_voxels=final_voxels,
                 save_scans_with_skulls=save_scans_with_skulls,
+                registration_metric="mi",
+                use_gpu=use_gpu,
                 debug=debug,
             )
             dur = f"{time.time() - started:.1f}s"
@@ -404,6 +407,7 @@ def main():
     p.add_argument("--final_voxels", type=float, nargs=3, default=(1.0, 1.0, 1.0), metavar=("SX", "SY", "SZ"),
                    help="Final voxel sizes in mm (e.g., 1.0 1.0 1.0).")
     p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
+    p.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for scan coregistration steps.")
     p.add_argument("--debug", action="store_true", help="Keep temp dirs from underlying preprocessing.")
 
     args = p.parse_args()
@@ -420,6 +424,7 @@ def main():
         final_dims=args.final_dims,
         final_voxels=args.final_voxels,
         save_scans_with_skulls=args.save_scans_with_skulls,
+        use_gpu=args.use_gpu,
         debug=args.debug,
     )
 

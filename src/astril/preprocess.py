@@ -273,7 +273,7 @@ def match_direction_matrices(input_path, donor_path, output_path):
 # Function to merge mask files into a single mask
 # -------------------------------------------------------------------------
 
-def merge_binary_masks(mask_paths, output_path, fill_holes=True, strict_affine=False):
+def merge_binary_masks(mask_paths, output_path, fill_holes=False, strict_affine=False):
     """
     Merge multiple binary masks (NIfTI format) into one.
     Voxels are 1 if any input mask has a 1 at that position.
@@ -326,9 +326,9 @@ def register_images(
     transform_path=None,
     apply_only=False,
     registration_type="rigid",
-    similarity_metric="correlation",
+    similarity_metric="mi",
     use_gpu=False,
-    verbose=True,
+    verbose=False,
     save_dummy_ref=False
 ):
     """
@@ -2455,32 +2455,55 @@ def convert_dicom_plan(
 # ------------------------------------------------------------------------
 
 def _build_cli_parser() -> "argparse.ArgumentParser":
+    # Combine RawText (preserve newlines) + show defaults
+    class _SmartFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+        pass
+
     parser = argparse.ArgumentParser(
         prog="python -m astril.preprocess",
-        description="MRI Preprocessing Tools (subcommand-style CLI)",
+        description=(
+            "MRI Preprocessing Tools\n"
+            "\n"
+            "Usage:\n"
+            "  python -m astril.preprocess <command> [options]\n"
+            "\n"
+            "Commands cover normalization, resizing (and reversal), registration, HD-BET,\n"
+            "DICOM demixing, planning and converting to NIfTI, and metadata utilities."
+        ),
+        formatter_class=_SmartFormatter,
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
+    # Print top-level help when no subcommand is provided (optional polish)
+    parser.set_defaults(func=lambda *_a, **_k: parser.print_help())
 
-    # ---- normalize
-    p = sub.add_parser("normalize", help="Normalize an MRI volume using a binary mask.")
-    p.add_argument("--input", required=True)
-    p.add_argument("--mask", required=True)
-    p.add_argument("--output", required=True)
+    # ---------- normalize ----------
+    p = sub.add_parser(
+        "normalize",
+        help="Normalize an MRI volume using a binary mask (zero-mean/unit-variance in-mask).",
+        formatter_class=_SmartFormatter,
+    )
+    p.add_argument("--input", required=True, help="Input NIfTI image (.nii|.nii.gz).")
+    p.add_argument("--mask", required=True, help="Binary mask NIfTI (same shape; >0=in brain).")
+    p.add_argument("--output", required=True, help="Output NIfTI path for normalized image.")
     def _run_normalize(a):
         normalize_masked_image(a.input, a.mask, a.output)
     p.set_defaults(func=_run_normalize)
 
-    # ---- resize
-    p = sub.add_parser("resize", help="Resize MRI scan to target shape and voxel dims.")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--data_dims", default="240,240,155", help="e.g., 240,240,155")
-    p.add_argument("--voxel_dims", default="1.0,1.0,1.0", help="e.g., 1.0,1.0,1.0")
-    p.add_argument("--interp", type=int, default=1)
-    p.add_argument("--save_padding_record", action="store_true")
-    p.add_argument("--padding_record")
-    p.add_argument("--roimask")
-    p.add_argument("--translation_only", action="store_true")
+    # ---------- resize ----------
+    p = sub.add_parser(
+        "resize",
+        help="Resample to target shape/voxel size; optionally recenter ROI and save padding record.",
+        formatter_class=_SmartFormatter,
+    )
+    p.add_argument("--input", required=True, help="Path to input NIfTI to be resampled.")
+    p.add_argument("--output", required=True, help="Output path for resized NIfTI.")
+    p.add_argument("--data_dims", default="240,240,155", help="Target voxel grid as comma-separated integers X,Y,Z (e.g., 240,240,155).")
+    p.add_argument("--voxel_dims", default="1.0,1.0,1.0", help="Target voxel spacing (mm) as comma-separated floats X,Y,Z (e.g., 1.0,1.0,1.0).")
+    p.add_argument("--interp", type=int, default=1, help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...).")
+    p.add_argument("--save_padding_record", action="store_true", help="Write a padding/resize record alongside the output to enable exact reversal later.")
+    p.add_argument("--padding_record", help="If provided, read this existing padding record to reproduce previous centering/shape steps.")
+    p.add_argument("--roimask", help="Optional ROI mask (NIfTI). If set (and no --padding_record), the ROI centroid is translated to the volume center before resampling.")
+    p.add_argument("--translation_only", action="store_true", help="Only apply translation from ROI centering; do not change shape or voxel spacing.")
     def _run_resize(a):
         resize_mri(
             input_filepath=a.input,
@@ -2495,64 +2518,84 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
         )
     p.set_defaults(func=_run_resize)
 
-    # ---- reverse_resize
-    p = sub.add_parser("reverse_resize", help="Reverse a previous resize using a saved padding record.")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--padding_record", required=True)
-    p.add_argument("--interp", type=int, default=1)
+    # ---------- reverse_resize ----------
+    p = sub.add_parser(
+        "reverse_resize",
+        help="Reverse a previous resize using a saved padding record.", formatter_class=_SmartFormatter)
+    p.add_argument("--input", required=True, help="Resized NIfTI to reverse back to the original grid.")
+    p.add_argument("--output", required=True, help="Path for reversed (original space) output NIfTI.")
+    p.add_argument("--padding_record", required=True, help="Padding record produced by the prior `resize` operation.")
+    p.add_argument("--interp", type=int, default=1, help="Interpolation order used during resampling back (0=nearest, 1=linear, ...).")
     def _run_reverse(a):
         reverse_resize_mri(a.input, a.output, a.padding_record, interp=a.interp)
     p.set_defaults(func=_run_reverse)
 
-    # ---- match_affine
-    p = sub.add_parser("match_affine", help="Match affine of INPUT to DONOR image.")
-    p.add_argument("--input", required=True)
-    p.add_argument("--donor", required=True)
-    p.add_argument("--output", required=True)
+    # ---------- match_affine ----------
+    p = sub.add_parser(
+        "match_affine",
+        help="Match affine of INPUT to DONOR image.", formatter_class=_SmartFormatter)
+    p.add_argument("--input", required=True, help="Source NIfTI to be resampled to the donor grid.")
+    p.add_argument("--donor", required=True, help="Donor NIfTI whose shape/affine to match.")
+    p.add_argument("--output", required=True, help="Output path for resampled image (matches donor grid).")
     def _run_match(a):
         match_direction_matrices(a.input, a.donor, a.output)
     p.set_defaults(func=_run_match)
 
-    # ---- merge_masks
-    p = sub.add_parser("merge_masks", help="Merge 2 binary masks into one.")
-    p.add_argument("--masks", nargs="+", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--no_fill", action="store_true")
-    p.add_argument("--strict_affine", action="store_true")
+    # ---------- merge_masks ----------
+    p = sub.add_parser(
+        "merge_masks",
+        help="Merge multiple binary masks (logical OR); optional hole filling and affine checks.", formatter_class=_SmartFormatter)
+    p.add_argument("--masks", nargs="+", required=True, help="Two or more binary mask NIfTIs to merge (same shape; >0=in mask).")
+    p.add_argument("--output", required=True, help="Output path for merged mask NIfTI.")
+    p.add_argument("--fill_holes", action="store_true", help="Fill interior holes within the merged mask.")
+    p.add_argument("--strict_affine", action="store_true", help="Require all input affines to match exactly; otherwise raise an error.")
     def _run_merge(a):
-        merge_binary_masks(a.masks, a.output, fill_holes=not a.no_fill, strict_affine=a.strict_affine)
+        merge_binary_masks(a.masks, a.output, fill_holes=a.fill_holes, strict_affine=a.strict_affine)
     p.set_defaults(func=_run_merge)
 
-    # ---- register
-    p = sub.add_parser("register", help="Register or apply transform to align moving->fixed.")
-    p.add_argument("--fixed", required=True)
-    p.add_argument("--moving", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--transform")
-    p.add_argument("--apply_only", action="store_true")
-    p.add_argument("--type", default="rigid", choices=["rigid", "affine", "translation"])
-    p.add_argument("--metric", default="correlation", choices=["correlation", "mi"])
-    p.add_argument("--use_gpu", action="store_true")
-    p.add_argument("--save_dummy_ref", action="store_true")
-    p.add_argument("--quiet", action="store_true")
+    # ---------- register ----------
+    p = sub.add_parser(
+        "register",
+        help="Rigid/affine/translation registration via SimpleITK; or apply an existing transform.", formatter_class=_SmartFormatter)
+    p.add_argument("--fixed", required=True, help="Fixed/reference image (NIfTI).")
+    p.add_argument("--moving", required=True, help="Moving image to align (NIfTI).")
+    p.add_argument("--output", required=True, help="Registered output path (NIfTI).")
+    basic = p.add_argument_group("Registration basics")
+    basic.add_argument("--registration_type", choices=["rigid", "affine", "translation"], default="rigid",
+                       help="Transform family to optimize.")
+    basic.add_argument("--similarity_metric", choices=["correlation", "mi"], default="correlation",
+                       help="Similarity metric: Pearson correlation or Mattes mutual information.")
+    io = p.add_argument_group("Transforms I/O")
+    io.add_argument("--transform",
+                    help="Where to save the fitted transform (.tfm), or load from when --apply_only is set.")
+    io.add_argument("--apply_only", action="store_true",
+                    help="Skip optimization and only apply the transform given by --transform.")
+    perf = p.add_argument_group("Performance & logging")
+    perf.add_argument("--use_gpu", action="store_true", help="Enable faster sampling-based settings when available.")
+    perf.add_argument("--verbose", action="store_true", help="Print metric values and detailed status messages.")
+    perf.add_argument("--save_dummy_ref", action="store_true",
+                      help="Save zeroed fixed/moving reference images next to the transform for later reversal.")
     def _run_register(a):
         register_images(
             fixed_path=a.fixed, moving_path=a.moving, output_path=a.output,
             transform_path=a.transform, apply_only=a.apply_only,
-            registration_type=a.type, similarity_metric=a.metric,
-            use_gpu=a.use_gpu, save_dummy_ref=a.save_dummy_ref, verbose=not a.quiet,
+            registration_type=a.registration_type, similarity_metric=a.similarity_metric,
+            use_gpu=a.use_gpu, save_dummy_ref=a.save_dummy_ref, verbose=a.verbose,
         )
     p.set_defaults(func=_run_register)
 
-    # ---- inverse_transform
-    p = sub.add_parser("inverse_transform", help="Apply inverse of a saved transform.")
-    p.add_argument("--original", required=True, help="Original (pre-registered) image")
-    p.add_argument("--transformed", required=True, help="Already transformed image")
-    p.add_argument("--transform", required=True, help="Transform .tfm")
-    p.add_argument("--output", required=True)
-    p.add_argument("--interp", default="linear", choices=["linear", "nearest"])
-    p.add_argument("--quiet", action="store_true")
+    # ---------- invert_transform ----------
+    p = sub.add_parser(
+        "invert_transform",
+        help="Apply the inverse of a saved rigid/affine transform to return an image to original space.",
+        formatter_class=_SmartFormatter,
+    )
+    p.add_argument("--original", required=True, help="Original pre-registered reference image.")
+    p.add_argument("--transformed", required=True, help="Image currently in transformed space.")
+    p.add_argument("--transform", required=True, help="Transform file (.tfm) to invert.")
+    p.add_argument("--output", required=True, help="Output NIfTI path for inverse-transformed image.")
+    p.add_argument("--interp", choices=["linear","nearest"], default="linear", help="Resampling kernel.")
+    p.add_argument("--verbose", action="store_true", help="Print actions and summary.")
     def _run_inverse(a):
         inverse_transform_image(
             original_image_path=a.original,
@@ -2560,20 +2603,20 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             transform_path=a.transform,
             output_path=a.output,
             interpolation=a.interp,
-            verbose=not a.quiet,
+            verbose=a.verbose,
         )
     p.set_defaults(func=_run_inverse)
 
     # ---- skullstrip (hd-bet)
-    p = sub.add_parser("skullstrip", help="Run HD-BET skullstripping.")
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", help="Optional output (bet) image")
-    p.add_argument("--mask", help="Optional output mask")
-    p.add_argument("--mode", default="accurate")
-    p.add_argument("--device", default="cpu")
-    p.add_argument("--tta", type=int, default=0)
-    p.add_argument("--pp", type=int, default=1)
-    p.add_argument("--overwrite_existing", type=int, default=0)
+    p = sub.add_parser("skullstrip", help="Run HD-BET to produce a brain mask and/or betted output volume.", formatter_class=_SmartFormatter)
+    p.add_argument("--input", required=True, help="Input NIfTI to skull-strip.")
+    p.add_argument("--output", help="Optional betted output path; omit to only save a mask.")
+    p.add_argument("--mask", help="Optional mask output path.")
+    p.add_argument("--mode", default="accurate", help="HD-BET mode: 'accurate' (default) or 'fast'.")
+    p.add_argument("--device", default="cpu", help="Target device (e.g., cpu, cuda:0).")
+    p.add_argument("--tta", type=int, default=0, help="Test-time augmentation level.")
+    p.add_argument("--pp", type=int, default=1, help="Post-processing level.")
+    p.add_argument("--overwrite_existing", type=int, default=0, help="Overwrite existing outputs (0/1).")
     def _run_hd_bet_cli(a):
         run_hd_bet(
             input_path=a.input,
@@ -2588,27 +2631,69 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_hd_bet_cli)
 
     # ---- math
-    p = sub.add_parser("math", help="Arithmetic / masking on MRI volumes.")
-    # Keep the flexible interface used by perform_mri_math()
-    p.add_argument("--applymask", action="store_true")
-    p.add_argument("--input")
-    p.add_argument("--mask")
-    p.add_argument("--average", nargs="*")
-    p.add_argument("--operation")
-    p.add_argument("--inputs", nargs="*")
-    p.add_argument("--output")
+    p = sub.add_parser(
+        "math",
+        help="Arithmetic/masking on MRI volumes (apply a mask, average volumes, or evaluate an expression).",
+        formatter_class=_SmartFormatter,
+        description=(
+            "Use one of the three modes below. Each mode has its own required/optional arguments.\n"
+            "\n"
+            "Modes:\n"
+            "  (A) Apply a mask: elementwise multiply an image by a binary mask.\n"
+            "  (B) Average volumes: compute the mean of several volumes.\n"
+            "  (C) Custom expression: evaluate a NumPy-like expression over inputs A..Z.\n"
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # (A) Apply a mask\n"
+            "  python -m astril.preprocess math --applymask --input img.nii.gz --mask brainmask.nii.gz --output img_masked.nii.gz\n"
+            "\n"
+            "  # (B) Average volumes\n"
+            "  python -m astril.preprocess math --average subj1.nii.gz subj2.nii.gz subj3.nii.gz --output group_mean.nii.gz\n"
+            "\n"
+            "  # (C) Custom expression (keep A inside B, else 0)\n"
+            "  python -m astril.preprocess math --operation \"where(B>0, A, 0)\" --inputs A.nii.gz B.nii.gz --output masked.nii.gz\n"
+            "\n"
+            "Allowed functions in --operation: where, log, log10, exp\n"
+        ),
+    )
+    # Mode A — Apply a mask
+    modeA = p.add_argument_group("Mode A — Apply a mask")
+    modeA.add_argument("--applymask", action="store_true",
+                       help="Enable mask application mode (A).")
+    modeA.add_argument("--input",
+                       help="Input NIfTI for --applymask mode (A).")
+    modeA.add_argument("--mask",
+                       help="Binary mask NIfTI for --applymask mode (A). Same shape as --input; >0=in mask.")
+
+    # Mode B — Average volumes
+    modeB = p.add_argument_group("Mode B — Average volumes")
+    modeB.add_argument("--average", nargs="*",
+                       help="One or more NIfTI files to average together (mode B).")
+
+    # Mode C — Custom expression
+    modeC = p.add_argument_group("Mode C — Custom expression")
+    modeC.add_argument("--operation",
+                       help="Expression over variables A..Z (mode C), e.g., 'where(B>0, A, 0)'.")
+    modeC.add_argument("--inputs", nargs="*",
+                       help="Input NIfTIs bound to A..Z for --operation (order matters).")
+
+    # Common output
+    p.add_argument("--output", required=True, help="Output NIfTI path (required for all modes).")
     def _run_math(a):
         # Reuse the existing, flexible argument contract
         perform_mri_math(a)
     p.set_defaults(func=_run_math)
 
     # ---- transform_pipeline
-    p = sub.add_parser("transform_pipeline", help="Apply or reverse a transform pipeline (json).")
-    p.add_argument("--input", required=True)
-    p.add_argument("--record", required=True, help="transform_record.json")
-    p.add_argument("--output", required=True)
-    p.add_argument("--mode", default="apply", choices=["apply", "reverse"])
-    p.add_argument("--interp", type=int, default=1)
+    p = sub.add_parser(
+        "transform_pipeline",
+        help="Apply or reverse a transform pipeline (json).", formatter_class=_SmartFormatter)
+    p.add_argument("--input", required=True, help="Input NIfTI to transform.")
+    p.add_argument("--record", required=True, help="Path to transform_record.json describing the pipeline.")
+    p.add_argument("--output", required=True, help="Where to write the transformed output.")
+    p.add_argument("--mode", default="apply", choices=["apply", "reverse"], help="Apply pipeline in forward or reverse order.")
+    p.add_argument("--interp", type=int, default=1, help="Interpolation order for any resampling steps (0=nearest, 1=linear).")
     def _run_pipeline(a):
         apply_or_reverse_transforms(
             input_path=a.input,
@@ -2620,17 +2705,21 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_pipeline)
 
     # ---- summarize_exam_series
-    p = sub.add_parser("summarize_exam_series", help="Infer scan types from an exam's MR/ series.")
-    p.add_argument("--dir", required=True, help="Exam directory containing MR/ subfolder")
-    p.add_argument("--mrSubdir", default="MR")
-    p.add_argument("--to_csv")
-    p.add_argument("--quiet", action="store_true")
+    p = sub.add_parser(
+        "summarize_exam_series",
+        help="Infer scan types from an exam's MR/ series.", formatter_class=_SmartFormatter)
+    p.add_argument("--dir", required=True, help="Path to exam directory containing the MR/ subfolder.")
+    p.add_argument("--mrSubdir", default="MR", help="Name of the MR subdirectory under the exam directory (default: MR).")
+    p.add_argument("--to_csv", help="Optional CSV path to write the per-series summary table.")
+    p.add_argument("--quiet", action="store_true", help="Suppress printed preview; still returns DataFrame if used as a function.")
     def _run_summarize(a):
         summarize_exam_series(a.dir, mr_subdir=a.mrSubdir, to_csv=a.to_csv, verbose=not a.quiet)
     p.set_defaults(func=_run_summarize)
 
     # ---- create_patient_metadata
-    p = sub.add_parser("create_patient_metadata", help="Scan multi-patient DICOM dir to build a metadata table.")
+    p = sub.add_parser(
+        "create_patient_metadata",
+        help="Scan multi-patient DICOM dir to build a metadata table.", formatter_class=_SmartFormatter)
     p.add_argument("--dir", required=True, help="Root directory with {Patient}/.../MR/{series}")
     p.add_argument("--metadataOut", required=True, help="Output table (.csv|.tsv|.xlsx)")
     p.add_argument("--previousMetadata", nargs="*", default=[], help="Zero or more prior tables to prefill from")
@@ -2651,7 +2740,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_cpm)
 
     # ---- demix_dicoms
-    p = sub.add_parser("demix_dicoms", help="Ensure each series folder contains files from only one scan.")
+    p = sub.add_parser(
+        "demix_dicoms",
+        help="Ensure each series folder contains files from only one scan; move/copy into clean folders.", formatter_class=_SmartFormatter)
     p.add_argument("--dir", required=True, help="Root directory containing patient/exam/MR folders with DICOM (.dcm) files.")
     p.add_argument("--outDir", default=None, help="Write a fully de-mixed COPY of --dir under this path")
     p.add_argument("--logOut", default=None, help="Optional path for move log (.csv|.tsv)")
@@ -2672,7 +2763,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_demix)
 
     # ---- plan_dicom_to_nifti_conversion
-    p = sub.add_parser("plan_dicom_to_nifti_conversion", help="Plan which DICOM series to convert and propose NIfTI names.")
+    p = sub.add_parser(
+        "plan_dicom_to_nifti_conversion",
+        help="Discover/select DICOM series to convert and (optionally) derived products; stream a plan file.", formatter_class=_SmartFormatter)
     p.add_argument("--patientMetadata", required=True, help="Table from create_patient_metadata() (filled in)")
     p.add_argument("--dir", required=True, help="Root DICOM directory; must contain subfolders in 'Directory' column")
     p.add_argument("--outDir", required=True, help="Planned destination root for converted files")
@@ -2715,7 +2808,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_plan)
 
     # ---- convert_dicom_to_nifti (single series)
-    p = sub.add_parser("convert_dicom_to_nifti", help="Convert one DICOM series directory to NIfTI (dicom2nifti).")
+    p = sub.add_parser(
+        "convert_dicom_to_nifti",
+        help="Convert one DICOM series directory to NIfTI (dicom2nifti).", formatter_class=_SmartFormatter)
     p.add_argument("--dicom_dir", required=True, help="Directory containing one DICOM series")
     p.add_argument("--output_path", required=True, help="Output NIfTI path (.nii or .nii.gz)")
     def _run_c2n(a):
@@ -2727,7 +2822,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.set_defaults(func=_run_c2n)
 
     # ---- convert_dicom_plan (batch from plan file)
-    p = sub.add_parser("convert_dicom_plan", help="Run DICOM->NIfTI conversions from a saved plan (dicom2nifti).")
+    p = sub.add_parser(
+        "convert_dicom_plan",
+        help="Execute DICOM→NIfTI conversions from a saved plan file.", formatter_class=_SmartFormatter)
     p.add_argument("--plan", required=True, help="Path to plan CSV/TSV/XLSX from plan_dicom_to_nifti_conversion.")
     p.add_argument("--n_workers", type=int, default=None, help="Parallel workers (I/O-bound).")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output NIfTI if present.")

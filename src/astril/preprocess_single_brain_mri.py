@@ -27,6 +27,7 @@ def run_preprocessing_pipeline(
     t2w_path,
     output_dir,
     temp_dir,
+    registration_metric="mi",
     co_register_path=None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
@@ -34,6 +35,7 @@ def run_preprocessing_pipeline(
     patientID=None,
     timepoint=None,
     scanID=None,
+    use_gpu=False,
     debug=False,
     verbose=False
 ):
@@ -113,9 +115,9 @@ def run_preprocessing_pipeline(
     tfm_t2f = os.path.join(temp_dir, "T2f_to_T1c.tfm")
     tfm_t2w = os.path.join(temp_dir, "T2w_to_T2f.tfm")
 
-    register_images(t1c_path, t1n_path, t1n_reg, transform_path=tfm_t1n, save_dummy_ref=True, verbose=False)
-    register_images(t1c_path, t2f_path, t2f_reg, transform_path=tfm_t2f, save_dummy_ref=True, verbose=False)
-    register_images(t2f_reg, t2w_path, t2w_reg, transform_path=tfm_t2w, save_dummy_ref=True, verbose=False)
+    register_images(t1c_path, t1n_path, t1n_reg, transform_path=tfm_t1n, similarity_metric=registration_metric, use_gpu=use_gpu, save_dummy_ref=True, verbose=False)
+    register_images(t1c_path, t2f_path, t2f_reg, transform_path=tfm_t2f, similarity_metric=registration_metric, use_gpu=use_gpu, save_dummy_ref=True, verbose=False)
+    register_images(t1c_path, t2w_path, t2w_reg, transform_path=tfm_t2w, similarity_metric=registration_metric, use_gpu=use_gpu, save_dummy_ref=True, verbose=False)
 
     for tfm, label in zip([tfm_t1n, tfm_t2f, tfm_t2w], ["T1n", "T2f", "T2w"]):
         
@@ -142,7 +144,7 @@ def run_preprocessing_pipeline(
         t1c_coreg = os.path.join(temp_dir, f"{basename_prefix}_T1c_coreg.nii.gz")
         coreg_tfm = os.path.join(temp_dir, "T1c_to_coreg.tfm")
         
-        register_images(co_register_path, t1c_path, t1c_coreg, transform_path=coreg_tfm, save_dummy_ref=True, verbose=False)
+        register_images(co_register_path, t1c_path, t1c_coreg, transform_path=coreg_tfm, similarity_metric=registration_metric, use_gpu=use_gpu, save_dummy_ref=True, verbose=False)
 
         coreg_tfm_dest = os.path.join(transform_dir, os.path.basename(coreg_tfm))
         shutil.move(coreg_tfm, coreg_tfm_dest)
@@ -304,6 +306,7 @@ def preprocess_single_brain_mri(
     t2f_path,
     t2w_path,
     output_dir,
+    registration_metric="mi",
     co_register_path=None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
@@ -312,6 +315,7 @@ def preprocess_single_brain_mri(
     patientID=None,
     timepoint=None,
     scanID=None,
+    use_gpu=False,
     verbose=False
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -326,6 +330,7 @@ def preprocess_single_brain_mri(
                 t2f_path=t2f_path,
                 t2w_path=t2w_path,
                 output_dir=output_dir,
+                registration_metric="mi",
                 co_register_path=co_register_path,
                 save_scans_with_skulls=save_scans_with_skulls,
                 final_dims=final_dims,
@@ -334,6 +339,7 @@ def preprocess_single_brain_mri(
                 patientID=patientID,
                 timepoint=timepoint,
                 scanID=scanID,
+                use_gpu=use_gpu,
                 debug=True,
                 verbose=verbose
             )
@@ -349,6 +355,7 @@ def preprocess_single_brain_mri(
                 t2f_path=t2f_path,
                 t2w_path=t2w_path,
                 output_dir=output_dir,
+                registration_metric="mi",
                 co_register_path=co_register_path,
                 save_scans_with_skulls=save_scans_with_skulls,
                 final_dims=final_dims,
@@ -357,6 +364,7 @@ def preprocess_single_brain_mri(
                 patientID=patientID,
                 timepoint=timepoint,
                 scanID=scanID,
+                use_gpu=use_gpu,
                 debug=False,
                 verbose=verbose
             )
@@ -373,10 +381,12 @@ def main():
     parser.add_argument("--patientID", help="Flag to indicate which patient this scan is from. If not provided, defaults to the first _ separated field of the input T1c filename.")
     parser.add_argument("--timepoint", help="Flag to indicate timepoint of this scan. If not provided, defaults to the second _ separated field of the input T1c filename.")
     parser.add_argument("--scanID", help="Unique identifier for this sequence of scans. If not provided, defaults to the third _ separated field of the input T1c filename.")
+    parser.add_argument("--registration_metric", default="mi", help="Metric to use for registration steps: 'correlation' or 'mi' [mutual information] (default: mi).")
     parser.add_argument("--co_register", help="Optional reference image to co-register all scans to")
     parser.add_argument("--save_scans_with_skulls", action="store_true", help="Save scans after registration but before skull-stripping. WARNING: May contain PHI in the form of a patient's face scan unless input scans were de-faced prior to processing.")
     parser.add_argument("--final_dims", default="240,240,155", help="Final data dimensions (default: 240,240,155)")
     parser.add_argument("--final_voxels", default="1.0,1.0,1.0", help="Final voxel sizes (default: 1.0,1.0,1.0)")
+    parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for scan registration steps.")
     parser.add_argument("--debug", action="store_true", help="Keep intermediate files and temp directory after execution")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose print logging.")
 
@@ -391,6 +401,7 @@ def main():
         t2f_path=args.t2f,
         t2w_path=args.t2w,
         output_dir=args.output,
+        registration_metric=args.registration_metric,
         co_register_path=args.co_register,
         save_scans_with_skulls=args.save_scans_with_skulls,
         final_dims=dims,
@@ -399,6 +410,7 @@ def main():
         patientID=args.patientID,
         timepoint=args.timepoint,
         scanID=args.scanID,
+        use_gpu=args.use_gpu,
         verbose=not args.quiet
     )
 
