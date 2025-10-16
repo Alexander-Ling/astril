@@ -3,14 +3,14 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.6.55"
+version = "0.6.57"
 description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
     "scipy",
     "pandas",
     "nibabel",
+    "matplotlib"
     "tensorflow",
     "psutil",
     "SimpleITK",
