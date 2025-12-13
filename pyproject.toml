@@ -15,6 +15,7 @@ description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
     "nilearn",
+    "dcm2niix",
     "numpy",
     "scipy",
     "pandas",
