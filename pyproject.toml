@@ -21,6 +21,7 @@ dependencies = [
     "nibabel",
     "matplotlib",
     "tensorflow",
+    "tf_keras",
     "psutil",
     "SimpleITK",
     "xlsxwriter",
