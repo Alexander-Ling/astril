@@ -1,4 +1,4 @@
-﻿# astril/preprocessing_utils.py
+# astril/preprocessing_utils.py
 
 import numpy as np
 import nibabel as nib
@@ -22,6 +22,9 @@ import glob
 from scipy.ndimage import zoom
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
+from importlib.metadata import version, PackageNotFoundError
+from packaging.version import Version
+from packaging.specifiers import SpecifierSet
 try:
     from tqdm import tqdm
 except Exception:
@@ -37,27 +40,100 @@ def _progress(iterable, total=None, desc=None, unit=None, enable=True):
     if unit: kwargs["unit"] = unit
     return tqdm(iterable, **kwargs)
 
+def apply_padding_anydim(arr, pad):
+    """Apply padding/cropping to the first 3 axes of an array (3D or 4D).
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input array with ndim >= 3. If 4D, the last axis is treated as time/frames and is not padded/cropped.
+    pad : array-like, shape (3, 2)
+        Padding/cropping for each spatial axis: [[before, after], ...].
+        Positive values pad with zeros; negative values crop.
+
+    Returns
+    -------
+    np.ndarray
+        Padded/cropped array.
+    """
+    pad = np.asarray(pad, dtype=int)
+    if pad.shape != (3, 2):
+        raise ValueError(f"pad must be shape (3,2), got {pad.shape}")
+    if arr.ndim < 3:
+        raise ValueError(f"arr must have ndim >= 3, got {arr.ndim}")
+
+    # --- Crop first (negative padding) via slicing ---
+    slices = []
+    for ax in range(3):
+        before, after = int(pad[ax, 0]), int(pad[ax, 1])
+        start = max(-before, 0)
+        end_crop = max(-after, 0)
+        end = None if end_crop == 0 else -end_crop
+        slices.append(slice(start, end))
+    # Keep any remaining axes (e.g. time) intact
+    for ax in range(3, arr.ndim):
+        slices.append(slice(None))
+    cropped = arr[tuple(slices)]
+
+    # --- Pad (positive padding) ---
+    pad_width = []
+    for ax in range(3):
+        before, after = int(pad[ax, 0]), int(pad[ax, 1])
+        pad_width.append((max(before, 0), max(after, 0)))
+    for ax in range(3, arr.ndim):
+        pad_width.append((0, 0))
+
+    if any(p[0] > 0 or p[1] > 0 for p in pad_width):
+        cropped = np.pad(cropped, pad_width, mode='constant', constant_values=0)
+    return cropped
+
+
 def apply_padding(data, pad):
-    result = data.copy()
-    for axis in range(3):
-        pad_before, pad_after = pad[axis]
+    """Backward-compatible wrapper: pads/crops the first 3 axes."""
+    return apply_padding_anydim(data, pad)
 
-        if pad_before < 0:
-            result = np.delete(result, np.s_[:abs(pad_before)], axis=axis)
-        if pad_after < 0:
-            result = np.delete(result, np.s_[-abs(pad_after):], axis=axis)
 
-        pad_before = max(pad_before, 0)
-        pad_after = max(pad_after, 0)
-        padding = [(0, 0)] * 3
-        padding[axis] = (pad_before, pad_after)
-        result = np.pad(result, padding, mode='constant', constant_values=0)
-    return result
+def _interp_to_scipy_order(interp):
+    # Accept ints directly
+    if isinstance(interp, (int, np.integer)):
+        order = int(interp)
+    elif isinstance(interp, str):
+        key = interp.strip().lower()
+        mapping = {
+            "nearest": 0,
+            "linear": 1,
+            "bilinear": 1,
+            "quadratic": 2,
+            "cubic": 3,
+            "quartic": 4,
+            "quintic": 5,
+        }
+        if key not in mapping:
+            raise ValueError(f"Unknown interp='{interp}'. Use one of: {sorted(mapping)} or an int 0-5.")
+        order = mapping[key]
+    else:
+        raise TypeError(f"interp must be an int (0-5) or a string like 'linear'. Got {type(interp)}")
+
+    if order < 0 or order > 5:
+        raise ValueError(f"scipy.ndimage.zoom order must be in [0,5]. Got {order}")
+    return order
+
+def prepare_zoom(original_voxel_dims, target_voxel_dims, interp):
+    """Precompute scipy.ndimage.zoom factors + interpolation order."""
+    zoom_factors = np.divide(original_voxel_dims, target_voxel_dims)
+    order = _interp_to_scipy_order(interp)
+    return zoom_factors, order
+
+
+def interpolate_to_voxel_dims_precomputed(data, zoom_factors, order):
+    """Resample a single 3D frame using precomputed zoom factors/order."""
+    return zoom(data, zoom_factors, order=order)
 
 
 def interpolate_to_voxel_dims(data, original_voxel_dims, target_voxel_dims, interp):
-    zoom_factors = np.divide(original_voxel_dims, target_voxel_dims)
-    return zoom(data, zoom_factors, order=interp)
+    """Backward-compatible helper: compute zoom factors/order and resample."""
+    zoom_factors, order = prepare_zoom(original_voxel_dims, target_voxel_dims, interp)
+    return interpolate_to_voxel_dims_precomputed(data, zoom_factors, order)
 
 
 def update_origin_for_padding(affine_matrix, padding, voxel_dims):
@@ -67,20 +143,25 @@ def update_origin_for_padding(affine_matrix, padding, voxel_dims):
 
 
 def adjust_to_target_shape(data, target_shape, padding_record=None, shape_padding=None):
-    current_shape = np.array(data.shape)
-    target_shape = np.array(target_shape)
+    """Pad/crop the first 3 axes of data to match target_shape.
+
+    Supports 3D (X,Y,Z) and 4D (X,Y,Z,T). For 4D, the time axis is preserved and the same
+    spatial padding/cropping is applied to every frame.
+    """
+    current_shape = np.array(data.shape[:3], dtype=int)
+    target_shape = np.array(target_shape, dtype=int)
 
     if shape_padding is None:
         shape_padding = np.zeros((3, 2), dtype=int)
         for axis in range(3):
-            diff = target_shape[axis] - current_shape[axis]
+            diff = int(target_shape[axis] - current_shape[axis])
             pad_before = diff // 2
             pad_after = diff - pad_before
-            shape_padding[axis] = [pad_before, pad_after] if diff > 0 else [pad_before, pad_after]
+            shape_padding[axis] = [pad_before, pad_after]
 
-    final_data = apply_padding(data, shape_padding)
+    final_data = apply_padding_anydim(data, shape_padding)
     if padding_record is not None:
-        padding_record['shape_padding'] = shape_padding
+        padding_record['shape_padding'] = np.array(shape_padding, dtype=int).tolist()
     return final_data, padding_record
 
 
@@ -95,7 +176,10 @@ def load_roi_mask(filepath, shape):
         raise ValueError("ROI mask dimensions must match data dimensions.")
     return mask
 
-def ensure_hd_bet_installed():
+def ensure_hd_bet_installed(
+    version_spec=">=2.0.0,<3.0.0"
+):
+    # 1. Ensure CLI exists
     if shutil.which("hd-bet") is None:
         raise ImportError(
             "HD-BET CLI not found in PATH.\n\n"
@@ -104,7 +188,28 @@ def ensure_hd_bet_installed():
             "Or use the preprocessing extra:\n"
             "    pip install astril[preprocessing]"
         )
-    # Ensure the parameter directory exists so downloads don't fail
+
+    # 2. Check installed package version
+    try:
+        installed_version = Version(version("hd-bet"))
+    except PackageNotFoundError:
+        raise ImportError(
+            "hd-bet appears to be on PATH, but the Python package is not installed "
+            "in this environment.\n"
+            "Please install it with:\n"
+            "    pip install hd-bet"
+        )
+
+    spec = SpecifierSet(version_spec)
+    if installed_version not in spec:
+        raise ImportError(
+            f"hd-bet version {installed_version} is installed, but "
+            f"version {version_spec} is required.\n\n"
+            "Please upgrade/downgrade:\n"
+            f"    pip install 'hd-bet{version_spec}'"
+        )
+
+    # 3. Ensure parameter directory exists
     param_dir = os.path.expanduser("~/hd-bet_params")
     os.makedirs(param_dir, exist_ok=True)
 
@@ -2038,3 +2143,330 @@ def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = "
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(info, fh, indent=2, ensure_ascii=False)
     return out
+
+
+# ------------------------------------------------------------------------
+# General NIfTI helpers for 3D/4D pipelines
+# ------------------------------------------------------------------------
+def get_nifti_ndim(nifti_path):
+    """
+    Return (ndim, shape) for a NIfTI file.
+    ndim is 3 or 4 for typical MRI volumes.
+    """
+    import nibabel as nib
+    img = nib.load(nifti_path)
+    shape = img.shape
+    ndim = len(shape)
+    return ndim, shape
+
+def extract_nifti_frame(nifti_4d_path, frame_index, out_path):
+    """
+    Extract a single 3D frame from a 4D NIfTI and write it to out_path.
+    Preserves affine and header (as appropriate for nibabel).
+    """
+    import nibabel as nib
+    import numpy as np
+    img = nib.load(nifti_4d_path)
+    data = img.get_fdata(dtype=np.float32)
+    if data.ndim != 4:
+        raise ValueError(f"extract_nifti_frame expects 4D input. Got shape={data.shape} from {nifti_4d_path}")
+    if frame_index < 0 or frame_index >= data.shape[3]:
+        raise IndexError(f"frame_index out of range: {frame_index} for shape={data.shape}")
+    frame = data[..., frame_index]
+    out_img = nib.Nifti1Image(frame, img.affine, img.header)
+    nib.save(out_img, out_path)
+    return out_path
+
+def stack_nifti_frames(frame_paths, out_path):
+    """
+    Stack multiple 3D NIfTI frames into a 4D NIfTI, using the affine/header from the first frame.
+    """
+    import nibabel as nib
+    import numpy as np
+    if not frame_paths:
+        raise ValueError("stack_nifti_frames requires at least one frame path.")
+    first = nib.load(frame_paths[0])
+    frames = []
+    for p in frame_paths:
+        img = nib.load(p)
+        dat = img.get_fdata(dtype=np.float32)
+        if dat.ndim != 3:
+            raise ValueError(f"Expected 3D frame at {p}, got shape={dat.shape}")
+        frames.append(dat)
+    data4d = np.stack(frames, axis=3)
+    out_img = nib.Nifti1Image(data4d, first.affine, first.header)
+    nib.save(out_img, out_path)
+    return out_path
+
+
+# ------------------------------------------------------------------------
+# SimpleITK helpers for fast in-memory 4D workflows
+# ------------------------------------------------------------------------
+def sitk_extract_3d_from_4d(img4d, frame_index: int):
+    """Extract a 3D volume (frame) from a 4D SimpleITK image.
+
+    SimpleITK represents 4D NIfTI as a 4D image; many registration routines operate on 3D.
+    This helper extracts the requested frame while preserving spatial metadata.
+    """
+    import SimpleITK as sitk
+
+    if img4d.GetDimension() != 4:
+        raise ValueError(f"sitk_extract_3d_from_4d expects a 4D image; got dim={img4d.GetDimension()}")
+
+    size = list(img4d.GetSize())
+    if frame_index < 0 or frame_index >= size[3]:
+        raise IndexError(f"frame_index out of range: {frame_index} for size={size}")
+
+    idx = [0, 0, 0, int(frame_index)]
+    ext = size[:]
+    ext[3] = 0  # Extract removes the 4th dimension when the size is 0 in that dimension
+    return sitk.Extract(img4d, ext, idx)
+
+def sitk_join_3d_frames_to_4d(frames3d, *, spatial_reference, time_reference):
+    """Join a list of 3D SimpleITK images into a 4D image, preserving useful metadata.
+
+    - spatial_reference: 3D image whose spatial grid (origin/spacing/direction) we want to preserve.
+      (Typically the fixed image used for resampling.)
+    - time_reference: original 4D moving image, used to preserve time spacing/origin when available.
+    """
+    import SimpleITK as sitk
+
+    if not frames3d:
+        raise ValueError("sitk_join_3d_frames_to_4d requires at least one 3D frame.")
+
+    out = sitk.JoinSeries(list(frames3d))
+
+    # Preserve time spacing/origin if available; otherwise fall back to 1.0 / 0.0.
+    t_spacing = 1.0
+    t_origin = 0.0
+    if time_reference is not None and time_reference.GetDimension() == 4:
+        try:
+            t_spacing = float(time_reference.GetSpacing()[3])
+            t_origin = float(time_reference.GetOrigin()[3])
+        except Exception:
+            pass
+
+    # Spatial metadata comes from the reference (which is in the target space).
+    sp = spatial_reference.GetSpacing()
+    org = spatial_reference.GetOrigin()
+    dir3 = spatial_reference.GetDirection()  # length 9
+
+    out.SetSpacing(tuple(list(sp) + [t_spacing]))
+    out.SetOrigin(tuple(list(org) + [t_origin]))
+
+    # 4D direction is 16-length flattened 4x4 matrix; embed 3D direction in the top-left.
+    d = [0.0] * 16
+    d[0], d[1], d[2] = dir3[0], dir3[1], dir3[2]
+    d[4], d[5], d[6] = dir3[3], dir3[4], dir3[5]
+    d[8], d[9], d[10] = dir3[6], dir3[7], dir3[8]
+    d[15] = 1.0
+    out.SetDirection(tuple(d))
+
+    return out
+
+def apply_mask_anydim(input_image_path, mask_path, output_path):
+    import nibabel as nib
+    import numpy as np
+
+    img = nib.load(input_image_path)
+    data = img.get_fdata(dtype=np.float32)
+
+    mask_img = nib.load(mask_path)
+    mask = mask_img.get_fdata(dtype=np.float32) > 0
+    if mask.ndim != 3:
+        raise ValueError(f"Mask must be 3D. Got shape={mask.shape} from {mask_path}")
+
+    if data.ndim == 3:
+        if data.shape != mask.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match image shape {data.shape}")
+        out = np.where(mask, data, 0.0).astype(np.float32, copy=False)
+
+    elif data.ndim == 4:
+        if data.shape[:3] != mask.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match image spatial shape {data.shape[:3]}")
+        out = np.where(mask[..., None], data, 0.0).astype(np.float32, copy=False)
+
+    else:
+        raise ValueError(f"Unsupported ndim={data.ndim} for {input_image_path}")
+
+    nib.save(nib.Nifti1Image(out, img.affine, img.header), output_path)
+    return output_path
+
+def normalize_masked_anydim(input_image_path, mask_path, output_path):
+    import nibabel as nib
+    import numpy as np
+
+    img = nib.load(input_image_path)
+    data = img.get_fdata(dtype=np.float32)
+
+    mask_img = nib.load(mask_path)
+    mask = mask_img.get_fdata(dtype=np.float32) > 0
+    if mask.ndim != 3:
+        raise ValueError(f"Mask must be 3D. Got shape={mask.shape} from {mask_path}")
+
+    if data.ndim == 3:
+        if data.shape != mask.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match image shape {data.shape}")
+
+        out = np.zeros_like(data)
+        vals = data[mask]
+        if vals.size:
+            mu = vals.mean()
+            sigma = vals.std()
+            if sigma <= 0:
+                sigma = 1.0
+            out[mask] = (vals - mu) / sigma
+
+    elif data.ndim == 4:
+        if data.shape[:3] != mask.shape:
+            raise ValueError(f"Mask shape {mask.shape} does not match image spatial shape {data.shape[:3]}")
+
+        out = np.zeros_like(data)
+        for t in range(data.shape[3]):
+            frame = data[..., t]
+            vals = frame[mask]
+            if not vals.size:
+                continue
+            mu = vals.mean()
+            sigma = vals.std()
+            if sigma <= 0:
+                sigma = 1.0
+            out_frame = out[..., t]          # view
+            out_frame[mask] = (vals - mu) / sigma
+
+    else:
+        raise ValueError(f"Unsupported ndim={data.ndim} for {input_image_path}")
+
+    nib.save(nib.Nifti1Image(out, img.affine, img.header), output_path)
+    return output_path
+
+# ------------------------------------------------------------------------
+# Sidecar and scan discovery helpers (generalized preprocessing)
+# ------------------------------------------------------------------------
+def _strip_nii_ext(path_or_name: str) -> str:
+    """Return filename without .nii or .nii.gz suffix."""
+    name = os.path.basename(str(path_or_name))
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return os.path.splitext(name)[0]
+
+
+def discover_scans_in_dir(scan_dir: str, prefer_gz: bool = True, modalities: list[str] | None = None) -> dict[str, str]:
+    """
+    Discover NIfTI scans in a directory (non-recursive) using astril naming convention:
+        {patientID}_{timepoint}_{modality}.nii[.gz]
+    where {modality} may contain underscores.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping {modality_label -> filepath}.
+        If both .nii and .nii.gz exist for the same modality, prefers .nii.gz when prefer_gz=True.
+        If `modalities` is provided, only those modalities are returned.
+    """
+    import os
+    scan_dir = os.fspath(scan_dir)
+    if not os.path.isdir(scan_dir):
+        raise FileNotFoundError(f"scan_dir not found or not a directory: {scan_dir}")
+
+    entries = []
+    for fn in os.listdir(scan_dir):
+        p = os.path.join(scan_dir, fn)
+        if not os.path.isfile(p):
+            continue
+        if fn.endswith(".nii") or fn.endswith(".nii.gz"):
+            entries.append(p)
+
+    found: dict[str, str] = {}
+    for p in entries:
+        stem = _strip_nii_ext(p)
+        parts = stem.split("_")
+        if len(parts) < 3:
+            # Can't infer modality reliably
+            continue
+        modality = "_".join(parts[2:])
+        # Resolve conflicts: prefer .nii.gz if requested
+        if modality in found:
+            prev = found[modality]
+            if prefer_gz:
+                if prev.endswith(".nii") and p.endswith(".nii.gz"):
+                    found[modality] = p
+            else:
+                # keep first seen
+                pass
+        else:
+            found[modality] = p
+
+    if modalities is not None:
+        want = {str(m) for m in modalities}
+        found = {k: v for k, v in found.items() if k in want}
+    return found
+
+
+def find_sidecars_for_nifti(nifti_path: str) -> list[str]:
+    """
+    Find sidecar files that accompany a NIfTI (same stem, different extension),
+    e.g. .bval/.bvec/.json. Returns absolute paths.
+    """
+    import os
+    nifti_path = os.fspath(nifti_path)
+    d = os.path.dirname(nifti_path)
+    stem = _strip_nii_ext(nifti_path)
+    sidecars = []
+    if not os.path.isdir(d):
+        return sidecars
+    for fn in os.listdir(d):
+        if fn.startswith(stem + "."):
+            # exclude the nifti itself
+            if fn.endswith(".nii") or fn.endswith(".nii.gz"):
+                continue
+            sidecars.append(os.path.join(d, fn))
+    return sorted(sidecars)
+
+
+def copy_sidecars_for_output(sidecar_paths: list[str], source_nifti: str, output_nifti: str, dry_run: bool = False) -> list[str]:
+    """
+    Copy sidecars associated with `source_nifti` to match the stem of `output_nifti`.
+
+    Example:
+        source:  P001_d0_DWI.nii.gz  has sidecar P001_d0_DWI.bvec
+        output:  P001_d0_DWI_brain.nii.gz  -> copies to P001_d0_DWI_brain.bvec
+
+    Parameters
+    ----------
+    sidecar_paths : list[str]
+        Sidecar absolute paths (typically from find_sidecars_for_nifti()).
+    source_nifti : str
+        The original nifti path used to derive the stem prefix that sidecars match.
+    output_nifti : str
+        Destination nifti path whose stem determines copied sidecar filenames.
+    dry_run : bool
+        If True, do not copy; only return the would-be destination paths.
+
+    Returns
+    -------
+    list[str]
+        Destination sidecar paths.
+    """
+    import os
+    import shutil
+
+    src_stem = _strip_nii_ext(source_nifti)
+    out_dir = os.path.dirname(os.fspath(output_nifti))
+    out_stem = _strip_nii_ext(output_nifti)
+    os.makedirs(out_dir, exist_ok=True)
+
+    dests: list[str] = []
+    for sp in sidecar_paths or []:
+        fn = os.path.basename(sp)
+        if not fn.startswith(src_stem + "."):
+            # only copy sidecars that match this source stem
+            continue
+        suffix = fn[len(src_stem):]  # includes leading '.'
+        dest = os.path.join(out_dir, out_stem + suffix)
+        dests.append(dest)
+        if not dry_run:
+            shutil.copy2(sp, dest)
+    return dests

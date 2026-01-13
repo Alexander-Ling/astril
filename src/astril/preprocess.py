@@ -1,4 +1,4 @@
-﻿# preprocessing_functions.py
+# preprocessing_functions.py
 # Author: Alex Ling
 # E. Antonio Chiocca Group, BWH
 # Description: Preprocessing utilities for MRI normalization, resampling, etc.
@@ -80,16 +80,34 @@ def normalize_masked_image(input_image_path, mask_path, output_path=None):
 # Function to reshape an MRI volume to specified data and voxel dimensions
 # -------------------------------------------------------------------------
 
-def resize_mri(input_filepath, output_filepath, target_shape, target_voxel_dims, interp,
-               save_padding_record=False, padding_record_path=None,
-               roi_mask_path=None, translation_only=False):
+def resize_mri(
+    input_filepath,
+    output_filepath,
+    target_shape,
+    target_voxel_dims,
+    interp,
+    save_padding_record=False,
+    padding_record_path=None,
+    roi_mask_path=None,
+    translation_only=False,
+    reg_frame_index=0,   # <-- for 4D, which frame defines padding/shape decisions
+):
+    """
+    Resize a 3D or 4D NIfTI to (target_shape, target_voxel_dims).
+
+    - For 3D: identical behavior to your current implementation.
+    - For 4D: loads entire 4D volume once, computes padding decisions once (using reg_frame_index),
+      then processes each frame in memory and stacks into a 4D output.
+    """
     # Lazy imports
     import nibabel as nib
     import numpy as np
-    # Utilities are imported lazily as well
+
     from .preprocessing_utils import (
-        apply_padding,
+        apply_padding_anydim,
+        prepare_zoom,
         interpolate_to_voxel_dims,
+        interpolate_to_voxel_dims_precomputed,
         update_origin_for_padding,
         adjust_to_target_shape,
         read_padding_record,
@@ -99,69 +117,155 @@ def resize_mri(input_filepath, output_filepath, target_shape, target_voxel_dims,
     if not os.path.exists(input_filepath):
         raise ValueError(f"[Error] Attempting to resize {input_filepath}, but file does not exist.")
 
-    mri = nib.load(input_filepath)
-    data = mri.get_fdata()
-    original_voxel_dims = mri.header.get_zooms()
+    img = nib.load(input_filepath)
+    data = img.get_fdata()
+    ndim = data.ndim
 
+    if ndim not in (3, 4):
+        raise ValueError(f"Unsupported ndim={ndim} for resize: {input_filepath}")
+
+    header_zooms = img.header.get_zooms()
+    original_voxel_dims = header_zooms[:3]  # spatial only
+
+    # ---------------------------------------------------------------------
+    # padding_record init (works for both 3D and 4D; stores spatial grid)
+    # ---------------------------------------------------------------------
     padding_record = {
-        'target_voxel_dims': target_voxel_dims,
-        'target_shape': target_shape,
-        'original_voxel_dims': original_voxel_dims,
-        'original_shape': data.shape,
-        'original_grid': {
-            'size': list(data.shape),
-            'spacing': list(original_voxel_dims),
-            'origin': list(mri.affine[:3, 3]),
-            'direction': list(np.ravel(mri.affine[:3, :3] / np.array(original_voxel_dims)))
-        }
+        "target_voxel_dims": tuple(target_voxel_dims),
+        "target_shape": tuple(target_shape),
+        "original_voxel_dims": tuple(original_voxel_dims),
+        "original_shape": tuple(data.shape),
+        "original_grid": {
+            "size": list(data.shape[:3]),
+            "spacing": list(original_voxel_dims),
+            "origin": list(img.affine[:3, 3]),
+            "direction": list(np.ravel(img.affine[:3, :3] / np.array(original_voxel_dims))),
+        },
     }
 
     loaded_padding_record = None
     if padding_record_path and os.path.exists(padding_record_path):
         loaded_padding_record = read_padding_record(padding_record_path)
 
-    roi_mask = load_roi_mask(roi_mask_path, data.shape) if roi_mask_path else None
+    # ROI mask should be 3D; for 4D we apply it based on spatial dims
+    roi_mask = load_roi_mask(roi_mask_path, data.shape[:3]) if roi_mask_path else None
 
+    # Select the 3D reference volume used to decide padding/shape for 4D
+    if ndim == 3:
+        ref_vol = data
+    else:
+        if not (0 <= reg_frame_index < data.shape[3]):
+            raise ValueError(
+                f"reg_frame_index={reg_frame_index} out of range for T={data.shape[3]}: {input_filepath}"
+            )
+        ref_vol = data[..., reg_frame_index]
+
+    # ---------------------------------------------------------------------
+    # Determine (or load) center_padding
+    # ---------------------------------------------------------------------
     if roi_mask is not None or loaded_padding_record:
         if not loaded_padding_record:
             roi_indices = np.where(roi_mask > 0)
+            if len(roi_indices[0]) == 0:
+                raise ValueError(f"ROI mask appears empty: {roi_mask_path}")
             roi_center = (np.min(roi_indices, axis=1) + np.max(roi_indices, axis=1)) // 2
-            data_center = np.array(data.shape) // 2
+            data_center = np.array(ref_vol.shape) // 2
             translation = data_center - roi_center
             center_padding = np.zeros((3, 2), dtype=int)
             for dim, shift in enumerate(translation):
                 center_padding[dim] = [shift, -shift]
         else:
-            center_padding = loaded_padding_record['center_padding']
-        data = apply_padding(data, center_padding)
+            center_padding = np.array(loaded_padding_record["center_padding"], dtype=int)
+
+        # Apply center padding to 3D or 4D in one shot (pads/crops only spatial axes)
+        data = apply_padding_anydim(data, center_padding)
     else:
         center_padding = np.zeros((3, 2), dtype=int)
 
-    padding_record['center_padding'] = center_padding
+    padding_record["center_padding"] = center_padding.tolist()
 
+    # ---------------------------------------------------------------------
+    # If translation_only: skip interpolation + target shape adjustment
+    # ---------------------------------------------------------------------
     if translation_only:
-        padding_record['shape_padding'] = np.zeros((3, 2), dtype=int)
+        padding_record["shape_padding"] = np.zeros((3, 2), dtype=int).tolist()
         final_data = data
-        new_affine = mri.affine
+        new_affine = img.affine
+
     else:
-        interpolated = interpolate_to_voxel_dims(data, original_voxel_dims, target_voxel_dims, interp)
-        if loaded_padding_record:
-            final_data, padding_record = adjust_to_target_shape(
-                interpolated, target_shape, padding_record, loaded_padding_record['shape_padding']
-            )
+        # For 4D, compute shape_padding once using the reference frame, then reuse for all frames
+        if ndim == 3:
+            interpolated = interpolate_to_voxel_dims(data, original_voxel_dims, target_voxel_dims, interp)
+
+            if loaded_padding_record:
+                final_data, padding_record = adjust_to_target_shape(
+                    interpolated,
+                    target_shape,
+                    padding_record,
+                    np.array(loaded_padding_record["shape_padding"], dtype=int),
+                )
+            else:
+                final_data, padding_record = adjust_to_target_shape(interpolated, target_shape, padding_record)
+
         else:
-            final_data, padding_record = adjust_to_target_shape(interpolated, target_shape, padding_record)
-        new_affine = mri.affine.copy()
+            # Precompute zoom factors/order once (avoid overhead per frame)
+            zoom_factors, order = prepare_zoom(original_voxel_dims, target_voxel_dims, interp)
+
+            # Interpolate reference frame first to determine (or validate) shape padding
+            interp_ref = interpolate_to_voxel_dims_precomputed(ref_vol, zoom_factors, order)
+
+            if loaded_padding_record:
+                shape_padding = np.array(loaded_padding_record["shape_padding"], dtype=int)
+                _ref_resized, padding_record = adjust_to_target_shape(
+                    interp_ref,
+                    target_shape,
+                    padding_record,
+                    shape_padding,
+                )
+            else:
+                _ref_resized, padding_record = adjust_to_target_shape(interp_ref, target_shape, padding_record)
+                shape_padding = np.array(padding_record["shape_padding"], dtype=int)
+
+            # Interpolate all frames into a preallocated array, then apply shape padding ONCE to the 4D stack
+            T = int(data.shape[3])
+            interp_shape3 = tuple(interp_ref.shape)
+            interped = np.empty((*interp_shape3, T), dtype=np.float32)
+            interped[..., 0] = interp_ref.astype(np.float32, copy=False)
+
+            for t in range(1, T):
+                interped[..., t] = interpolate_to_voxel_dims_precomputed(
+                    data[..., t], zoom_factors, order
+                ).astype(np.float32, copy=False)
+
+            final_data = apply_padding_anydim(interped, shape_padding)
+
+        # Update affine (same as your existing logic)
+        new_affine = img.affine.copy()
         new_affine[:3, :3] = np.diag(np.sign(np.diag(new_affine[:3, :3])) * np.array(target_voxel_dims))
-        new_affine = update_origin_for_padding(new_affine, padding_record['shape_padding'], target_voxel_dims)
+        new_affine = update_origin_for_padding(new_affine, np.array(padding_record["shape_padding"], dtype=int), target_voxel_dims)
 
-    nib.save(nib.Nifti1Image(final_data.astype(np.float32), new_affine), output_filepath)
+    # ---------------------------------------------------------------------
+    # Save output
+    # ---------------------------------------------------------------------
+    out_img = nib.Nifti1Image(final_data.astype(np.float32), new_affine)
 
+    # Preserve 4th zoom (time spacing) if present
+    if ndim == 4:
+        out_hdr = out_img.header
+        tzoom = header_zooms[3] if len(header_zooms) > 3 else 1.0
+        out_hdr.set_zooms(tuple(list(target_voxel_dims) + [tzoom]))
+
+    nib.save(out_img, output_filepath)
+
+    # ---------------------------------------------------------------------
+    # Save padding record if requested
+    # ---------------------------------------------------------------------
     if save_padding_record:
         path_to_save = padding_record_path or f"{output_filepath}_padding.txt"
         os.makedirs(os.path.dirname(path_to_save), exist_ok=True)
-        with open(path_to_save, 'w') as f:
+        with open(path_to_save, "w") as f:
             f.write(str(padding_record))
+
 
 # -----------------------------------------------------------------------------------
 # Function to undo reshape of MRI volume using saved padding record from resize_mri()
@@ -172,12 +276,10 @@ def reverse_resize_mri(input_filepath, output_filepath, padding_record_path, int
     Reverse a resizing operation performed by resize_mri(), using the original
     spacing and padding information stored in a padding record file.
 
-    Args:
-        input_filepath (str): Path to the resized image (.nii.gz)
-        output_filepath (str): Path where the reversed (original space) image should be saved
-        padding_record_path (str): Path to the .txt file storing the resize/padding metadata
-        interp (int): Interpolation order for resampling (0 = nearest, 1 = linear, etc.)
+    Supports 3D and 4D inputs. For 4D, resampling is done framewise to avoid
+    any interpolation across the time axis.
     """
+    import os
     import nibabel as nib
     import numpy as np
     from scipy.ndimage import zoom
@@ -190,51 +292,97 @@ def reverse_resize_mri(input_filepath, output_filepath, padding_record_path, int
 
     img = nib.load(input_filepath)
     data = img.get_fdata()
-    current_voxel_dims = img.header.get_zooms()
-    original_voxel_dims = np.array(padding_record['original_voxel_dims'])
+    ndim = data.ndim
+    if ndim not in (3, 4):
+        raise ValueError(f"Unsupported ndim={ndim} for reverse_resize_mri: {input_filepath}")
 
-    # Step 1: Resize back to original voxel spacing
-    zoom_factors = np.array(current_voxel_dims) / original_voxel_dims
-    resampled = zoom(data, zoom_factors, order=interp)
+    # ---- Helper: undo padding on first 3 axes only (works for 3D or 4D) ----
+    def _undo_padding_anydim(arr, pad_3x2):
+        """
+        Inverse of apply_padding_anydim logic:
+        - If pad value was positive (we padded), undo by cropping.
+        - If pad value was negative (we cropped), undo by padding zeros.
+        Operates on first 3 axes only; leaves extra axes untouched.
+        """
+        pad_3x2 = np.asarray(pad_3x2, dtype=int)
+        if pad_3x2.shape != (3, 2):
+            raise ValueError(f"pad must be shape (3,2), got {pad_3x2.shape}")
 
-    # Step 2: Undo shape padding (crop or pad)
-    shape_padding = np.array(padding_record['shape_padding'])
-    adjusted = resampled
-    for axis in range(3):
-        before, after = shape_padding[axis]
-        if before > 0 or after > 0:
-            adjusted = np.take(adjusted, indices=range(before, adjusted.shape[axis] - after), axis=axis)
-        elif before < 0 or after < 0:
-            pad_width = [(0, 0)] * 3
-            pad_width[axis] = (-before if before < 0 else 0, -after if after < 0 else 0)
-            adjusted = np.pad(adjusted, pad_width, mode='constant', constant_values=0)
+        out = arr
 
-    # Step 3: Undo center padding (crop or pad)
-    center_padding = np.array(padding_record['center_padding'])
-    final = adjusted
-    for axis in range(3):
-        before, after = center_padding[axis]
-        if before > 0 or after > 0:
-            final = np.take(final, indices=range(before, final.shape[axis] - after), axis=axis)
-        elif before < 0 or after < 0:
-            pad_width = [(0, 0)] * 3
-            pad_width[axis] = (-before if before < 0 else 0, -after if after < 0 else 0)
-            final = np.pad(final, pad_width, mode='constant', constant_values=0)
+        # First: undo positive padding by cropping
+        slices = [slice(None)] * out.ndim
+        for ax in range(3):
+            before, after = pad_3x2[ax]
+            if before > 0 or after > 0:
+                start = before
+                end = out.shape[ax] - after if after > 0 else out.shape[ax]
+                if end < start:
+                    raise ValueError(
+                        f"Invalid undo crop on axis {ax}: start={start}, end={end}, shape={out.shape}"
+                    )
+                slices[ax] = slice(start, end)
+        out = out[tuple(slices)]
 
-    # Step 4: Restore original affine
+        # Second: undo negative padding (i.e., original crop) by adding zeros
+        pad_width = [(0, 0)] * out.ndim
+        for ax in range(3):
+            before, after = pad_3x2[ax]
+            if before < 0 or after < 0:
+                pad_before = -before if before < 0 else 0
+                pad_after = -after if after < 0 else 0
+                pad_width[ax] = (pad_before, pad_after)
+
+        if any(p[0] > 0 or p[1] > 0 for p in pad_width[:3]):
+            out = np.pad(out, pad_width, mode="constant", constant_values=0)
+
+        return out
+
+    # ---- Step 1: Resize back to original voxel spacing (spatial only) ----
+    current_zooms = img.header.get_zooms()
+    current_voxel_dims = np.array(current_zooms[:3], dtype=float)
+    original_voxel_dims = np.array(padding_record["original_voxel_dims"][:3], dtype=float)
+
+    zoom_factors = current_voxel_dims / original_voxel_dims  # spatial zoom only
+
+    if ndim == 3:
+        resampled = zoom(data, zoom_factors, order=interp)
+    else:
+        # Framewise zoom to avoid interpolation across time axis
+        T = data.shape[3]
+        first = zoom(data[..., 0], zoom_factors, order=interp)
+        resampled = np.empty((*first.shape, T), dtype=first.dtype)
+        resampled[..., 0] = first
+        for t in range(1, T):
+            resampled[..., t] = zoom(data[..., t], zoom_factors, order=interp)
+
+    # ---- Step 2: Undo shape padding ----
+    shape_padding = np.asarray(padding_record["shape_padding"], dtype=int)
+    adjusted = _undo_padding_anydim(resampled, shape_padding)
+
+    # ---- Step 3: Undo center padding ----
+    center_padding = np.asarray(padding_record["center_padding"], dtype=int)
+    final = _undo_padding_anydim(adjusted, center_padding)
+
+    # ---- Step 4: Restore original affine ----
     original_affine = np.eye(4)
-    original_affine[:3, 3] = padding_record['original_grid']['origin']
+    original_affine[:3, 3] = padding_record["original_grid"]["origin"]
 
-    direction_matrix = np.reshape(padding_record['original_grid']['direction'], (3, 3))
-    voxel_dims = np.array(padding_record['original_voxel_dims'])
+    direction_matrix = np.reshape(padding_record["original_grid"]["direction"], (3, 3))
+    voxel_dims = np.array(padding_record["original_voxel_dims"][:3], dtype=float)
 
-    # Apply voxel size along the correct axis (columns)
-    scaled_direction = direction_matrix * voxel_dims[np.newaxis, :]  # shape (3, 3)
+    scaled_direction = direction_matrix * voxel_dims[np.newaxis, :]
     original_affine[:3, :3] = scaled_direction
 
-    nib.save(nib.Nifti1Image(final.astype(np.float32), original_affine), output_filepath)
-    print(f"[Done] Reversed resize saved to: {output_filepath}")
+    out_img = nib.Nifti1Image(final.astype(np.float32), original_affine)
 
+    # Preserve time zoom if 4D
+    if ndim == 4:
+        tzoom = current_zooms[3] if len(current_zooms) > 3 else 1.0
+        out_img.header.set_zooms(tuple(list(original_voxel_dims) + [tzoom]))
+
+    nib.save(out_img, output_filepath)
+    print(f"[Done] Reversed resize saved to: {output_filepath}")
 
 # -------------------------------------------------------------------------
 # Function to match affine matrices between two nifti files
@@ -327,30 +475,93 @@ def register_images(
     apply_only=False,
     registration_type="rigid",
     similarity_metric="mi",
-    use_gpu=False,
+    registration_strategy="accurate",
+    metric_sampling_seed=None,
     verbose=False,
-    save_dummy_ref=False
+    save_dummy_ref=False,
+    *,
+    fixed_frame_index: int = 0,
+    moving_frame_index: int = 0,
+    debug = False,
 ):
     """
-    Register or apply transform to align moving image to fixed image using SimpleITK.
+    Register (estimate a transform) or apply an existing transform to align a moving MRI volume
+    into the space of a fixed MRI volume, using SimpleITK.
 
-    Args:
-        fixed_path (str): Path to the fixed image (reference).
-        moving_path (str): Path to the moving image (to be registered or transformed).
-        output_path (str): Path to save the output image.
-        transform_path (str): Path to save or load transform.
-        apply_only (bool): If True, apply existing transform instead of performing registration.
-        registration_type (str): One of "rigid", "affine", or "translation".
-        similarity_metric (str): "correlation" or "mi" (mutual information).
-        use_gpu (bool): Use GPU acceleration if supported.
-        save_dummy_ref (bool): Whether to save a zeroed copy of the moving image as a deidentified, space-efficient way to keep a reference for later re-application or reversal of the transformation.
-        verbose (bool): Whether to print metric score and status.
+    **3D and 4D support**
+    - If both inputs are 3D, behavior is unchanged.
+    - If either input is 4D, the transform is **estimated** (when apply_only=False) from a single 3D frame
+      (selected by fixed_frame_index / moving_frame_index), then applied in-memory to all frames and written
+      as a 4D NIfTI at output_path.
+
+    Notes
+    -----
+    - SimpleITK's registration methods operate on 3D volumes; for 4D we therefore register a representative
+      frame, then resample each frame with the resulting transform.
+    - In apply-only mode, the transform is applied to the full moving image (3D or 4D).
+    - Dummy reference images (save_dummy_ref=True) reflect the *3D images used to estimate* the transform.
+      For 4D inputs, these are the selected frames.
+
+    Parameters
+    ----------
+    fixed_path : str or os.PathLike
+        Path to the fixed/reference image (3D or 4D). The output is resampled onto the fixed grid.
+    moving_path : str or os.PathLike
+        Path to the moving image (3D or 4D).
+    output_path : str or os.PathLike
+        Path where the registered/resampled moving image will be written.
+    transform_path : str or os.PathLike, optional
+        Transform file path.
+        - If apply_only=False and provided, the estimated transform is written here.
+        - If apply_only=True, this must exist and is loaded and applied.
+    apply_only : bool, default=False
+        If True, skip registration and only apply an existing transform.
+    registration_type : {"rigid", "affine", "translation"}, default="rigid"
+        Transform family to estimate (registration mode only).
+    similarity_metric : {"mi", "correlation"}, default="mi"
+        Similarity metric to optimize during registration (registration mode only).
+    registration_strategy : {"accurate", "medium", "fast"}, default="accurate"
+        Preset controlling pyramid levels, sampling fraction, and iteration budget.
+    metric_sampling_seed : int or None, default=None
+        Seed for stochastic metric sampling used in "medium"/"fast" presets.
+    verbose : bool, default=False
+        Print additional details.
+    save_dummy_ref : bool, default=False
+        If True (and transform_path is provided), write de-identified 0-filled dummy references alongside
+        the transform, preserving geometry for later apply/reverse steps.
+    fixed_frame_index : int, default=0
+        If fixed_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
+    moving_frame_index : int, default=0
+        If moving_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
+    debug : bool, default=False
+        Print additional information for 4d image registration to debug affine matrice issues.
+
+    Returns
+    -------
+    None
     """
+    import os
     import SimpleITK as sitk
     import numpy as np
 
-    fixed = sitk.ReadImage(fixed_path, sitk.sitkFloat32)
-    moving = sitk.ReadImage(moving_path, sitk.sitkFloat32)
+    # Lightweight dimensionality check (nibabel is OK here; used elsewhere in the package)
+    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
+
+    fixed_ndim, _ = get_nifti_ndim(fixed_path)
+    moving_ndim, moving_shape = get_nifti_ndim(moving_path)
+
+    if fixed_ndim not in (3, 4) or moving_ndim not in (3, 4):
+        raise ValueError(
+            f"register_images supports only 3D/4D NIfTI inputs. "
+            f"Got fixed_ndim={fixed_ndim} moving_ndim={moving_ndim}."
+        )
+
+    fixed_img = sitk.ReadImage(str(fixed_path), sitk.sitkFloat32)
+    moving_img = sitk.ReadImage(str(moving_path), sitk.sitkFloat32)
+
+    # For registration, pick 3D frames if needed.
+    fixed_for_reg = fixed_img if fixed_ndim == 3 else sitk_extract_3d_from_4d(fixed_img, int(fixed_frame_index))
+    moving_for_reg = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, int(moving_frame_index))
 
     if apply_only:
         if not transform_path or not os.path.isfile(transform_path):
@@ -358,8 +569,37 @@ def register_images(
         transform = sitk.ReadTransform(transform_path)
         if verbose:
             print(f"Applying transform from: {transform_path}")
+
     else:
-        # Select transform type
+        strategy = str(registration_strategy).lower().strip()
+        presets = {
+            "accurate": dict(
+                sampling_fraction=1.0,
+                iters=300,
+                shrink=[8, 4, 2, 1],
+                smooth=[3, 2, 1, 0],
+                mi_bins=50,
+            ),
+            "medium": dict(
+                sampling_fraction=0.25,
+                iters=200,
+                shrink=[4, 2, 1],
+                smooth=[2, 1, 0],
+                mi_bins=50,
+            ),
+            "fast": dict(
+                sampling_fraction=0.10,
+                iters=120,
+                shrink=[4, 2, 1],
+                smooth=[2, 1, 0],
+                mi_bins=32,
+            ),
+        }
+        if strategy not in presets:
+            raise ValueError("registration_strategy must be one of: 'accurate', 'medium', 'fast'.")
+        p = presets[strategy]
+
+        # Transform family
         if registration_type == "rigid":
             tx = sitk.Euler3DTransform()
         elif registration_type == "affine":
@@ -370,7 +610,7 @@ def register_images(
             raise ValueError("Invalid registration_type. Choose 'rigid', 'affine', or 'translation'.")
 
         initial_transform = sitk.CenteredTransformInitializer(
-            fixed, moving, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
+            fixed_for_reg, moving_for_reg, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
         )
 
         registration = sitk.ImageRegistrationMethod()
@@ -380,48 +620,161 @@ def register_images(
         if similarity_metric == "correlation":
             registration.SetMetricAsCorrelation()
         elif similarity_metric == "mi":
-            registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+            registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=int(p["mi_bins"]))
         else:
             raise ValueError("Invalid similarity_metric. Choose 'correlation' or 'mi'.")
 
+        # Multi-resolution pyramid
+        registration.SetShrinkFactorsPerLevel([int(x) for x in p["shrink"]])
+        registration.SetSmoothingSigmasPerLevel([float(x) for x in p["smooth"]])
+        registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+        # Sampling
+        f = float(p["sampling_fraction"])
+        if f >= 1.0:
+            registration.SetMetricSamplingStrategy(registration.NONE)
+            if verbose:
+                print(f"[{strategy}] metric sampling: NONE (all voxels)")
+        else:
+            registration.SetMetricSamplingStrategy(registration.RANDOM)
+            if metric_sampling_seed is None:
+                registration.SetMetricSamplingPercentage(f)
+            else:
+                registration.SetMetricSamplingPercentage(f, int(metric_sampling_seed))
+            if verbose:
+                print(f"[{strategy}] metric sampling: RANDOM ({f:.3f} of voxels), seed={metric_sampling_seed}")
+
+        # Optimizer
         registration.SetInterpolator(sitk.sitkLinear)
         registration.SetOptimizerAsRegularStepGradientDescent(
-            learningRate=2.0, minStep=1e-4, numberOfIterations=200,
-            gradientMagnitudeTolerance=1e-6
+            learningRate=2.0,
+            minStep=1e-4,
+            numberOfIterations=int(p["iters"]),
+            gradientMagnitudeTolerance=1e-6,
         )
         registration.SetOptimizerScalesFromPhysicalShift()
 
-        if use_gpu:
-            try:
-                registration.SetMetricSamplingStrategy(registration.RANDOM)
-                registration.SetMetricSamplingPercentage(0.2)
-                if verbose:
-                    print("Using GPU-style fast approximation (random sampling).")
-            except Exception as e:
-                if verbose:
-                    print(f"GPU acceleration setup failed: {e}")
-
-        transform = registration.Execute(fixed, moving)
+        transform = registration.Execute(fixed_for_reg, moving_for_reg)
 
         if verbose:
-            final_metric = registration.GetMetricValue()
-            print(f"Final {similarity_metric} = {final_metric:.4f}")
+            print(f"Final {similarity_metric} = {registration.GetMetricValue():.4f}")
 
         if transform_path:
             sitk.WriteTransform(transform, transform_path)
 
-    # Resample the moving image using the transform
-    registered = sitk.Resample(
-        moving, fixed, transform, sitk.sitkLinear, 0.0, moving.GetPixelID()
-    )
-    sitk.WriteImage(registered, output_path)
+    # ------------------------------------------------------------------
+    # Resample moving -> fixed space
+    # ------------------------------------------------------------------
+    # Spatial reference for resampling: always a 3D grid.
+    spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
 
+    if moving_ndim == 3:
+        registered = sitk.Resample(
+            moving_img,
+            spatial_ref,
+            transform,
+            sitk.sitkLinear,
+            0.0,
+            moving_img.GetPixelID(),
+        )
+        sitk.WriteImage(registered, str(output_path))
+    else:
+        # Apply transform to each 3D frame, in memory, then re-stack to 4D.
+        n_frames = moving_shape[3] if moving_ndim == 4 else 1
+
+        out_frames = []
+        for t in range(int(n_frames)):
+            frame3d = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, t)
+            reg3d = sitk.Resample(frame3d, spatial_ref, transform, sitk.sitkLinear, 0.0, frame3d.GetPixelID())
+            out_frames.append(reg3d)
+
+        out4d = sitk_join_3d_frames_to_4d(
+            out_frames,
+            spatial_reference=spatial_ref,
+            time_reference=moving_img,
+        )
+
+        # NOTE (4D NIfTI header correctness):
+        # Some readers (including certain Slicer/ITK diffusion-related paths) may fall back to a
+        # "base affine" derived from pixdim/qfac if the header looks inconsistent (dtype/scale/offset),
+        # even when sform/qform are set. To reduce the chance of fallback, build a fresh NIfTI
+        # with a clean header and explicitly set qform/sform/codes/zooms/dtype.
+        import numpy as np
+        import nibabel as nib
+
+        fixed_nii = nib.load(str(fixed_path))
+        moving_nii = nib.load(str(moving_path))
+        fixed_affine = fixed_nii.affine
+
+        # SimpleITK returns 4D arrays as (t, z, y, x); nibabel expects (x, y, z, t).
+        arr_tzyx = sitk.GetArrayFromImage(out4d)
+        data_xyzt = np.transpose(arr_tzyx, (3, 2, 1, 0))
+
+        # Use a concrete dtype and make header match it (avoid fixed header dtype/scale baggage).
+        data_xyzt = data_xyzt.astype(np.float32, copy=False)
+
+        # Build a fresh NIfTI (nibabel will generate a sane vox_offset/magic/layout).
+        out_nii = nib.Nifti1Image(data_xyzt, fixed_affine)
+        hdr = out_nii.header
+        hdr.set_data_dtype(data_xyzt.dtype)
+
+        # Copy spatial zooms from fixed; preserve time zoom from moving if present.
+        fixed_zooms = fixed_nii.header.get_zooms()[:3]
+        moving_zooms = moving_nii.header.get_zooms()
+        tzoom = float(moving_zooms[3]) if len(moving_zooms) > 3 else 1.0
+        hdr.set_zooms(tuple(list(fixed_zooms) + [tzoom]))
+
+        # Match units (optional but helps some readers).
+        try:
+            xyz_unit, t_unit = fixed_nii.header.get_xyzt_units()
+            hdr.set_xyzt_units(xyz=xyz_unit, t=t_unit)
+        except Exception:
+            pass
+
+        # Use fixed qform/sform codes if available; otherwise default to 1 ("scanner").
+        try:
+            qcode = int(fixed_nii.header["qform_code"])
+            scode = int(fixed_nii.header["sform_code"])
+        except Exception:
+            qcode, scode = 1, 1
+        if qcode <= 0:
+            qcode = 1
+        if scode <= 0:
+            scode = 1
+
+        out_nii.set_qform(fixed_affine, code=qcode)
+        out_nii.set_sform(fixed_affine, code=scode)
+
+        # Clear any scaling fields that can confuse some readers.
+        try:
+            hdr["scl_slope"] = 1.0
+            hdr["scl_inter"] = 0.0
+        except Exception:
+            pass
+
+        nib.save(out_nii, str(output_path))
+
+        if debug:
+            a = fixed_nii.affine
+            loaded_4d_output = nib.load(str(output_path))
+            b = loaded_4d_output.affine
+            loaded_4d_header = loaded_4d_output.header
+            print(f"[Debug] For moving path: {str(moving_path)}")
+            print(f"[Debug] np.allclose(fixed_nii.affine, loaded_4d_output.affine) = {np.allclose(a, b)}")
+            print(f"[Debug] fixed_nii.affine = {a}")
+            print(f"[Debug] loaded_4d_output.affine = {b}")
+            print(f"[Debug] loaded_4d_output.header = {loaded_4d_header}")
+            print(f"[Debug] loaded_4d_header.get_sform(coded=True) = {loaded_4d_header.get_sform(coded=True)}")
+            print(f"[Debug] loaded_4d_header.get_qform(coded=True) = {loaded_4d_header.get_qform(coded=True)}")
+            print(f"[Debug] loaded_4d_header.get_base_affine() = {loaded_4d_header.get_base_affine()}")
+
+    # Optional dummy references
     if save_dummy_ref and transform_path:
-        base = os.path.splitext(transform_path)[0]
+        base = os.path.splitext(str(transform_path))[0]
         fixed_dummy_path = base + "_fixed_ref.nii.gz"
         moving_dummy_path = base + "_moving_ref.nii.gz"
 
-        for ref_img, path in [(fixed, fixed_dummy_path), (moving, moving_dummy_path)]:
+        for ref_img, path in [(fixed_for_reg, fixed_dummy_path), (moving_for_reg, moving_dummy_path)]:
             zero_array = np.zeros(sitk.GetArrayFromImage(ref_img).shape, dtype=np.float32)
             dummy = sitk.GetImageFromArray(zero_array)
             dummy.CopyInformation(ref_img)
@@ -446,113 +799,202 @@ def inverse_transform_image(
     output_path,
     interpolation="linear",
     verbose=True,
+    *,
+    original_frame_index: int = 0,
 ):
     """
     Apply the inverse of a saved transform to return an image to its original space.
 
-    Args:
-        original_image_path (str): Path to the original (pre-registered) image (reference grid).
-        transformed_image_path (str): Path to the image that has been transformed.
-        transform_path (str): Path to the saved transform (.tfm).
-        output_path (str): Path to save the inverse-transformed image.
-        interpolation (str): One of 'linear' or 'nearest'.
-        verbose (bool): Print actions and summary.
+    This supports both 3D and 4D NIfTI:
+      - If transformed_image_path is 3D, writes a 3D output.
+      - If transformed_image_path is 4D, applies the inverse transform to each 3D frame in-memory and writes a 4D output.
+
+    Parameters
+    ----------
+    original_image_path : str | PathLike
+        Path to the original (pre-registered) image defining the **reference grid** to recover into.
+        If 4D, the spatial grid is taken from `original_frame_index`.
+    transformed_image_path : str | PathLike
+        Path to the transformed image (3D or 4D) to be mapped back into the original grid.
+    transform_path : str | PathLike
+        Path to the forward transform (.tfm) that produced the transformed image.
+    output_path : str | PathLike
+        Output path for the recovered image.
+    interpolation : {'linear','nearest'}
+        Interpolation for resampling.
+    verbose : bool
+        Print summary information.
+    original_frame_index : int
+        When original_image_path is 4D, which frame to use as the spatial reference grid.
+
+    Notes
+    -----
+    - This function assumes the forward transform maps: original -> transformed_reference_space.
+      It applies the inverse to map: transformed -> original_reference_grid.
     """
     import SimpleITK as sitk
-    import numpy as np
+    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
 
-    original_img = sitk.ReadImage(original_image_path, sitk.sitkFloat32)
-    transformed_img = sitk.ReadImage(transformed_image_path, sitk.sitkFloat32)
-    transform = sitk.ReadTransform(transform_path)
+    orig_ndim, orig_shape = get_nifti_ndim(original_image_path)
+    tr_ndim, tr_shape = get_nifti_ndim(transformed_image_path)
 
-    if not transform.IsLinear():
-        raise ValueError("Transform is not linear (rigid/affine). Inverse may not be supported.")
+    if orig_ndim not in (3, 4) or tr_ndim not in (3, 4):
+        raise ValueError(
+            f"inverse_transform_image supports only 3D/4D NIfTI. "
+            f"Got original_ndim={orig_ndim} transformed_ndim={tr_ndim}."
+        )
 
-    inverse_transform = transform.GetInverse()
+    original_img = sitk.ReadImage(str(original_image_path), sitk.sitkFloat32)
+    transformed_img = sitk.ReadImage(str(transformed_image_path), sitk.sitkFloat32)
+
+    # Choose a 3D spatial reference grid to recover into
+    original_ref_3d = original_img if orig_ndim == 3 else sitk_extract_3d_from_4d(original_img, int(original_frame_index))
+
+    transform = sitk.ReadTransform(str(transform_path))
+    try:
+        inverse_transform = transform.GetInverse()
+    except Exception as e:
+        raise ValueError(f"Failed to compute inverse transform for '{transform_path}': {e}")
 
     if interpolation == "linear":
         interp_method = sitk.sitkLinear
     elif interpolation == "nearest":
         interp_method = sitk.sitkNearestNeighbor
     else:
-        raise ValueError("Unsupported interpolation type.")
+        raise ValueError("interpolation must be 'linear' or 'nearest'")
 
-    recovered = sitk.Resample(
-        transformed_img,
-        original_img,
-        inverse_transform,
-        interp_method,
-        0.0,
-        transformed_img.GetPixelID()
-    )
-    sitk.WriteImage(recovered, output_path)
+    if tr_ndim == 3:
+        recovered = sitk.Resample(
+            transformed_img,
+            original_ref_3d,
+            inverse_transform,
+            interp_method,
+            0.0,
+            transformed_img.GetPixelID(),
+        )
+        sitk.WriteImage(recovered, str(output_path))
+    else:
+        # 4D: invert each 3D frame in memory, then re-stack to 4D.
+        n_frames = int(tr_shape[3])
+        frames_out = []
+        for t in range(n_frames):
+            frame3d = sitk_extract_3d_from_4d(transformed_img, t)
+            recovered3d = sitk.Resample(
+                frame3d,
+                original_ref_3d,
+                inverse_transform,
+                interp_method,
+                0.0,
+                frame3d.GetPixelID(),
+            )
+            frames_out.append(recovered3d)
+
+        out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img)
+        sitk.WriteImage(out4d, str(output_path))
 
     if verbose:
         print(f"Inverse-transformed image saved to: {output_path}")
-
 
 # ---------------------------------------------------------------------------------------
 # Function to run hd-bet for brainmask creation
 # ---------------------------------------------------------------------------------------
 
-def run_hd_bet(input_path, output_path=None, mask_path=None, mode="accurate", device="cpu", tta=0, pp=1, overwrite_existing=0, quiet=False):
+def run_hd_bet(
+    input_path: str | os.PathLike,
+    output_path: str | os.PathLike | None = None,
+    mask_path: str | os.PathLike | None = None,
+    device: str = "cpu",
+    disable_tta: bool = True,
+    verbose: bool = False,
+):
+    """
+    HD-BET v2.x CLI wrapper.
+
+    - If output_path is provided: writes brain-extracted image there (default HD-BET output).
+    - If mask_path is provided: also writes a brain mask (HD-BET decides the on-disk naming; we discover it and move it).
+    - If only mask_path is provided: we force no bet image via --no_bet_image
+    - Suggested to disable TTA if running on CPU for speed
+    - Set device to cuda to run on GPU
+    """
     from .preprocessing_utils import ensure_hd_bet_installed
     ensure_hd_bet_installed()
 
-    if not output_path and not mask_path:
-        raise ValueError("Must provide at least --output or --mask path.")
+    input_path = str(input_path)
 
-    bet_flag = 1 if output_path else 0
-    save_mask_flag = 1 if mask_path else 0
+    if output_path is None and mask_path is None:
+        raise ValueError("Must provide at least one of output_path or mask_path.")
 
-    # Generate safe dummy output if only mask is being saved
-    use_dummy_output = False
-    if output_path:
-        hd_bet_output = output_path
-    elif mask_path:
-        dummy_base = os.path.splitext(os.path.basename(input_path))[0]
-        dummy_output = f"{dummy_base}_dummy_{uuid.uuid4().hex[:8]}.nii.gz"
-        hd_bet_output = os.path.join(os.path.dirname(mask_path), dummy_output)
-        use_dummy_output = True
+    # Decide how output paths should be handled
+    if output_path is not None and mask_path is not None:
+        out_for_cli = str(output_path)
+        out_is = "skullstripped_scan"
+    elif output_path is not None:
+        out_for_cli = str(output_path)
+        out_is = "skullstripped_scan"
     else:
-        raise RuntimeError("Unexpected logic error in determining output path.")
+        out_for_cli = str(mask_path)
+        out_is = "mask"
 
-    cmd = [
-        "hd-bet",
-        "-i", input_path,
-        "-o", hd_bet_output,
-        "-mode", mode,
-        "-device", str(device),
-        "-tta", str(tta),
-        "-pp", str(pp),
-        "--overwrite_existing", str(overwrite_existing),
-        "--bet", str(bet_flag),
-        "--save_mask", str(save_mask_flag),
-    ]
+    cmd = ["hd-bet", "-i", input_path, "-o", out_for_cli, "-device", str(device)]
 
-    if not quiet:
+    # TTA behavior: defaults to TTA enabled; disabling is a speed optimization (esp. on CPU).
+    if disable_tta is True:
+        cmd.append("--disable_tta")
+
+    # Ask for mask if requested
+    if mask_path is not None:
+        cmd.append("--save_bet_mask")
+
+    # If user doesn't want a bet image, explicitly request that.
+    if output_path is None:
+        cmd.append("--no_bet_image")
+
+    if verbose:
+        cmd.append("--verbose")
+
+    if verbose:
         print("Running command:", " ".join(cmd))
-    # suppress HD-BET console output if quiet
-    with contextlib.ExitStack() as stack:
-        stdout = subprocess.DEVNULL if quiet else None
-        stderr = subprocess.DEVNULL if quiet else None
+
+    with contextlib.ExitStack():
+        stdout = subprocess.DEVNULL if not verbose else None
+        stderr = subprocess.DEVNULL if not verbose else None
         subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr)
 
-    if mask_path:
-        # Only change the final extension, not every occurrence in the path
-        if hd_bet_output.endswith(".nii.gz"):
-            expected_mask = hd_bet_output[:-7] + "_mask.nii.gz"
-        elif hd_bet_output.endswith(".nii"):
-            expected_mask = hd_bet_output[:-4] + "_mask.nii"
-        else:
-            expected_mask = hd_bet_output + "_mask"
-        if not os.path.exists(expected_mask):
-            raise FileNotFoundError(f"Expected mask file not found: {expected_mask}")
-        os.replace(expected_mask, mask_path)
+    # If a mask was requested in addition to skullstripped scan, find what HD-BET produced and move it to mask_path.
+    if mask_path is not None:
+        out_p = Path(out_for_cli)
 
-    if use_dummy_output and os.path.exists(hd_bet_output):
-        os.remove(hd_bet_output)
+        # Heuristic: HD-BET historically used "<output>_bet.nii.gz".
+        candidates = []
 
+        # Same folder, same stem prefix, containing "bet"
+        parent = out_p.parent
+        stem = out_p.name
+        for p in parent.glob("*"):
+            name = p.name.lower()
+            if "_bet" in name and (stem.lower().split(".nii")[0] in name):
+                if p.suffix in [".nii"] or name.endswith(".nii.gz"):
+                    candidates.append(p)
+
+        # Fallback: common legacy naming patterns
+        if not candidates:
+            if out_for_cli.endswith(".nii.gz"):
+                candidates.append(Path(out_for_cli[:-7] + "_bet.nii.gz"))
+            elif out_for_cli.endswith(".nii"):
+                candidates.append(Path(out_for_cli[:-4] + "_bet.nii"))
+
+        candidates = [p for p in candidates if p.exists()]
+        if not candidates:
+            raise FileNotFoundError(
+                f"HD-BET finished but no mask file was found near {out_for_cli}. "
+                f"Try running with verbose=True to see what it writes."
+            )
+
+        # Prefer the most recently modified candidate
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        if verbose:
+            print(f"Moving {str(candidates[0])} to {str(mask_path)}.")
+        os.replace(str(candidates[0]), str(mask_path))
 
 # ---------------------------------------------------------------------------------------
 # Function to do basic math between MRI volumes
@@ -2563,15 +3005,30 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     basic = p.add_argument_group("Registration basics")
     basic.add_argument("--registration_type", choices=["rigid", "affine", "translation"], default="rigid",
                        help="Transform family to optimize.")
-    basic.add_argument("--similarity_metric", choices=["correlation", "mi"], default="correlation",
+    basic.add_argument("--similarity_metric", choices=["correlation", "mi"], default="mi",
                        help="Similarity metric: Pearson correlation or Mattes mutual information.")
+    basic.add_argument(
+        "--registration_strategy",
+        choices=["accurate", "medium", "fast"],
+        default="accurate",
+        help=(
+            "Speed/accuracy preset. 'accurate' uses all voxels; 'medium'/'fast' use random metric sampling."
+        ),
+    )
+    basic.add_argument(
+        "--metric_sampling_seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional integer seed for deterministic random metric sampling (only relevant for 'medium'/'fast')."
+        ),
+    )
     io = p.add_argument_group("Transforms I/O")
     io.add_argument("--transform",
                     help="Where to save the fitted transform (.tfm), or load from when --apply_only is set.")
     io.add_argument("--apply_only", action="store_true",
                     help="Skip optimization and only apply the transform given by --transform.")
     perf = p.add_argument_group("Performance & logging")
-    perf.add_argument("--use_gpu", action="store_true", help="Enable faster sampling-based settings when available.")
     perf.add_argument("--verbose", action="store_true", help="Print metric values and detailed status messages.")
     perf.add_argument("--save_dummy_ref", action="store_true",
                       help="Save zeroed fixed/moving reference images next to the transform for later reversal.")
@@ -2580,7 +3037,10 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             fixed_path=a.fixed, moving_path=a.moving, output_path=a.output,
             transform_path=a.transform, apply_only=a.apply_only,
             registration_type=a.registration_type, similarity_metric=a.similarity_metric,
-            use_gpu=a.use_gpu, save_dummy_ref=a.save_dummy_ref, verbose=a.verbose,
+            registration_strategy=a.registration_strategy,
+            metric_sampling_seed=a.metric_sampling_seed,
+            save_dummy_ref=a.save_dummy_ref,
+            verbose=a.verbose,
         )
     p.set_defaults(func=_run_register)
 
@@ -2612,21 +3072,17 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--input", required=True, help="Input NIfTI to skull-strip.")
     p.add_argument("--output", help="Optional betted output path; omit to only save a mask.")
     p.add_argument("--mask", help="Optional mask output path.")
-    p.add_argument("--mode", default="accurate", help="HD-BET mode: 'accurate' (default) or 'fast'.")
-    p.add_argument("--device", default="cpu", help="Target device (e.g., cpu, cuda:0).")
-    p.add_argument("--tta", type=int, default=0, help="Test-time augmentation level.")
-    p.add_argument("--pp", type=int, default=1, help="Post-processing level.")
-    p.add_argument("--overwrite_existing", type=int, default=0, help="Overwrite existing outputs (0/1).")
+    p.add_argument("--device", default="cpu", help="Target device (e.g., cpu, cuda).")
+    p.add_argument("--enable_tta", action="store_true", help="Enable HD-BET test-time augmentation (TTA). Slower; may improve masks.")
+    p.add_argument("--verbose", action="store_true", help="Print HD-BET CLI output.")
     def _run_hd_bet_cli(a):
         run_hd_bet(
             input_path=a.input,
             output_path=a.output,
             mask_path=a.mask,
-            mode=a.mode,
             device=a.device,
-            tta=a.tta,
-            pp=a.pp,
-            overwrite_existing=a.overwrite_existing,
+            disable_tta=not a.enable_tta,
+            verbose=a.verbose,
         )
     p.set_defaults(func=_run_hd_bet_cli)
 

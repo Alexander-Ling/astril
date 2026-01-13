@@ -10,7 +10,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.6.58"
+version = "0.6.99"
 description = "Segmentation training project. Heavily aided by ChatGPT."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -28,7 +28,8 @@ dependencies = [
     "xlsxwriter",
     "requests>=2.28",
     "tqdm>=4.65",
-    "platformdirs>=4"
+    "platformdirs>=4",
+    "packaging>=21.0"
 ]
 
 [project.scripts]
@@ -57,6 +58,6 @@ include-package-data = true
 
 [project.optional-dependencies]
 preprocessing = [
-    "hd-bet>=1.0.8",
+    "hd-bet>=2.0.1,<3",
     "dicom2nifti>=2.4.7"
 ]
