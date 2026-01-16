@@ -8,6 +8,7 @@ Description: Full MRI preprocessing pipeline for brain scans (T1c, T1n, T2f, T2w
 import os
 import sys
 import argparse
+import copy
 import tempfile
 import shutil
 import json
@@ -95,8 +96,11 @@ def run_preprocessing_pipeline(
     from astril.preprocessing_utils import (
         get_nifti_ndim,
         apply_mask_anydim,
+        apply_mask_anydim_sitk,
         normalize_masked_anydim,
         ensure_hd_bet_installed,
+        find_sidecars_for_nifti,
+        copy_sidecars_for_output,
     )
 
     from astril.preprocess import (
@@ -106,6 +110,7 @@ def run_preprocessing_pipeline(
         normalize_masked_image,
         resize_mri,
         match_direction_matrices,
+        inverse_transform_image,
     )
 
     # ---- Helper function to verify that derived sequences retain dimensions/affine of parent sequences ---
@@ -173,6 +178,18 @@ def run_preprocessing_pipeline(
     # Keep working paths for each stage
     reg_paths: dict[str, str] = {}
 
+    # Track which inputs are 4D so we can treat them differently
+    ndim_by_label: dict[str, int] = {}
+    for lbl, pth in scans.items():
+        ndim, _ = get_nifti_ndim(pth)
+        ndim_by_label[lbl] = int(ndim)
+
+    fourd_labels = [lbl for lbl, nd in ndim_by_label.items() if nd == 4]
+    threed_labels = [lbl for lbl, nd in ndim_by_label.items() if nd == 3]
+
+    if verbose and fourd_labels:
+        print(f"[Info] Detected 4D scans (will be kept UNREGISTERED; skull-strip only): {', '.join(fourd_labels)}")
+
     # ---- Step 1: register everything to anchor space ----
     if verbose:
         print(f"[Step 1] Register all scans to anchor '{anchor_label}'")
@@ -194,6 +211,10 @@ def run_preprocessing_pipeline(
         ndim, shape = get_nifti_ndim(src)
         tfm = os.path.join(temp_dir, f"{lbl}_to_{anchor_label}.tfm")
 
+        # Note: 4D scans are allowed as family parents so we can estimate a transform from the 4D series
+        # to the anchor (typically from a representative frame). However, we do not carry forward a registered
+        # 4D volume in this pipeline; 4D outputs remain in native space and are skull-stripped only later.
+
         if verbose:
             print(f"Registering {lbl} to {anchor_label}...")
 
@@ -214,7 +235,7 @@ def run_preprocessing_pipeline(
             reg_paths[lbl] = out_reg
 
         elif ndim == 4:
-            # 4D: estimate transform from a single frame (default frame 0) and apply to all frames in-memory
+            # 4D: estimate transform from a single frame (default frame 0). We do NOT keep a registered 4D output.
             out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
             register_images(
                 fixed_path=anchor_path,
@@ -229,7 +250,19 @@ def run_preprocessing_pipeline(
                 moving_frame_index=0,
                 debug=debug,
             )
-            reg_paths[lbl] = out_reg
+            # Discard the registered 4D output (we only keep the transform + dummy refs).
+            if not debug:
+                try:
+                    if os.path.exists(out_reg):
+                        os.remove(out_reg)
+                    # Also remove any incidental sidecars next to the temp registered file
+                    out_base = out_reg[:-7] if out_reg.lower().endswith(".nii.gz") else os.path.splitext(out_reg)[0]
+                    for _ext in (".json", ".bval", ".bvec", ".nii.json"):
+                        _p = out_base + _ext
+                        if os.path.exists(_p):
+                            os.remove(_p)
+                except Exception:
+                    pass
 
         else:
             raise ValueError(f"Unsupported NIfTI dimensionality for label '{lbl}': ndim={ndim} path={src}")
@@ -282,19 +315,11 @@ def run_preprocessing_pipeline(
             reg_paths[lbl] = out_reg
 
         elif ndim == 4:
-            # 4D: apply the existing transform in-memory to all frames in a single call
-            out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
-            register_images(
-                fixed_path=anchor_path,
-                moving_path=src,
-                output_path=out_reg,
-                transform_path=tfm_path,
-                apply_only=True,
-                save_dummy_ref=False,
-                verbose=False,
-                debug=debug,
-            )
-            reg_paths[lbl] = out_reg
+            # Desired behavior: 4D scans are NEVER registered/resampled in this pipeline.
+            # They remain in native space and are skull-stripped only in Step 4b.
+            # We still record provenance that this scan would share the parent's transform conceptually.
+            if verbose:
+                print(f"  [skip] {lbl} is 4D; keeping native (will output *_unregistered) and not applying parent transform.")
 
         else:
             raise ValueError(f"Unsupported NIfTI dimensionality for label '{lbl}': ndim={ndim} path={src}")
@@ -304,6 +329,7 @@ def run_preprocessing_pipeline(
             **parent_info,
             "applied_from_parent": parent_label,
             "estimated_from": "frame0" if ndim == 4 else "volume",
+            "skipped_output": True if ndim == 4 else False,
         }
 
     # ---- Step 1: register everything to anchor space ----
@@ -387,6 +413,9 @@ def run_preprocessing_pipeline(
         if verbose:
             print("[Step 2] Co-register anchor space to provided reference and apply to all scans")
 
+        # Apply co-registration ONLY to 3D scans
+        # 4D scans are kept in their native space and handled later (skull-strip only).
+
         coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
         anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
 
@@ -418,6 +447,15 @@ def run_preprocessing_pipeline(
         # Apply to all registered scans (including anchor)
         new_reg_paths: dict[str, str] = {}
         for lbl, src_reg in reg_paths.items():
+
+            # Hard guard: never co-register 4D scans.
+            # (They should not be in reg_paths, but this prevents accidental resampling if they are.)
+            if ndim_by_label.get(lbl, 3) == 4:
+                if verbose:
+                    print(f"  [skip] {lbl} is 4D; not applying co-registration transform.")
+                new_reg_paths[lbl] = src_reg
+                continue
+
             ndim, shape = get_nifti_ndim(src_reg)
 
             if ndim == 3:
@@ -432,17 +470,6 @@ def run_preprocessing_pipeline(
                 )
                 new_reg_paths[lbl] = out_coreg
 
-            elif ndim == 4:
-                out_coreg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_coreg.nii.gz")
-                register_images(
-                    co_register_path, src_reg, out_coreg,
-                    transform_path=coreg_tfm_dest,
-                    apply_only=True,
-                    save_dummy_ref=False,
-                    verbose=False,
-                    debug=debug,
-                )
-                new_reg_paths[lbl] = out_coreg
             else:
                 raise ValueError(f"Unexpected ndim={ndim} for registered scan: {src_reg}")
 
@@ -504,16 +531,118 @@ def run_preprocessing_pipeline(
         print("[Step 4] Apply brainmask to all scans...")
 
     brain_paths: dict[str, str] = {}
+    # 3D scans: apply anchor-space mask directly (registered/coregistered already)
     for lbl, src_reg in reg_paths.items():
+        if ndim_by_label.get(lbl, 3) != 3:
+            continue
         out_brain = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain_temp.nii.gz")
         apply_mask_anydim(src_reg, brainmask_temp, out_brain)
         brain_paths[lbl] = out_brain
+
+    # 4D scans: keep native-space; skull-strip only.
+    # We map the anchor brainmask back into each 4D scan's native space using the inverse of a frame-based transform.
+    unregistered_4d_outputs: dict[str, str] = {}
+    for lbl in fourd_labels:
+        src_4d = scans[lbl]
+        if verbose:
+            print(f"[Step 4b] Skull-strip 4D scan (native space, unregistered): {lbl}")
+
+        # Estimate a forward transform (4D->anchor) using register_images, but we do not keep the resampled 4D output.
+        tfm = os.path.join(temp_dir, f"{lbl}_to_{anchor_label}.tfm")
+        tmp_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_TEMP_REG_SHOULD_NOT_USE.nii.gz")
+        register_images(
+            fixed_path=coreg_anchor_path,
+            moving_path=src_4d,
+            output_path=tmp_reg,
+            transform_path=tfm,
+            apply_only=False,
+            similarity_metric=registration_metric,
+            registration_strategy=registration_strategy,
+            save_dummy_ref=True,
+            verbose=False,
+            debug=debug,
+        )
+        # Map the anchor brainmask back into the original 4D grid
+        mask_in_native = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brainmask_native_temp.nii.gz")
+        inverse_transform_image(
+            original_image_path=src_4d,
+            transformed_image_path=brainmask_temp,
+            transform_path=tfm,
+            output_path=mask_in_native,
+            interpolation="nearest",
+            verbose=False,
+        )
+
+        # Apply the native-space mask to the original 4D scan (no registration/resampling of the 4D data)
+        out_unreg = os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nii.gz")
+        apply_mask_anydim(src_4d, mask_in_native, out_unreg)
+
+        # If a sibling 4D NRRD exists (e.g., diffusion NRRD for Slicer), skull-strip it as well.
+        # We do NOT estimate any additional transforms here: we reuse the same native-space mask.
+        # Convention: <stem>.nrrd next to the NIfTI (same basename without .nii/.nii.gz).
+        try:
+            def _strip_nii_ext(p: str) -> str:
+                pl = p.lower()
+                if pl.endswith(".nii.gz"):
+                    return p[:-7]
+                if pl.endswith(".nii"):
+                    return p[:-4]
+                return os.path.splitext(p)[0]
+
+            nrrd_in = _strip_nii_ext(src_4d) + ".nrrd"
+            if os.path.exists(nrrd_in):
+                out_unreg_nrrd = os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nrrd")
+                apply_mask_anydim_sitk(nrrd_in, mask_in_native, out_unreg_nrrd)
+
+                # Carry forward JSON sidecar (if present) for NRRD as well
+                # (NRRD diffusion should already store gradients; JSON is for your Astril provenance/metadata.)
+                sidecars_nrrd = []
+                # Prefer canonical JSON (stem.json) but tolerate legacy stem.nii.json
+                stem = _strip_nii_ext(src_4d)
+                cand1 = stem + ".json"
+                cand2 = stem + ".nii.json"
+                if os.path.exists(cand1):
+                    sidecars_nrrd.append(cand1)
+                elif os.path.exists(cand2):
+                    sidecars_nrrd.append(cand2)
+                if sidecars_nrrd:
+                    copy_sidecars_for_output(sidecars_nrrd, src_4d, out_unreg_nrrd, dry_run=False)
+
+                unregistered_4d_outputs[f"{lbl}.nrrd"] = out_unreg_nrrd
+        except Exception as e:
+            if verbose:
+                print(f"[Warning] Failed to skull-strip NRRD sibling for {lbl}: {e}")
+
+        # Carry forward sidecars:
+        # - Always copy JSON
+        # - Only copy bval/bvec for *base* DWI
+        sidecars = find_sidecars_for_nifti(src_4d)
+        keep = []
+        for sp in sidecars:
+            sp_l = sp.lower()
+            if sp_l.endswith(".json"):
+                keep.append(sp)
+            elif (lbl.upper() == "DWI") and (sp_l.endswith(".bval") or sp_l.endswith(".bvec")):
+                keep.append(sp)
+        copy_sidecars_for_output(keep, src_4d, out_unreg, dry_run=False)
+
+        unregistered_4d_outputs[lbl] = out_unreg
+
+        # Cleanup the temporary registered 4D output unless debugging
+        if (not debug) and os.path.exists(tmp_reg):
+            try:
+                os.remove(tmp_reg)
+            except Exception:
+                pass
 
     # Optionally save skull-containing (registered/coregistered) scans
     if save_scans_with_skulls:
         skull_dir = os.path.join(output_dir, "with_skulls")
         os.makedirs(skull_dir, exist_ok=True)
         for lbl, src_reg in reg_paths.items():
+            # Avoid writing 4D skull volumes (they should not be registered outputs in this pipeline).
+            if ndim_by_label.get(lbl, 3) == 4:
+                continue
             shutil.copy(src_reg, os.path.join(skull_dir, f"{basename_prefix}_{lbl}_with_skull.nii.gz"))
 
     # ---- Step 5: normalize masked scans ----
@@ -521,6 +650,7 @@ def run_preprocessing_pipeline(
         print("[Step 5] Normalize masked scans...")
 
     norm_paths: dict[str, str] = {}
+    # 3D only: 4D scans are intentionally not normalized
     for lbl, src_brain in brain_paths.items():
         out_norm = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain_norm_temp.nii.gz")
         normalize_masked_anydim(src_brain, brainmask_temp, out_norm)
@@ -530,19 +660,50 @@ def run_preprocessing_pipeline(
     if verbose:
         print("[Step 6] Resize scans to final dimensions/voxels...")
 
+    # 3D only: 4D scans are intentionally not resized
+
     final_brain_paths: dict[str, str] = {}
     final_norm_paths: dict[str, str] = {}
     # Save final brainmask (resized consistently with outputs)
     brainmask_out = os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz")
     resize_mri(brainmask_temp, brainmask_out, final_dims, final_voxels, interp="nearest")
 
-    for lbl in scans.keys():
+    for lbl in threed_labels:
         out_brain = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain.nii.gz")
         out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain_norm.nii.gz")
         resize_mri(brain_paths[lbl], out_brain, final_dims, final_voxels, interp="linear")
         resize_mri(norm_paths[lbl], out_norm, final_dims, final_voxels, interp="linear")
         final_brain_paths[lbl] = out_brain
         final_norm_paths[lbl] = out_norm
+
+        # Carry forward JSON sidecar from the original acquisition and annotate that it is original-acquisition metadata
+        try:
+            src_orig = scans[lbl]
+            sidecars = find_sidecars_for_nifti(src_orig)
+            jsons = [sp for sp in sidecars if sp.lower().endswith(".json")]
+            copied = copy_sidecars_for_output(jsons, src_orig, out_brain, dry_run=False)
+            copied_norm = copy_sidecars_for_output(jsons, src_orig, out_norm, dry_run=False)
+            # Stamp Astril.originalAcquisition so users know SliceThickness/etc refer to original acquisition.
+            for cp in (copied + copied_norm):
+                if not cp.lower().endswith(".json"):
+                    continue
+                try:
+                    with open(cp, "r", encoding="utf-8") as fh:
+                        meta = json.load(fh)
+                    astril = meta.get("Astril")
+                    if not isinstance(astril, dict):
+                        astril = {}
+                    astril["originalAcquisition"] = {
+                        "source_nifti": os.path.basename(src_orig),
+                        "note": "This sidecar describes the original acquisition; image may have been registered/resampled/normalized."
+                    }
+                    meta["Astril"] = astril
+                    with open(cp, "w", encoding="utf-8") as fh:
+                        json.dump(meta, fh, indent=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Save transform record for each label
         record_path = os.path.join(output_dir, f"{basename_prefix}_{lbl}_transform_record.json")

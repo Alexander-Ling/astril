@@ -1900,7 +1900,13 @@ def _nii_stem(p: str) -> str:
 
 def _merge_and_write_json_sidecar(nifti_path: str, dynamic_info: Dict[str, Any], *, strict_deid: bool = True) -> None:
     """If a dcm2niix JSON exists next to nifti_path, load it, scrub PHI,
-    then merge in dynamic_info (which takes precedence) and write back."""
+    then merge in dynamic_info and write back.
+
+    Notes
+    -----
+    We intentionally namespace Astril-specific fields under a single top-level key
+    to avoid colliding with existing (or future) dcm2niix/BIDS-style keys.
+    """
     base = _nii_stem(nifti_path)
     src_json = base + ".json"
     merged: Dict[str, Any] = {}
@@ -1913,16 +1919,22 @@ def _merge_and_write_json_sidecar(nifti_path: str, dynamic_info: Dict[str, Any],
                 merged.update(dcm2)
         except Exception:
             pass
-    # dynamic info is already PHI-scrubbed and should override
-    if isinstance(dynamic_info, dict):
-        merged.update(dynamic_info)
+    # Namespace Astril-specific metadata to avoid polluting the top-level JSON
+    # (and to reduce the chance of schema/tool conflicts).
+    if isinstance(dynamic_info, dict) and dynamic_info:
+        astril = merged.get("Astril")
+        if not isinstance(astril, dict):
+            astril = {}
+        # dynamic_info is already PHI-scrubbed; keep it under the namespace.
+        astril.update(dynamic_info)
+        merged["Astril"] = astril
     # record deid mode
     merged.setdefault("deidentification", {"strict": bool(strict_deid)})
     try:
         write_json_sidecar(nifti_path, merged)
     except Exception:
-        # last resort: write the dynamic_info only
-        write_json_sidecar(nifti_path, dynamic_info)
+        # last resort: write a minimal sidecar containing only the Astril namespace
+        write_json_sidecar(nifti_path, {"Astril": dynamic_info or {}, "deidentification": {"strict": bool(strict_deid)}})
 
 def _finalize_output(src_nii: str, dest_nii: str) -> str:
     """
@@ -1935,7 +1947,23 @@ def _finalize_output(src_nii: str, dest_nii: str) -> str:
     def _base(p):
         return p[:-7] if p.lower().endswith(".nii.gz") else os.path.splitext(p)[0]
     sbase, dbase = _base(src_nii), _base(dest_nii)
-    for ext in (".json", ".bval", ".bvec"):
+    
+    def _is_base_dwi_output(path_nii: str) -> bool:
+        """
+        Return True if the destination NIfTI name corresponds to a *base* DWI series.
+        Assumes naming like: {patientID}_{timepoint}_{modality}.nii[.gz]
+        and base diffusion modality exactly "DWI".
+        """
+        stem = os.path.basename(_base(path_nii))
+        # base DWI ends with _DWI (and NOT _DWI_<something>)
+        return stem.upper().endswith("_DWI")
+
+    # Always carry JSON. Only carry diffusion vectors for base DWI outputs.
+    exts = [".json"]
+    if _is_base_dwi_output(dest_nii):
+        exts.extend([".bval", ".bvec"])
+
+    for ext in exts:
         # prefer the canonical sidecar (e.g., tmp.json), but gracefully handle legacy tmp.nii.json
         if ext == ".json":
             primary = sbase + ".json"
@@ -1949,6 +1977,196 @@ def _finalize_output(src_nii: str, dest_nii: str) -> str:
             if os.path.exists(s):
                 shutil.copy2(s, dbase + ext)
     return dest_nii
+
+def export_dwi_nrrd_from_dicoms(
+    dicom_series_dir: str,
+    output_nrrd_path: str,
+    *,
+    verbose: Optional[bool] = None,
+) -> str:
+    """Export a diffusion NRRD (with embedded gradients) using dcm2niix.
+
+    This is primarily intended for 3D Slicer / SlicerDMRI compatibility.
+    We keep the standard NIfTI + .bval/.bvec + .json outputs as well.
+    """
+    if not _which("dcm2niix"):
+        raise RuntimeError("dcm2niix not found on PATH. Please install dcm2niix and ensure it is discoverable.")
+
+    out_dir = os.path.dirname(os.path.abspath(output_nrrd_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Use the desired basename so the produced file matches the NIfTI naming.
+    base = os.path.basename(output_nrrd_path)
+    # strip known extensions for dcm2niix -f
+    for ext in (".nrrd", ".nhdr"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+
+    # Write into a temp dir first (avoid clobbering / partial outputs on failure)
+    tmpdir = tempfile.mkdtemp(prefix="dwi_nrrd_", dir=out_dir)
+    try:
+        cmd = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir, dicom_series_dir]
+        _dbg(verbose, "[export_dwi_nrrd] running:", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"dcm2niix NRRD export failed:\n{err[:400]}")
+        # dcm2niix may emit .nrrd or .nhdr (with separate .raw.gz/.raw)
+        candidates = (
+            glob.glob(os.path.join(tmpdir, base + ".nrrd")) +
+            glob.glob(os.path.join(tmpdir, base + ".nhdr")) +
+            glob.glob(os.path.join(tmpdir, "*.nrrd")) +
+            glob.glob(os.path.join(tmpdir, "*.nhdr"))
+        )
+        if not candidates:
+            raise RuntimeError("dcm2niix NRRD export produced no .nrrd/.nhdr output")
+        produced = candidates[0]
+
+        # Move the header/data pair if needed
+        if produced.lower().endswith(".nhdr"):
+            # Move header and associated data file(s)
+            dest_hdr = output_nrrd_path if output_nrrd_path.lower().endswith(".nhdr") else (os.path.splitext(output_nrrd_path)[0] + ".nhdr")
+            shutil.move(produced, dest_hdr)
+            for p in glob.glob(os.path.join(tmpdir, "*")):
+                if os.path.abspath(p) == os.path.abspath(produced):
+                    continue
+                shutil.move(p, os.path.join(os.path.dirname(dest_hdr), os.path.basename(p)))
+            return dest_hdr
+        else:
+            dest = output_nrrd_path if output_nrrd_path.lower().endswith(".nrrd") else (os.path.splitext(output_nrrd_path)[0] + ".nrrd")
+            shutil.move(produced, dest)
+            for p in glob.glob(os.path.join(tmpdir, "*")):
+                if os.path.abspath(p) == os.path.abspath(produced):
+                    continue
+                dstp = os.path.join(os.path.dirname(dest), os.path.basename(p))
+                if not os.path.exists(dstp):
+                    shutil.move(p, dstp)
+            return dest
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _fsl_sidecar_paths(nifti_path: str) -> tuple[str, str]:
+    """Return (.bval_path, .bvec_path) for a NIfTI path."""
+    base = _nii_stem(nifti_path)
+    return base + ".bval", base + ".bvec"
+
+
+def _read_fsl_bvals(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read().strip().split()
+    return np.array([float(x) for x in txt], dtype=float)
+
+
+def _read_fsl_bvecs(path: str):
+    # FSL bvec is typically 3 rows x N cols, but sometimes N rows x 3.
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append([float(x) for x in line.split()])
+    arr = np.array(rows, dtype=float)
+    if arr.shape[0] == 3:
+        return arr
+    if arr.shape[1] == 3:
+        return arr.T
+    raise ValueError(f"Unrecognized bvec shape {arr.shape} in {path}")
+
+
+def _write_fsl_bvecs(path: str, bvecs_3xN):
+    # Preserve canonical 3-row FSL format
+    with open(path, "w", encoding="utf-8") as f:
+        for r in range(3):
+            f.write(" ".join(f"{float(x):.10g}" for x in bvecs_3xN[r, :]))
+            f.write("\n")
+
+
+def _rotation_from_sitk_transform(tfm):
+    """Extract an orthonormal 3x3 rotation matrix from a SimpleITK transform.
+
+    For affine-like transforms, SimpleITK exposes a 3x3 matrix via GetMatrix().
+    We orthonormalize it (polar decomposition via SVD) to drop any numeric shear/scale.
+    """
+    if not hasattr(tfm, "GetMatrix"):
+        return None
+    mat = tfm.GetMatrix()
+    if mat is None:
+        return None
+    mat = list(mat)
+    if len(mat) != 9:
+        return None
+    A = np.array(mat, dtype=float).reshape(3, 3)
+    # Orthonormalize: R = U V^T
+    U, _, Vt = np.linalg.svd(A)
+    R = U @ Vt
+    # Ensure right-handed
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    return R
+
+
+def update_fsl_vectors_after_transform(
+    src_nifti_path: str,
+    dst_nifti_path: str,
+    transform,
+    *,
+    inverse: bool = False,
+    verbose: Optional[bool] = None,
+) -> dict:
+    """Copy .bval and update (rotate) .bvec to match an applied spatial transform."""
+    src_bval, src_bvec = _fsl_sidecar_paths(src_nifti_path)
+    dst_bval, dst_bvec = _fsl_sidecar_paths(dst_nifti_path)
+    out = {"copied_bval": False, "updated_bvec": False, "reason": ""}
+
+    if not os.path.exists(src_bval) and not os.path.exists(src_bvec):
+        out["reason"] = "no_bval_or_bvec"
+        return out
+
+    # Always copy bvals if present
+    if os.path.exists(src_bval):
+        try:
+            shutil.copy2(src_bval, dst_bval)
+            out["copied_bval"] = True
+        except Exception as e:
+            out["reason"] = f"failed_copy_bval:{type(e).__name__}"
+            _dbg(verbose, "[update_fsl_vectors] WARNING copying bval:", e)
+
+    if not os.path.exists(src_bvec):
+        out["reason"] = out["reason"] or "no_bvec"
+        return out
+
+    R = _rotation_from_sitk_transform(transform)
+    if R is None:
+        out["reason"] = out["reason"] or "transform_no_matrix"
+        return out
+
+    if inverse:
+        R = np.linalg.inv(R)
+
+    try:
+        bvecs = _read_fsl_bvecs(src_bvec)  # 3xN
+        if bvecs.shape[0] != 3:
+            raise ValueError("bvecs not 3xN after parsing")
+        new_bvecs = R @ bvecs
+        _write_fsl_bvecs(dst_bvec, new_bvecs)
+        out["updated_bvec"] = True
+        return out
+    except Exception as e:
+        out["reason"] = f"failed_update_bvec:{type(e).__name__}"
+        _dbg(verbose, "[update_fsl_vectors] WARNING updating bvec:", e)
+        # fallback: copy original bvec without modification
+        try:
+            shutil.copy2(src_bvec, dst_bvec)
+        except Exception:
+            pass
+        return out
 
 def _sanitize_label(lbl: str) -> str:
     if lbl is None: return "Unknown"
@@ -2263,6 +2481,137 @@ def sitk_join_3d_frames_to_4d(frames3d, *, spatial_reference, time_reference):
     out.SetDirection(tuple(d))
 
     return out
+
+def apply_mask_anydim_sitk(input_image_path, mask_path, output_path):
+    """
+    Apply a 3D brain mask to a 3D or 4D image using SimpleITK.
+
+    - Works for NIfTI (.nii/.nii.gz) and NRRD (.nrrd) inputs/outputs.
+    - For 4D images, the mask is applied to every frame (broadcast over frame axis).
+    - For diffusion NRRD (common in Slicer), the data is often stored as a 3D *vector* image
+      (dim=3, components-per-pixel > 1). In that case we preserve the vector structure and
+      copy metadata keys so the result remains diffusion-aware.
+    - Writes output in the format implied by output_path extension.
+    """
+    import SimpleITK as sitk
+    import numpy as np
+
+    # Preserve original pixel type to avoid accidentally changing vector layout on write.
+    img = sitk.ReadImage(str(input_image_path))
+    msk = sitk.ReadImage(str(mask_path))
+
+    if msk.GetDimension() != 3:
+        raise ValueError(f"Mask must be 3D. Got dim={msk.GetDimension()} from {mask_path}")
+
+    img_dim = img.GetDimension()
+    ncomp = int(getattr(img, "GetNumberOfComponentsPerPixel", lambda: 1)())
+    is_vector_3d = (img_dim == 3 and ncomp > 1)
+    orig_pixel_id = img.GetPixelID()
+
+    if img_dim not in (3, 4):
+        raise ValueError(f"Unsupported image dim={img_dim} for {input_image_path}")
+
+    # Compare spatial sizes (SimpleITK uses x,y,z ordering for GetSize()).
+    img_size = img.GetSize()
+    msk_size = msk.GetSize()
+    if img_dim == 3:
+        if tuple(img_size) != tuple(msk_size):
+            raise ValueError(f"Mask size {msk_size} does not match image size {img_size} for {input_image_path}")
+    else:
+        # 4D: first 3 dims must match (x,y,z)
+        if tuple(img_size[:3]) != tuple(msk_size):
+            raise ValueError(f"Mask size {msk_size} does not match image spatial size {img_size[:3]} for {input_image_path}")
+
+    # Build a binary mask image (float32)
+    msk_bin = sitk.Cast(msk > 0, sitk.sitkFloat32)
+
+    def _geom_tuple(im):
+        return (tuple(im.GetSize()), tuple(im.GetSpacing()), tuple(im.GetOrigin()), tuple(im.GetDirection()))
+
+    def _resample_mask_to_ref(mask_img, ref_img):
+        """
+        Resample a 3D scalar mask onto ref_img geometry using nearest neighbor.
+        Ensures exact physical-space match for strict ITK filters.
+        """
+        if mask_img.GetDimension() != 3 or ref_img.GetDimension() != 3:
+            raise ValueError("Mask and reference must be 3D for resampling")
+        # If geometry matches exactly, return as-is
+        if _geom_tuple(mask_img) == _geom_tuple(ref_img):
+            return mask_img
+        res = sitk.Resample(
+            mask_img,
+            ref_img,
+            sitk.Transform(),
+            sitk.sitkNearestNeighbor,
+            0.0,
+            sitk.sitkFloat32,
+        )
+        return res
+
+    # Masking strategy:
+    # - For 3D VECTOR images (common diffusion NRRD): use ITK Multiply(img, scalar_mask)
+    #   to preserve the vector length/components.
+    # - For 3D scalar images: Multiply works fine too.
+    # - For 4D scalar images: SimpleITK arithmetic on 4D can be inconsistent across IO backends,
+    #   so we do a controlled numpy broadcast for 4D only.
+    if img_dim == 3:
+        if is_vector_3d:
+            # Diffusion NRRD in Slicer is often a 3D *vector* image (dim=3, components>1).
+            # SimpleITK MultiplyImageFilter does NOT support vector pixel types in 3D, so we mask
+            # each component as a scalar volume and then Compose back into a vector image.
+
+            # Important: ensure the mask occupies EXACTLY the same physical space as the diffusion NRRD.
+            # Even tiny floating-point differences in spacing/origin/direction can cause ITK to throw.
+            ref_scalar = sitk.VectorIndexSelectionCast(img, 0)  # scalar 3D with the diffusion grid
+            msk_on_ref = _resample_mask_to_ref(msk_bin, ref_scalar)
+
+            masked_components = []
+            for c in range(ncomp):
+                comp = sitk.VectorIndexSelectionCast(img, c)  # scalar 3D
+                comp_f = sitk.Cast(comp, sitk.sitkFloat32)
+                masked_f = sitk.Multiply(comp_f, msk_on_ref)  # scalar×scalar supported (same geometry)
+                masked_components.append(masked_f)
+
+            out_vf = sitk.Compose(masked_components)  # vector float32 (ncomp components)
+            out_img = sitk.Cast(out_vf, orig_pixel_id)
+        else:
+            # Scalar 3D: scalar×scalar
+            # Ensure mask matches image geometry exactly (strict ITK)
+            if _geom_tuple(msk_bin) != _geom_tuple(img):
+                msk_bin = _resample_mask_to_ref(msk_bin, img)
+            img_f = sitk.Cast(img, sitk.sitkFloat32) if img.GetPixelID() != sitk.sitkFloat32 else img
+            out_f = sitk.Multiply(img_f, msk_bin)
+            out_img = sitk.Cast(out_f, orig_pixel_id)
+    else:
+        # 4D scalar: do numpy masking (t,z,y,x) with broadcast
+        img_arr = sitk.GetArrayFromImage(img)
+        # For 4D scalar, SimpleITK doesn't enforce physical space in the numpy route,
+        # but we still want the mask sampled in the 4D image's spatial grid.
+        # Use the first timepoint as reference to resample the mask.
+        try:
+            # Extract a 3D reference by taking the first frame via numpy and reconstructing,
+            # then CopyInformation from the 4D image's spatial metadata (best-effort).
+            # If your 4D images are true 4D in ITK, this is usually fine as-is.
+            pass
+        except Exception:
+            pass
+        msk_arr = sitk.GetArrayFromImage(msk_bin) > 0  # (z,y,x)
+        if img_arr.ndim != 4:
+            raise ValueError(f"Expected 4D array (t,z,y,x) for {input_image_path}, got shape {img_arr.shape}")
+        out_arr = np.where(msk_arr[None, ...], img_arr, 0)
+        out_img = sitk.GetImageFromArray(out_arr, isVector=False)
+        out_img.CopyInformation(img)
+
+    # Copy all metadata keys so diffusion NRRD remains diffusion-aware (gradients, modality, etc.).
+    # Multiply should preserve metadata in most cases, but be explicit.
+    try:
+        for k in img.GetMetaDataKeys():
+            out_img.SetMetaData(k, img.GetMetaData(k))
+    except Exception:
+        pass
+
+    sitk.WriteImage(out_img, str(output_path))
+    return output_path
 
 def apply_mask_anydim(input_image_path, mask_path, output_path):
     import nibabel as nib

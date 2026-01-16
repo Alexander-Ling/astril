@@ -782,6 +782,21 @@ def register_images(
             if verbose:
                 print(f"Dummy reference saved to: {path}")
 
+    # If this looks like diffusion data (FSL .bval/.bvec next to moving_path),
+    # copy/update sidecars so downstream tools see the correct gradient table after resampling.
+    try:
+        from .preprocessing_utils import update_fsl_vectors_after_transform
+        update_fsl_vectors_after_transform(
+            str(moving_path),
+            str(output_path),
+            transform,
+            inverse=False,
+            verbose=verbose,
+        )
+    except Exception:
+        # Non-fatal: image resampling succeeded, but sidecar update may not apply.
+        pass
+
     if verbose:
         print(f"Output saved to: {output_path}")
         if transform_path and not apply_only:
@@ -891,6 +906,20 @@ def inverse_transform_image(
 
         out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img)
         sitk.WriteImage(out4d, str(output_path))
+
+    # If diffusion sidecars exist next to the transformed image, rotate/copy them
+    # to remain consistent with the inverse-resampled output.
+    try:
+        from .preprocessing_utils import update_fsl_vectors_after_transform
+        update_fsl_vectors_after_transform(
+            str(transformed_image_path),
+            str(output_path),
+            inverse_transform,
+            inverse=False,
+            verbose=verbose,
+        )
+    except Exception:
+        pass
 
     if verbose:
         print(f"Inverse-transformed image saved to: {output_path}")
@@ -2222,15 +2251,102 @@ def plan_dicom_to_nifti_conversion(
         except Exception:
             pass
 
+        def _is_primary_4d_label(lbl: str) -> bool:
+            base = str(lbl or "").split("(", 1)[0].strip().upper()
+            return base in {"DWI", "PERFUSION"}
+
+        def _primary_4d_source_score(r: _pd.Series, lbl: str) -> float:
+            """Heuristic score to prefer the *acquisition container* for primary 4D families.
+
+            This is intentionally label-aware and vendor-tolerant:
+            it prefers multi-volume evidence / Siemens MOSAIC / ORIGINAL over derived maps.
+            """
+            base = str(lbl or "").split("(", 1)[0].strip().upper()
+
+            # Pull a few text fields (robust to NaN / lists serialized as strings)
+            def _s(x):
+                return str(x or "").strip().upper()
+
+            img_type = _s(r.get("image_type", ""))
+            seq_name = _s(r.get("sequence_name", ""))
+            ser_desc = _s(r.get("series_description", ""))
+            prot     = _s(r.get("protocol_name", ""))
+            tokens   = " ".join([img_type, seq_name, ser_desc, prot])
+
+            score = 0.0
+
+            # Strong positives
+            if "MOSAIC" in img_type:
+                score += 8.0
+            if "ORIGINAL" in img_type:
+                score += 4.0
+            if _s(r.get("primary_secondary", "")) == "PRIMARY":
+                score += 2.0
+            # num_frames is populated for Enhanced multiframe (true 4D) when available
+            try:
+                nf = float(r.get("num_frames") or 0)
+            except Exception:
+                nf = 0.0
+            if nf and nf > 1:
+                score += 6.0
+
+            # Strong negatives (derived maps should not win as the family "primary")
+            if "DERIVED" in img_type:
+                score -= 6.0
+            if bool(r.get("is_derived", False)):
+                score -= 2.0
+
+            if base == "DWI":
+                bad = ["ADC", "TRACE", "TRACEW", "FA", "MD", "RD", "AD", "EXP", "COLFA", "TENSOR", "MAP"]
+            else:  # PERFUSION
+                bad = [
+                    "CBV", "CBF", "MTT", "TTP", "TMAX", "KTRANS", "KEP", "VP", "VE",
+                    "AUC", "MEAN", "MAX", "PARAM", "MAP", "LEAK", "LEAKAGE"
+                ]
+            if any(b in tokens for b in bad):
+                score -= 10.0
+
+            # Mild positive: looks like a diffusion/perfusion acquisition string
+            if base == "DWI" and any(k in tokens for k in ["DTI", "DWI", "DIFF", "EP_B", "EPI"]):
+                score += 1.5
+            if base == "PERFUSION" and any(k in tokens for k in ["PERF", "PWI", "DSC", "DCE", "ASL", "PCASL"]):
+                score += 1.5
+
+            return score
+
         def _select_best(group: _pd.DataFrame) -> int | None:
             g = group.copy()
             # keep only eligible rows within this label group
             g = g[eligible.loc[g.index]]
-
             if g.empty:
                 return None
 
-            # prefer PRIMARY & not derived → AX plane → max slices → max confidence → earliest acq_dt
+            # Label-aware selection for primary 4D families (DWI, Perfusion): prefer the acquisition container.
+            try:
+                grp_label = str(g.iloc[0].get(label_col, "") if label_col else "")
+            except Exception:
+                grp_label = ""
+
+            if label_col and _is_primary_4d_label(grp_label):
+                base = grp_label.split("(", 1)[0].strip().upper()
+
+                # Prefer the base label (no parentheses) when present: e.g., DWI over DWI(ADC)
+                no_paren = ~g[label_col].astype(str).str.contains(r"\(")
+                if no_paren.any():
+                    g = g[no_paren]
+
+                # Add a source-likeness score to drive selection.
+                g = g.assign(
+                    _score=g.apply(lambda r: _primary_4d_source_score(r, r.get(label_col, "")), axis=1),
+                    _nf=_pd.to_numeric(g.get("num_frames", _pd.Series(index=g.index)), errors="coerce").fillna(0).astype(float),
+                    _ns=_pd.to_numeric(g.get("n_slices", _pd.Series(index=g.index)), errors="coerce").fillna(-1).astype(float),
+                    _conf=_pd.to_numeric(g.get("confidence", _pd.Series(index=g.index)), errors="coerce").fillna(0.0).astype(float),
+                    _acq=g.get("acq_dt", _pd.Series(index=g.index)).map(lambda x: _pd.to_datetime(x) if pd.notna(x) else pd.NaT),
+                ).sort_values(by=["_score", "_nf", "_conf", "_ns", "_acq"], ascending=[False, False, False, False, True])
+
+                return None if g.empty else int(g.index[0])
+
+            # Generic selection (other families): prefer PRIMARY & not derived → AX plane → max confidence → max slices → earliest acq_dt
             if "primary_secondary" in g.columns:
                 pri = g["primary_secondary"].fillna("").str.upper().eq("PRIMARY")
                 if pri.any():
@@ -2249,6 +2365,7 @@ def plan_dicom_to_nifti_conversion(
             ).sort_values(by=["_conf","_ns","_acq"], ascending=[False, False, True])
 
             return None if g.empty else int(g.index[0])
+
 
         if label_col:
             chosen = []
@@ -2676,6 +2793,7 @@ def convert_dicom_plan(
         "Action","GeneratorKey","PrimaryLabel","DerivedLabel",
         "PrimarySeriesIdentifier","PrimarySeriesPath",
         "folder","proposed_nifti_path","status","message","nii_path",
+        "nrrd_path","nrrd_error",
     ]
     _log_fh = open(_log_path, "a", newline="", encoding="utf-8")
     _log_writer = _csv.writer(_log_fh, delimiter=_delim)
@@ -2706,8 +2824,68 @@ def convert_dicom_plan(
                 rec.get("status", ""),
                 rec.get("message", ""),
                 rec.get("nii_path", ""),
+                rec.get("nrrd_path", ""),
+                rec.get("nrrd_error", ""),
             ])
             _log_fh.flush()
+
+    # ---------- expected-4D validation helpers ----------
+    def _base_label(lbl: str) -> str:
+        s = str(lbl or '').strip()
+        return s.split('(', 1)[0].strip().upper()
+
+    _EXPECTED_4D_BASE_LABELS = {"DWI", "PERFUSION"}
+
+    def _is_expected_4d_primary_row(row: pd.Series, rec: dict | None = None) -> bool:
+        """True only for *primary* members of families that should be 4D (e.g., DWI, Perfusion).
+
+        - Parent label must be one of _EXPECTED_4D_BASE_LABELS.
+        - Row must not be marked derived (vendor-derived maps should still be convertible as 3D).
+        """
+        lbl = _base_label(row.get('final_label', ''))
+        if lbl not in _EXPECTED_4D_BASE_LABELS:
+            return False
+        # Treat Action=DERIVE as derived by definition; otherwise consult plan's is_derived when present.
+        action = str((rec or {}).get('Action', row.get('Action', 'CONVERT'))).strip().upper()
+        if action == 'DERIVE':
+            return False
+        is_derived = False
+        if 'is_derived' in row.index:
+            is_derived = _to_bool(row.get('is_derived', False))
+        else:
+            # Fallback: labels with parentheses (e.g., DWI(ADC), Perfusion(CBV)) are treated as derived.
+            is_derived = '(' in str(row.get('final_label', '') or '')
+        return (not is_derived)
+
+    def _delete_nifti_and_sidecars(nii_path: str):
+        """Best-effort cleanup of a NIfTI output and its common sidecars."""
+        import os
+        if not nii_path:
+            return
+        candidates = [nii_path]
+        base = nii_path
+        if base.lower().endswith('.nii.gz'):
+            stem = base[:-7]
+        else:
+            stem = os.path.splitext(base)[0]
+        candidates += [stem + ext for ext in ('.json', '.bval', '.bvec')]
+        for p in candidates:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    def _validate_expected_4d(nii_path: str) -> tuple[bool, str]:
+        """Return (ok, message). ok=True iff the image is actually 4D."""
+        try:
+            from .preprocessing_utils import get_nifti_ndim
+            ndim, shape = get_nifti_ndim(nii_path)
+            if int(ndim) == 4 and len(shape) == 4 and int(shape[3]) > 1:
+                return True, f"ndim={ndim}, shape={shape}"
+            return False, f"expected 4D but got ndim={ndim}, shape={shape}"
+        except Exception as e:
+            return False, f"unable to validate ndim: {type(e).__name__}: {e}"
 
     # ---------- worker ----------
     def _convert_row(row: pd.Series) -> dict:
@@ -2760,8 +2938,42 @@ def convert_dicom_plan(
                     dicom_series_dir=series_dir,
                     output_path=out_path,
                 )
+
+                # For certain *primary* sequences (e.g., DWI/Perfusion), the converted file must be 4D.
+                # If it is not, treat this conversion as skipped (remove outputs) so we don't
+                # accidentally derive from an incomplete primary.
+                if _is_expected_4d_primary_row(row, rec):
+                    ok4d, msg = _validate_expected_4d(written)
+                    if not ok4d:
+                        _delete_nifti_and_sidecars(written)
+                        rec["status"] = "skipped_expected_4d_not_4d"
+                        rec["message"] = msg
+                        rec["nii_path"] = ""
+                        return rec
+
                 rec["status"] = "ok"
                 rec["nii_path"] = written
+
+                # Also export diffusion NRRD for Slicer compatibility (parent diffusion only).
+                # We keep NIfTI + sidecars as primary outputs.
+                try:
+                    lbl_raw = (rec.get("final_label") or rec.get("PrimaryLabel") or "").strip()
+                    lbl = lbl_raw.upper()
+                    # Accept common diffusion parent labels
+                    is_parent_diffusion = (lbl == "DWI") or lbl.startswith("DWI_") or (lbl == "DTI")
+                    is_derived = bool((rec.get("DerivedLabel") or "").strip()) or (str(rec.get("Action","")).upper() == "DERIVE")
+
+                    if is_parent_diffusion and not is_derived:
+                        from .preprocessing_utils import export_dwi_nrrd_from_dicoms
+                        if out_path.lower().endswith(".nii.gz"):
+                            stem = out_path[:-7]
+                        else:
+                            stem = os.path.splitext(out_path)[0]
+                        nrrd_path = stem + ".nrrd"
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
+                except Exception as e:
+                    rec["nrrd_path"] = ""
+                    rec["nrrd_error"] = f"{type(e).__name__}: {e}"
             elif action == "DERIVE":
                 from .preprocessing_utils import run_derived_generator
                 generator_key = rec.get("GeneratorKey", "")
@@ -2845,6 +3057,20 @@ def convert_dicom_plan(
                 )
                 rec["status"] = "ok"
                 rec["nii_path"] = written
+
+                # Optional: also export a diffusion NRRD for DWI parent series to improve
+                # 3D Slicer / SlicerDMRI compatibility (embedded gradients).
+                # We intentionally keep the standard NIfTI + sidecars as the primary output.
+                try:
+                    lbl = str(rec.get("final_label") or rec.get("Label") or rec.get("PrimaryLabel") or "").strip().upper()
+                    if lbl == "DWI":
+                        from .preprocessing_utils import export_dwi_nrrd_from_dicoms
+                        stem = out_path[:-7] if out_path.lower().endswith(".nii.gz") else os.path.splitext(out_path)[0]
+                        nrrd_path = stem + ".nrrd"
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
+                except Exception as e:
+                    rec["nrrd_path"] = ""
+                    rec["nrrd_error"] = f"{type(e).__name__}: {e}"
             else:
                 rec["status"] = "skipped"
                 rec["message"] = f"Unknown Action '{action}'"
@@ -2854,30 +3080,108 @@ def convert_dicom_plan(
         return rec
 
     # ---------- execute ----------
-    jobs = [r for _, r in todo.iterrows()]
+    # We run conversions in two phases so that DERIVE jobs never run off a primary
+    # 4D sequence that converted incorrectly (e.g., DWI/Perfusion that ended up 3D).
+    # Vendor-provided derived series are still converted normally (they are Action=CONVERT).
+
+    def _action_of(r: "pd.Series") -> str:
+        return str(r.get("Action", "CONVERT")).upper().strip() or "CONVERT"
+
+    convert_jobs = [r for _, r in todo.iterrows() if _action_of(r) == "CONVERT"]
+    derive_jobs  = [r for _, r in todo.iterrows() if _action_of(r) == "DERIVE"]
+
+    # Track which primary 4D labels were successfully converted per exam.
+    # Keyed by (ExamDirectory, BASE_LABEL) where BASE_LABEL is e.g. 'DWI' or 'PERFUSION'.
+    primary4d_ok: dict[tuple[str, str], bool] = {}
+
     records = []
     try:
-        if n_workers == 1:
-            for r in _progress(jobs, total=len(jobs), desc="Converting", unit="series", enable=show_progress):
-                rec = _convert_row(r)
-                records.append(rec)
-                _stream_log_row(rec)
-        else:
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futs = [pool.submit(_convert_row, r) for r in jobs]
-                for ft in _progress(as_completed(futs), total=len(futs), desc="Converting", unit="series", enable=show_progress):
-                    try:
-                        rec = ft.result()
-                    except Exception as e:
-                        rec = {"status": "exception", "message": f"Future failed: {e}"}
+        # ---- Phase 1: CONVERT (includes vendor-derived series) ----
+        if convert_jobs:
+            def _update_primary4d_ok(r: "pd.Series", rec: dict):
+                # Only track *primary* members of expected-4D families (DWI/Perfusion).
+                try:
+                    if _is_expected_4d_primary_row(r, rec):
+                        key = (str(rec.get("ExamDirectory", "")), _base_label(rec.get("final_label", "")))
+                        if rec.get("status") == "ok":
+                            primary4d_ok[key] = True
+                        else:
+                            primary4d_ok.setdefault(key, False)
+                except Exception:
+                    pass
+
+            if n_workers == 1:
+                for r in _progress(convert_jobs, total=len(convert_jobs), desc="Converting", unit="series", enable=show_progress):
+                    rec = _convert_row(r)
                     records.append(rec)
                     _stream_log_row(rec)
+                    _update_primary4d_ok(r, rec)
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    ft_to_row = {pool.submit(_convert_row, r): r for r in convert_jobs}
+                    for ft in _progress(as_completed(ft_to_row), total=len(ft_to_row), desc="Converting", unit="series", enable=show_progress):
+                        r = ft_to_row.get(ft)
+                        try:
+                            rec = ft.result()
+                        except Exception as e:
+                            rec = {"status": "exception", "message": f"Future failed: {e}"}
+                        records.append(rec)
+                        _stream_log_row(rec)
+                        if r is not None:
+                            _update_primary4d_ok(r, rec)
+
+        # ---- Phase 2: DERIVE (skip if primary 4D conversion was invalid) ----
+        if derive_jobs:
+            def _derive_wrapper(r: "pd.Series") -> dict:
+                prim_lbl = str(r.get("PrimaryLabel", "")).strip() or str(r.get("final_label", "")).strip()
+                exam_dir = str(r.get("ExamDirectory", ""))
+                base = _base_label(prim_lbl)
+                if base in {"DWI", "PERFUSION"}:
+                    ok = primary4d_ok.get((exam_dir, base), None)
+                    if ok is False:
+                        # Explicitly block derivation from an invalid 4D primary conversion.
+                        return {
+                            "Directory": r.get("Directory", ""),
+                            "ExamDirectory": exam_dir,
+                            "series_identifier": r.get("series_identifier", ""),
+                            "final_label": r.get("final_label", ""),
+                            "Action": "DERIVE",
+                            "GeneratorKey": r.get("GeneratorKey", ""),
+                            "PrimaryLabel": prim_lbl,
+                            "DerivedLabel": r.get("DerivedLabel", ""),
+                            "PrimarySeriesIdentifier": r.get("PrimarySeriesIdentifier", ""),
+                            "PrimarySeriesPath": r.get("PrimarySeriesPath", ""),
+                            "folder": str(r.get("folder", "")),
+                            "proposed_nifti_path": str(r.get("proposed_nifti_path", "")).strip(),
+                            "status": "skipped_invalid_primary",
+                            "message": f"Skipped DERIVE because primary '{base}' converted as non-4D (see prior warning/log for this exam).",
+                            "nii_path": "",
+                            "nrrd_path": "",
+                            "nrrd_error": "",
+                        }
+                return _convert_row(r)
+
+            if n_workers == 1:
+                for r in _progress(derive_jobs, total=len(derive_jobs), desc="Deriving", unit="series", enable=show_progress):
+                    rec = _derive_wrapper(r)
+                    records.append(rec)
+                    _stream_log_row(rec)
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futs = [pool.submit(_derive_wrapper, r) for r in derive_jobs]
+                    for ft in _progress(as_completed(futs), total=len(futs), desc="Deriving", unit="series", enable=show_progress):
+                        try:
+                            rec = ft.result()
+                        except Exception as e:
+                            rec = {"status": "exception", "message": f"Future failed: {e}"}
+                        records.append(rec)
+                        _stream_log_row(rec)
+
     finally:
         try:
             _log_fh.close()
         except Exception:
             pass
-
     # Build pandas result for return value (stream already written to disk)
     log_df = pd.DataFrame.from_records(records)
 
