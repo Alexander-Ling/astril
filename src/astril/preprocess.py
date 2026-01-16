@@ -404,7 +404,7 @@ def match_direction_matrices(input_path, donor_path, output_path):
     input_img = nib.load(input_path)
 
     # Resample to match donor using nearest neighbor (default for labels, safe fallback for others)
-    resampled_img = resample_to_img(input_img, donor_img, interpolation='nearest')
+    resampled_img = resample_to_img(input_img, donor_img, interpolation='nearest', force_resample = True, copy_header = True)
 
     # Preserve data type from original image
     resampled_data = resampled_img.get_fdata().astype(input_img.get_data_dtype())
@@ -479,6 +479,7 @@ def register_images(
     metric_sampling_seed=None,
     verbose=False,
     save_dummy_ref=False,
+    n_workers: int = None,
     *,
     fixed_frame_index: int = 0,
     moving_frame_index: int = 0,
@@ -529,6 +530,8 @@ def register_images(
     save_dummy_ref : bool, default=False
         If True (and transform_path is provided), write de-identified 0-filled dummy references alongside
         the transform, preserving geometry for later apply/reverse steps.
+    n_workers : int, default = None
+        Limits how many CPU threads are used for registration and resampling. Default behavior is to use all available threads.
     fixed_frame_index : int, default=0
         If fixed_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
     moving_frame_index : int, default=0
@@ -546,6 +549,20 @@ def register_images(
 
     # Lightweight dimensionality check (nibabel is OK here; used elsewhere in the package)
     from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
+
+    # ------------------------------------------------------------------
+    # Thread control
+    # ------------------------------------------------------------------
+    # Prefer per-object thread limits to avoid global collisions when running
+    # register_images in parallel. Fall back to a global ITK cap only if the
+    # current SimpleITK build does not expose per-object controls.
+    from .preprocessing_utils import (
+        normalize_n_workers,
+        set_sitk_object_threads,
+        global_sitk_thread_cap,
+        make_sitk_resampler,
+    )
+    n_workers = normalize_n_workers(n_workers)
 
     fixed_ndim, _ = get_nifti_ndim(fixed_path)
     moving_ndim, moving_shape = get_nifti_ndim(moving_path)
@@ -616,6 +633,9 @@ def register_images(
         registration = sitk.ImageRegistrationMethod()
         registration.SetInitialTransform(initial_transform, inPlace=False)
 
+        # Try to cap threads per-object for registration if supported.
+        reg_threads_ok = set_sitk_object_threads(registration, n_workers)
+
         # Metric
         if similarity_metric == "correlation":
             registration.SetMetricAsCorrelation()
@@ -654,7 +674,11 @@ def register_images(
         )
         registration.SetOptimizerScalesFromPhysicalShift()
 
-        transform = registration.Execute(fixed_for_reg, moving_for_reg)
+        # If per-object thread control isn't available for registration, we can
+        # optionally fall back to a global cap (LAST RESORT).
+        use_global_cap = (n_workers is not None and not reg_threads_ok)
+        with global_sitk_thread_cap(n_workers, enabled=use_global_cap, verbose=verbose):
+            transform = registration.Execute(fixed_for_reg, moving_for_reg)
 
         if verbose:
             print(f"Final {similarity_metric} = {registration.GetMetricValue():.4f}")
@@ -669,14 +693,15 @@ def register_images(
     spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
 
     if moving_ndim == 3:
-        registered = sitk.Resample(
-            moving_img,
-            spatial_ref,
-            transform,
-            sitk.sitkLinear,
-            0.0,
-            moving_img.GetPixelID(),
+        # Use ResampleImageFilter so we can cap threads per-object.
+        resampler = make_sitk_resampler(
+            reference_img=spatial_ref,
+            transform=transform,
+            default_value=0.0,
+            pixel_id=moving_img.GetPixelID(),
+            n_workers=n_workers,
         )
+        registered = resampler.Execute(moving_img)
         sitk.WriteImage(registered, str(output_path))
     else:
         # Apply transform to each 3D frame, in memory, then re-stack to 4D.
@@ -685,7 +710,14 @@ def register_images(
         out_frames = []
         for t in range(int(n_frames)):
             frame3d = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, t)
-            reg3d = sitk.Resample(frame3d, spatial_ref, transform, sitk.sitkLinear, 0.0, frame3d.GetPixelID())
+            resampler = make_sitk_resampler(
+                reference_img=spatial_ref,
+                transform=transform,
+                default_value=0.0,
+                pixel_id=frame3d.GetPixelID(),
+                n_workers=n_workers,
+            )
+            reg3d = resampler.Execute(frame3d)
             out_frames.append(reg3d)
 
         out4d = sitk_join_3d_frames_to_4d(

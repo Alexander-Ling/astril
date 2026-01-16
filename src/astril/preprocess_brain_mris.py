@@ -243,6 +243,7 @@ def preprocess_library(
     old_coreg_log: list[str | Path] | None = None,
     dont_coregister: bool = False,
     n_workers: int = 1,
+    n_workers_per_registration_process: int | None = None,
     overwrite: bool = False,
     reuse_patient_brainmask: bool = True,
     # Passthrough options to preprocess_single_brain_mri
@@ -276,6 +277,37 @@ def preprocess_library(
     in_dir = Path(in_dir).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ----------------------------
+    # Thread budgeting for SimpleITK registration
+    # ----------------------------
+    # Batch mode parallelizes across patients using ThreadPoolExecutor(max_workers=n_workers).
+    # If each registration also uses all CPU threads, total runnable threads can explode and
+    # performance tanks (oversubscription).
+    #
+    # We therefore compute a per-registration cap:
+    #   floor(cpu_threads_available / n_workers)  (clamped to >= 1)
+    #
+    # Users can override via --n_workers_per_registration_process.
+    cpu_threads_available = os.cpu_count() or 1
+    pipelines = int(n_workers) if (n_workers and int(n_workers) > 0) else 1
+    if n_workers_per_registration_process is None:
+        n_workers_per_sitk_process = max(1, cpu_threads_available // pipelines)
+    else:
+        try:
+            n_workers_per_sitk_process = max(1, int(n_workers_per_registration_process))
+        except Exception:
+            raise ValueError(
+                f"n_workers_per_registration_process must be an int or None; got {n_workers_per_registration_process!r}"
+            )
+
+    if not quiet:
+        print(
+            f"[preprocess_brain_mris] CPU threads available={cpu_threads_available}; "
+            f"pipelines(n_workers)={pipelines}; "
+            f"n_workers_per_registration_process={n_workers_per_sitk_process}",
+            flush=True,
+        )
 
     # Default log paths
     if preprocess_log is None:
@@ -406,6 +438,7 @@ def preprocess_library(
                 family_parent_map=family_parent_map,
                 use_gpu=use_gpu,
                 enable_tta=enable_tta,
+                n_workers_per_sitk_process=n_workers_per_sitk_process,
                 verbose=not quiet,
             )
             dur = f"{time.time() - started:.1f}s"
@@ -600,6 +633,15 @@ def main():
     p.add_argument("--old_coreg_log", nargs="*", default=None, help="One or more prior coreg logs to reuse references.")
     p.add_argument("--dont_coregister", action="store_true", help="Disable co-registration; run each exam independently.")
     p.add_argument("--n_workers", type=int, default=1, help="Parallel workers across patients (threaded). Use 1 to run serially.")
+    p.add_argument(
+        "--n_workers_per_registration_process",
+        type=int,
+        default=None,
+        help=(
+            "Max ITK/SimpleITK threads per registration/resample call. "
+            "If omitted, computed as floor(os.cpu_count()/n_workers), clamped to >=1."
+        ),
+    )
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs instead of skipping processed exams.")
     p.add_argument("--no_reuse_patient_brainmask", action="store_true", help="Disable per-patient brainmask reuse; compute per-exam.")
 
@@ -649,6 +691,7 @@ def main():
         old_coreg_log=args.old_coreg_log,
         dont_coregister=args.dont_coregister,
         n_workers=args.n_workers,
+        n_workers_per_registration_process=args.n_workers_per_registration_process,
         overwrite=args.overwrite,
         reuse_patient_brainmask=not args.no_reuse_patient_brainmask,
         modalities=modalities,

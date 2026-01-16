@@ -21,6 +21,7 @@ def run_preprocessing_pipeline(
     registration_metric="mi",
     co_register_path=None,
     registration_strategy="medium",
+    n_workers_per_sitk_process=None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
@@ -57,6 +58,9 @@ def run_preprocessing_pipeline(
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
+     n_workers_per_sitk_process : int | None, default=None
+         Passed to preprocess.register_images(..., n_workers=...). Caps ITK/SimpleITK threads per registration/resample
+         call to avoid oversubscription when many pipelines run in parallel.
     save_scans_with_skulls : bool, default=False
         If True, also save the registered/coregistered full-head scans (before masking) under
         output_dir/with_skulls/.
@@ -228,6 +232,7 @@ def run_preprocessing_pipeline(
                 apply_only=False,
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
+                n_workers=n_workers_per_sitk_process,
                 save_dummy_ref=True,
                 verbose=False,
                 debug=debug,
@@ -245,6 +250,7 @@ def run_preprocessing_pipeline(
                 apply_only=False,
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
+                n_workers=n_workers_per_sitk_process,
                 save_dummy_ref=True,
                 verbose=False,
                 moving_frame_index=0,
@@ -307,6 +313,7 @@ def run_preprocessing_pipeline(
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm_path,
+                n_workers=n_workers_per_sitk_process,
                 apply_only=True,
                 save_dummy_ref=False,
                 verbose=False,
@@ -428,6 +435,7 @@ def run_preprocessing_pipeline(
             apply_only=False,
             similarity_metric=registration_metric,
             registration_strategy=registration_strategy,
+            n_workers=n_workers_per_sitk_process,
             save_dummy_ref=True,
             verbose=False,
             debug=debug,
@@ -462,6 +470,7 @@ def run_preprocessing_pipeline(
                 out_coreg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_coreg.nii.gz")
                 register_images(
                     co_register_path, src_reg, out_coreg,
+                    n_workers=n_workers_per_sitk_process,
                     transform_path=coreg_tfm_dest,
                     apply_only=True,
                     save_dummy_ref=False,
@@ -558,6 +567,7 @@ def run_preprocessing_pipeline(
             apply_only=False,
             similarity_metric=registration_metric,
             registration_strategy=registration_strategy,
+            n_workers=n_workers_per_sitk_process,
             save_dummy_ref=True,
             verbose=False,
             debug=debug,
@@ -733,6 +743,7 @@ def preprocess_single_brain_mri(
     registration_metric="mi",
     co_register_path=None,
     registration_strategy="medium",
+    n_workers_per_sitk_process=None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
@@ -772,6 +783,8 @@ def preprocess_single_brain_mri(
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
+     n_workers_per_sitk_process : int | None, default=None
+         Passed down to run_preprocessing_pipeline and then to register_images(..., n_workers=...).
     save_scans_with_skulls : bool, default=False
         If True, also save the registered/coregistered full-head scans (before masking) under
         output_dir/with_skulls/.
@@ -872,6 +885,7 @@ def preprocess_single_brain_mri(
             registration_metric=registration_metric,
             co_register_path=co_register_path,
             registration_strategy=registration_strategy,
+            n_workers_per_sitk_process=n_workers_per_sitk_process,
             save_scans_with_skulls=save_scans_with_skulls,
             final_dims=final_dims,
             final_voxels=final_voxels,
@@ -895,6 +909,7 @@ def preprocess_single_brain_mri(
                 registration_metric=registration_metric,
                 registration_strategy=registration_strategy,
                 co_register_path=co_register_path,
+                n_workers_per_sitk_process=n_workers_per_sitk_process,
                 save_scans_with_skulls=save_scans_with_skulls,
                 final_dims=final_dims,
                 final_voxels=final_voxels,
@@ -998,6 +1013,12 @@ def main():
         "--registration_strategy",
         default="medium",
         help="registration_strategy : {accurate, medium, or fast}, convenience preset controlling registration speed/accuracy tradeoffs",
+    )
+    parser.add_argument(
+        "--n_workers_per_sitk_process",
+        type=int,
+        default=None,
+        help="Max ITK/SimpleITK threads per register_images/resample call (default: None = SimpleITK default).",
     )
     parser.add_argument("--co_register", help="Optional reference image to co-register all scans to")
     parser.add_argument(

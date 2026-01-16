@@ -19,6 +19,8 @@ import tempfile
 import json
 import subprocess
 import glob
+import contextlib
+import threading
 from scipy.ndimage import zoom
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -29,6 +31,135 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+
+
+# -----------------------------------------------------------------------------
+# SimpleITK / ITK thread control helpers
+# -----------------------------------------------------------------------------
+#
+# Rationale
+# ---------
+# SimpleITK wraps ITK ProcessObjects which may run multi-threaded. When running
+# multiple registrations in parallel, setting the *global* ITK thread cap can
+# cause collisions across workers. We therefore:
+#   1) Prefer per-object thread limits via obj.SetNumberOfThreads(n) when available
+#   2) Fall back to a temporary global cap ONLY when required, protected by a
+#      module-level lock so concurrent calls do not race while the global cap is active.
+#
+# Notes
+# -----
+# - The lock only affects the fallback path (global cap). If per-object thread
+#   controls are available, parallelism is preserved.
+# - Even with the lock, the ITK thread cap is global while held, so this may
+#   reduce concurrency for registrations that require this fallback.
+
+_SITK_GLOBAL_THREADCAP_LOCK = threading.Lock()
+
+
+def normalize_n_workers(n):
+    """Normalize/validate a thread cap value.
+
+    Parameters
+    ----------
+    n : int | None
+        Desired number of worker threads.
+
+    Returns
+    -------
+    int | None
+        None means: do not set any caps (use library defaults).
+    """
+    if n is None:
+        return None
+    try:
+        n_int = int(n)
+    except Exception:
+        raise ValueError(f"n_workers must be an int or None; got {n!r}")
+    if n_int <= 0:
+        raise ValueError(f"n_workers must be >= 1 or None; got {n_int}")
+    return n_int
+
+
+def set_sitk_object_threads(obj, n_workers):
+    """Best-effort per-object thread cap for SimpleITK ProcessObjects.
+
+    Returns
+    -------
+    bool
+        True if the cap was applied (or no cap requested), False if the object
+        does not expose SetNumberOfThreads.
+    """
+    if n_workers is None:
+        return True
+    setter = getattr(obj, "SetNumberOfThreads", None)
+    if callable(setter):
+        setter(int(n_workers))
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def global_sitk_thread_cap(n_workers, enabled: bool, verbose: bool = False):
+    """Temporarily set the *global* ITK thread cap (last resort).
+
+    This is protected by a module-level lock to avoid races when multiple
+    register_images() calls happen concurrently in the same Python process.
+    """
+    if not enabled:
+        yield
+        return
+
+    if n_workers is None:
+        # Nothing to do
+        yield
+        return
+
+    # Lazy import to avoid pulling SimpleITK at module import time.
+    import SimpleITK as sitk
+
+    with _SITK_GLOBAL_THREADCAP_LOCK:
+        old = sitk.ProcessObject.GetGlobalDefaultNumberOfThreads()
+        try:
+            sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(int(n_workers))
+            if verbose:
+                print(
+                    f"[register_images] WARNING: falling back to global ITK thread cap ({n_workers}). "
+                    f"This is protected by a lock, but the setting is still global while active."
+                )
+            yield
+        finally:
+            # Best effort restore; do not mask the original exception if restore fails
+            try:
+                sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(int(old))
+            except Exception:
+                pass
+
+
+def make_sitk_resampler(
+    *,
+    reference_img,
+    transform,
+    default_value: float,
+    pixel_id,
+    n_workers=None,
+    interpolator=None,
+):
+    """Create a ResampleImageFilter with optional per-object thread cap.
+
+    Parameters are keyword-only to keep callsites explicit.
+    """
+    import SimpleITK as sitk
+
+    f = sitk.ResampleImageFilter()
+    set_sitk_object_threads(f, n_workers)
+    f.SetReferenceImage(reference_img)
+    f.SetTransform(transform)
+    if interpolator is None:
+        interpolator = sitk.sitkLinear
+    f.SetInterpolator(interpolator)
+    f.SetDefaultPixelValue(float(default_value))
+    f.SetOutputPixelType(pixel_id)
+    return f
 
 # -------- small helper for progress --------
 def _progress(iterable, total=None, desc=None, unit=None, enable=True):
