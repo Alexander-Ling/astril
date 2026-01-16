@@ -21,7 +21,8 @@ def run_preprocessing_pipeline(
     registration_metric="mi",
     co_register_path=None,
     registration_strategy="medium",
-    n_workers_per_sitk_process=None,
+    n_workers_per_registration_process=None,
+    n_workers_per_hd_bet_process=None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
@@ -58,9 +59,12 @@ def run_preprocessing_pipeline(
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
-     n_workers_per_sitk_process : int | None, default=None
-         Passed to preprocess.register_images(..., n_workers=...). Caps ITK/SimpleITK threads per registration/resample
-         call to avoid oversubscription when many pipelines run in parallel.
+    n_workers_per_registration_process : int | None, default=None
+        Passed to preprocess.register_images(..., n_workers=...). Caps ITK/SimpleITK threads per registration/resample
+        call to avoid oversubscription when many pipelines run in parallel.
+    n_workers_per_hd_bet_process : int | None, default=None
+        Passed to preprocess.run_hd_bet(..., n_workers=...). Caps hd-bet threads per skullstripping
+        call to avoid oversubscription when many pipelines run in parallel.
     save_scans_with_skulls : bool, default=False
         If True, also save the registered/coregistered full-head scans (before masking) under
         output_dir/with_skulls/.
@@ -135,6 +139,21 @@ def run_preprocessing_pipeline(
     # ---- check if hd-bet is installed (only needed when generating a mask) ---
     if brainmask_path is None:
         ensure_hd_bet_installed()
+
+    # Normalize worker controls
+    def _norm_pos_int_or_none(x, name):
+        if x is None:
+            return None
+        try:
+            x = int(x)
+        except Exception:
+            raise ValueError(f"{name} must be int or None; got {x!r}")
+        if x <= 0:
+            raise ValueError(f"{name} must be >= 1 or None; got {x}")
+        return x
+
+    n_workers_per_registration_process = _norm_pos_int_or_none(n_workers_per_registration_process, "n_workers_per_registration_process")
+    n_workers_per_hd_bet_process = _norm_pos_int_or_none(n_workers_per_hd_bet_process, "n_workers_per_hd_bet_process")
 
     # ---- normalize inputs ----
     scans = {str(k): os.fspath(v) for k, v in (scans or {}).items()}
@@ -232,7 +251,7 @@ def run_preprocessing_pipeline(
                 apply_only=False,
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
-                n_workers=n_workers_per_sitk_process,
+                n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
                 verbose=False,
                 debug=debug,
@@ -250,7 +269,7 @@ def run_preprocessing_pipeline(
                 apply_only=False,
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
-                n_workers=n_workers_per_sitk_process,
+                n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
                 verbose=False,
                 moving_frame_index=0,
@@ -313,7 +332,7 @@ def run_preprocessing_pipeline(
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm_path,
-                n_workers=n_workers_per_sitk_process,
+                n_workers=n_workers_per_registration_process,
                 apply_only=True,
                 save_dummy_ref=False,
                 verbose=False,
@@ -435,7 +454,7 @@ def run_preprocessing_pipeline(
             apply_only=False,
             similarity_metric=registration_metric,
             registration_strategy=registration_strategy,
-            n_workers=n_workers_per_sitk_process,
+            n_workers=n_workers_per_registration_process,
             save_dummy_ref=True,
             verbose=False,
             debug=debug,
@@ -470,7 +489,7 @@ def run_preprocessing_pipeline(
                 out_coreg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_coreg.nii.gz")
                 register_images(
                     co_register_path, src_reg, out_coreg,
-                    n_workers=n_workers_per_sitk_process,
+                    n_workers=n_workers_per_registration_process,
                     transform_path=coreg_tfm_dest,
                     apply_only=True,
                     save_dummy_ref=False,
@@ -533,6 +552,7 @@ def run_preprocessing_pipeline(
             device="cuda" if use_gpu else "cpu",
             disable_tta=not enable_tta,
             verbose=verbose,
+            n_workers=n_workers_per_hd_bet_process,
         )
 
     # ---- Step 4: apply mask to all scans ----
@@ -567,7 +587,7 @@ def run_preprocessing_pipeline(
             apply_only=False,
             similarity_metric=registration_metric,
             registration_strategy=registration_strategy,
-            n_workers=n_workers_per_sitk_process,
+            n_workers=n_workers_per_registration_process,
             save_dummy_ref=True,
             verbose=False,
             debug=debug,
@@ -743,7 +763,8 @@ def preprocess_single_brain_mri(
     registration_metric="mi",
     co_register_path=None,
     registration_strategy="medium",
-    n_workers_per_sitk_process=None,
+    n_workers_per_registration_process=None,
+    n_workers_per_hd_bet_process: int | None = None,
     save_scans_with_skulls=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
@@ -783,8 +804,11 @@ def preprocess_single_brain_mri(
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
-     n_workers_per_sitk_process : int | None, default=None
+     n_workers_per_registration_process : int | None, default=None
          Passed down to run_preprocessing_pipeline and then to register_images(..., n_workers=...).
+    n_workers_per_hd_bet_process : int | None, default=None
+        Passed through to `run_hd_bet(..., n_workers=...)` to limit CPU threads used by HD-BET in CPU mode,
+        applied per subprocess via environment variables. Ignored for CUDA mode.
     save_scans_with_skulls : bool, default=False
         If True, also save the registered/coregistered full-head scans (before masking) under
         output_dir/with_skulls/.
@@ -885,7 +909,8 @@ def preprocess_single_brain_mri(
             registration_metric=registration_metric,
             co_register_path=co_register_path,
             registration_strategy=registration_strategy,
-            n_workers_per_sitk_process=n_workers_per_sitk_process,
+            n_workers_per_registration_process=n_workers_per_registration_process,
+            n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
             save_scans_with_skulls=save_scans_with_skulls,
             final_dims=final_dims,
             final_voxels=final_voxels,
@@ -909,7 +934,8 @@ def preprocess_single_brain_mri(
                 registration_metric=registration_metric,
                 registration_strategy=registration_strategy,
                 co_register_path=co_register_path,
-                n_workers_per_sitk_process=n_workers_per_sitk_process,
+                n_workers_per_registration_process=n_workers_per_registration_process,
+                n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
                 save_scans_with_skulls=save_scans_with_skulls,
                 final_dims=final_dims,
                 final_voxels=final_voxels,
@@ -1015,10 +1041,16 @@ def main():
         help="registration_strategy : {accurate, medium, or fast}, convenience preset controlling registration speed/accuracy tradeoffs",
     )
     parser.add_argument(
-        "--n_workers_per_sitk_process",
+        "--n_workers_per_registration_process",
         type=int,
         default=None,
         help="Max ITK/SimpleITK threads per register_images/resample call (default: None = SimpleITK default).",
+    )
+    parser.add_argument(
+        "--n_workers_per_hd_bet_process",
+        type=int,
+        default=None,
+        help="Max threads per hd-bet skull stripping analysis (default: None = hd-bet default).",
     )
     parser.add_argument("--co_register", help="Optional reference image to co-register all scans to")
     parser.add_argument(
@@ -1132,6 +1164,8 @@ def main():
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
         registration_strategy=args.registration_strategy,
+        n_workers_per_registration_process=args.n_workers_per_registration_process,
+        n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         co_register_path=args.co_register,
         save_scans_with_skulls=args.save_scans_with_skulls,
         final_dims=dims,

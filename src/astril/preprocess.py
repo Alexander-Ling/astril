@@ -967,6 +967,7 @@ def run_hd_bet(
     device: str = "cpu",
     disable_tta: bool = True,
     verbose: bool = False,
+    n_workers: int | None = None,
 ):
     """
     HD-BET v2.x CLI wrapper.
@@ -976,6 +977,9 @@ def run_hd_bet(
     - If only mask_path is provided: we force no bet image via --no_bet_image
     - Suggested to disable TTA if running on CPU for speed
     - Set device to cuda to run on GPU
+    - If n_workers is provided and device is CPU-like, best-effort limit of CPU threads is applied
+      PER SUBPROCESS via environment variables (OMP/MKL/OpenBLAS/NumExpr/Torch). This avoids
+      global collisions when running multiple preprocessing pipelines in parallel.
     """
     from .preprocessing_utils import ensure_hd_bet_installed
     ensure_hd_bet_installed()
@@ -984,6 +988,22 @@ def run_hd_bet(
 
     if output_path is None and mask_path is None:
         raise ValueError("Must provide at least one of output_path or mask_path.")
+
+    # ---------------------------
+    # Per-subprocess thread control (CPU mode)
+    # ---------------------------
+    def _normalize_n_workers(n):
+        if n is None:
+            return None
+        try:
+            n = int(n)
+        except Exception:
+            raise ValueError(f"n_workers must be int or None; got {n!r}")
+        if n <= 0:
+            raise ValueError(f"n_workers must be >= 1 or None; got {n}")
+        return n
+
+    n_workers = _normalize_n_workers(n_workers)
 
     # Decide how output paths should be handled
     if output_path is not None and mask_path is not None:
@@ -1019,7 +1039,27 @@ def run_hd_bet(
     with contextlib.ExitStack():
         stdout = subprocess.DEVNULL if not verbose else None
         stderr = subprocess.DEVNULL if not verbose else None
-        subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr)
+
+        # Build a per-call environment so parallel runs don't collide.
+        env = os.environ.copy()
+        dev = str(device).lower().strip()
+        is_cpu = (dev == "cpu") or (dev.startswith("cpu"))
+        if is_cpu and n_workers is not None:
+            # These cover the common BLAS/OpenMP backends and PyTorch intraop threading.
+            # Note: hd-bet is a separate process, so this is the safest per-call control mechanism.
+            env.update(
+                {
+                    "OMP_NUM_THREADS": str(n_workers),
+                    "MKL_NUM_THREADS": str(n_workers),
+                    "OPENBLAS_NUM_THREADS": str(n_workers),
+                    "NUMEXPR_NUM_THREADS": str(n_workers),
+                    "TORCH_NUM_THREADS": str(n_workers),
+                }
+            )
+            if verbose:
+                print(f"[run_hd_bet] CPU thread cap for this subprocess: {n_workers}")
+
+        subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr, env=env)
 
     # If a mask was requested in addition to skullstripped scan, find what HD-BET produced and move it to mask_path.
     if mask_path is not None:

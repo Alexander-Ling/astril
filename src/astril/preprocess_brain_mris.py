@@ -244,6 +244,7 @@ def preprocess_library(
     dont_coregister: bool = False,
     n_workers: int = 1,
     n_workers_per_registration_process: int | None = None,
+    n_workers_per_hd_bet_process: int | None = None,
     overwrite: bool = False,
     reuse_patient_brainmask: bool = True,
     # Passthrough options to preprocess_single_brain_mri
@@ -279,33 +280,48 @@ def preprocess_library(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------
-    # Thread budgeting for SimpleITK registration
+    # Thread budgeting for nested tools
     # ----------------------------
-    # Batch mode parallelizes across patients using ThreadPoolExecutor(max_workers=n_workers).
-    # If each registration also uses all CPU threads, total runnable threads can explode and
-    # performance tanks (oversubscription).
+    # Batch mode runs multiple exam pipelines in parallel (n_workers). Each pipeline will call into
+    # registration (SimpleITK) and possibly HD-BET. If each nested tool uses "all threads", CPU
+    # oversubscription kills throughput. We therefore allocate a per-pipeline budget.
     #
-    # We therefore compute a per-registration cap:
-    #   floor(cpu_threads_available / n_workers)  (clamped to >= 1)
-    #
-    # Users can override via --n_workers_per_registration_process.
-    cpu_threads_available = os.cpu_count() or 1
-    pipelines = int(n_workers) if (n_workers and int(n_workers) > 0) else 1
-    if n_workers_per_registration_process is None:
-        n_workers_per_sitk_process = max(1, cpu_threads_available // pipelines)
-    else:
+    # HD-BET on CPU typically doesn't scale well beyond a modest thread count; we cap at 8.
+    HD_BET_CPU_THREAD_CAP = 8
+
+    def _norm_pos_int_or_none(x, name):
+        if x is None:
+            return None
         try:
-            n_workers_per_sitk_process = max(1, int(n_workers_per_registration_process))
+            x = int(x)
         except Exception:
-            raise ValueError(
-                f"n_workers_per_registration_process must be an int or None; got {n_workers_per_registration_process!r}"
-            )
+            raise ValueError(f"{name} must be int or None; got {x!r}")
+        if x <= 0:
+            raise ValueError(f"{name} must be >= 1 or None; got {x}")
+        return x
+
+    n_workers = int(n_workers) if int(n_workers) > 0 else 1
+    n_workers_per_registration_process = _norm_pos_int_or_none(n_workers_per_registration_process, "n_workers_per_registration_process")
+    n_workers_per_hd_bet_process = _norm_pos_int_or_none(n_workers_per_hd_bet_process, "n_workers_per_hd_bet_process")
+
+    threads_available = os.cpu_count() or 1
+    auto_budget = max(1, int(threads_available // max(1, n_workers)))
+
+    if n_workers_per_registration_process is None:
+        n_workers_per_registration_process = auto_budget
+
+    if n_workers_per_hd_bet_process is None:
+        n_workers_per_hd_bet_process = min(HD_BET_CPU_THREAD_CAP, auto_budget)
+    else:
+        # Even if user overrides, still enforce the cap in batch mode as requested.
+        n_workers_per_hd_bet_process = min(HD_BET_CPU_THREAD_CAP, n_workers_per_hd_bet_process)
 
     if not quiet:
         print(
-            f"[preprocess_brain_mris] CPU threads available={cpu_threads_available}; "
-            f"pipelines(n_workers)={pipelines}; "
-            f"n_workers_per_registration_process={n_workers_per_sitk_process}",
+            f"[preprocess_brain_mris] CPU threads available={threads_available}; "
+            f"pipelines(n_workers)={n_workers}; "
+            f"n_workers_per_registration_process={n_workers_per_registration_process}",
+            f"n_workers_per_hd_bet_process={n_workers_per_hd_bet_process}",
             flush=True,
         )
 
@@ -438,7 +454,8 @@ def preprocess_library(
                 family_parent_map=family_parent_map,
                 use_gpu=use_gpu,
                 enable_tta=enable_tta,
-                n_workers_per_sitk_process=n_workers_per_sitk_process,
+                n_workers_per_registration_process=n_workers_per_registration_process,
+                n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
                 verbose=not quiet,
             )
             dur = f"{time.time() - started:.1f}s"
@@ -637,10 +654,15 @@ def main():
         "--n_workers_per_registration_process",
         type=int,
         default=None,
-        help=(
-            "Max ITK/SimpleITK threads per registration/resample call. "
-            "If omitted, computed as floor(os.cpu_count()/n_workers), clamped to >=1."
-        ),
+        help="Optional override: CPU threads to allow per SimpleITK/ITK process within each pipeline. "
+             "Default: floor(cpu_threads / n_workers).",
+    )
+    p.add_argument(
+        "--n_workers_per_hd_bet_process",
+        type=int,
+        default=None,
+       help="Optional override: CPU threads to allow for HD-BET when device=cpu, per pipeline. "
+             "Default: min(8, floor(cpu_threads / n_workers)). (Capped at 8 in batch mode.)",
     )
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs instead of skipping processed exams.")
     p.add_argument("--no_reuse_patient_brainmask", action="store_true", help="Disable per-patient brainmask reuse; compute per-exam.")
@@ -692,6 +714,7 @@ def main():
         dont_coregister=args.dont_coregister,
         n_workers=args.n_workers,
         n_workers_per_registration_process=args.n_workers_per_registration_process,
+        n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         overwrite=args.overwrite,
         reuse_patient_brainmask=not args.no_reuse_patient_brainmask,
         modalities=modalities,
