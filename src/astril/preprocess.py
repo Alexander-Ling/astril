@@ -1885,6 +1885,7 @@ def plan_dicom_to_nifti_conversion(
     use_actual_exam_ids: bool = False,
     add_missing_derived: bool = False,
     make_derived_from_scratch: bool = False,
+    unexpected_multiframe_policy: str = "keep_first",
 ):
     """
     Plan DICOM->NIfTI conversion using existing series classification.
@@ -1912,6 +1913,9 @@ def plan_dicom_to_nifti_conversion(
       - use_actual_exam_ids: boolean to indicate if actual exam IDs should be used instead of unique random ones.
       - add_missing_derived: boolean to indicate if function should dentify derived scan types missing for each primary in an exam and add DERIVE jobs to the plan.
       - make_derived_from_scratch: boolean to indicate if function should ignore existing derived scans and plan DERIVE jobs for all supported derived types from primaries.
+      - unexpected_multiframe_policy: str
+        Policy for series that are expected to be single-frame/3D but convert to multi-frame/4D.
+        One of: 'keep_first' (default; keep frame 0 with a warning) or 'skip' (skip conversion with a warning).
 
     Returns:
       pandas.DataFrame with one row per discovered series, including:
@@ -1973,6 +1977,7 @@ def plan_dicom_to_nifti_conversion(
         "ExamDirectory","ExamAlias","patientID","timepoint_days","series_identifier",
         "final_label","plane","is_derived","matrix","voxel_mm","n_slices",
         "selected_for_conversion","proposed_nifti_path",
+        "unexpected_multiframe_policy",
         # show derivation info when present
         "Action","GeneratorKey","PrimaryLabel","DerivedLabel",
         "PrimarySeriesIdentifier","PrimarySeriesPath",
@@ -2247,6 +2252,7 @@ def plan_dicom_to_nifti_conversion(
         df["Directory"]       = rec["Directory"]
         df["ExamDirectory"]   = exam_rel
         df["ExamAlias"]       = alias_map.get((exam_rel, mr_name), None)
+        df["unexpected_multiframe_policy"] = str(unexpected_multiframe_policy)
         # Locals used by the DERIVE block
         exam_alias = alias_map.get((exam_rel, mr_name), None)
         patient_rel = rec["Directory"]
@@ -2770,11 +2776,17 @@ def convert_dicom_plan(
     overwrite: bool = False,
     log_out: str | None = None,
     show_progress: bool = True,
+    unexpected_multiframe_policy: str = "keep_first",
 ):
     """Read a plan produced by `plan_dicom_to_nifti_conversion` and run conversions
     for rows with a non-empty, non-"-" `proposed_nifti_path`.
 
     Streams a per-row CSV/TSV log to disk (thread-safe), similar to `demix_dicoms()`.
+    unexpected_multiframe_policy controls what to do if a series that is expected
+    to be a single 3D volume converts to a multi-frame/4D NIfTI.
+      - "keep_first" (default): keep frame 0, overwrite the output, and warn
+      - "skip": delete the output and warn
+
     Returns a DataFrame log with per-row status.
     """
     import os
@@ -2788,6 +2800,14 @@ def convert_dicom_plan(
         _read_table, _save_table, _progress,
         _sanitize_label,
     )
+
+    # Normalize/validate policy
+    unexpected_multiframe_policy = str(unexpected_multiframe_policy or "keep_first").strip().lower()
+    if unexpected_multiframe_policy not in {"keep_first", "skip"}:
+        raise ValueError(
+            "unexpected_multiframe_policy must be one of {'keep_first','skip'}; "
+            f"got: {unexpected_multiframe_policy!r}"
+        )
 
     # ---------- read and validate plan ----------
     plan = _read_table(plan_path)
@@ -2909,25 +2929,16 @@ def convert_dicom_plan(
     _EXPECTED_4D_BASE_LABELS = {"DWI", "PERFUSION"}
 
     def _is_expected_4d_primary_row(row: pd.Series, rec: dict | None = None) -> bool:
-        """True only for *primary* members of families that should be 4D (e.g., DWI, Perfusion).
-
-        - Parent label must be one of _EXPECTED_4D_BASE_LABELS.
-        - Row must not be marked derived (vendor-derived maps should still be convertible as 3D).
         """
-        lbl = _base_label(row.get('final_label', ''))
-        if lbl not in _EXPECTED_4D_BASE_LABELS:
-            return False
-        # Treat Action=DERIVE as derived by definition; otherwise consult plan's is_derived when present.
-        action = str((rec or {}).get('Action', row.get('Action', 'CONVERT'))).strip().upper()
-        if action == 'DERIVE':
-            return False
-        is_derived = False
-        if 'is_derived' in row.index:
-            is_derived = _to_bool(row.get('is_derived', False))
-        else:
-            # Fallback: labels with parentheses (e.g., DWI(ADC), Perfusion(CBV)) are treated as derived.
-            is_derived = '(' in str(row.get('final_label', '') or '')
-        return (not is_derived)
+        Return True iff this conversion-plan row corresponds to a modality
+        that is explicitly defined as a primary 4D acquisition.
+
+        IMPORTANT:
+        The conversion plan is the single source of truth here.
+        No metadata- or heuristic-based inference is performed.
+        """
+        lbl = str(row.get("final_label", "") or "").strip().upper()
+        return lbl in _EXPECTED_4D_BASE_LABELS
 
     def _delete_nifti_and_sidecars(nii_path: str):
         """Best-effort cleanup of a NIfTI output and its common sidecars."""
@@ -2958,6 +2969,79 @@ def convert_dicom_plan(
             return False, f"expected 4D but got ndim={ndim}, shape={shape}"
         except Exception as e:
             return False, f"unable to validate ndim: {type(e).__name__}: {e}"
+
+    def _resolve_unexpected_multiframe_policy(row: pd.Series) -> str:
+        """Per-row override (when present in plan); otherwise use function default."""
+        try:
+            if "unexpected_multiframe_policy" in row.index:
+                v = str(row.get("unexpected_multiframe_policy") or "").strip().lower()
+                if v in {"keep_first", "skip"}:
+                    return v
+        except Exception:
+            pass
+        return unexpected_multiframe_policy
+
+    def _validate_3d_or_singleton_4d(nii_path: str) -> tuple[bool, int | None, tuple[int, ...] | None, str]:
+        """Return (ok, ndim, shape, message). ok=True iff the image is effectively 3D.
+
+        - ndim==3 -> ok
+        - ndim==4 and shape[3]==1 -> ok (can be safely squeezed to 3D)
+        - ndim==4 and shape[3]>1 -> not ok (unexpected multiframe)
+        """
+        try:
+            from .preprocessing_utils import get_nifti_ndim
+            ndim, shape = get_nifti_ndim(nii_path)
+            ndim_i = int(ndim)
+            shp = tuple(int(x) for x in (shape or ()))
+            if ndim_i == 3:
+                return True, ndim_i, shp, f"ndim={ndim_i}, shape={shp}"
+            if ndim_i == 4 and len(shp) == 4:
+                if shp[3] == 1:
+                    return True, ndim_i, shp, f"ndim={ndim_i}, shape={shp} (singleton frame)"
+                return False, ndim_i, shp, f"ndim={ndim_i}, shape={shp}"
+            return False, ndim_i, shp, f"unexpected ndim={ndim_i}, shape={shp}"
+        except Exception as e:
+            return False, None, None, f"unable to validate ndim: {type(e).__name__}: {e}"
+
+    def _enforce_expected_single_frame(
+        written_nii_path: str,
+        policy: str,
+    ) -> tuple[str | None, str, str]:
+        """Ensure output is a single-frame 3D NIfTI.
+
+        Returns (final_path_or_none, status, message).
+        - If policy=="keep_first" and the output is multiframe 4D, we overwrite with frame 0.
+        - If policy=="skip" and the output is multiframe 4D, we delete outputs and return None.
+        - If output is 3D or singleton-4D, we return the (possibly overwritten) path.
+        """
+        ok, ndim, shape, msg = _validate_3d_or_singleton_4d(written_nii_path)
+        if ok and ndim == 3:
+            return written_nii_path, "ok", ""
+
+        # For singleton 4D, squeeze to 3D quietly (but note in message for transparency)
+        if ok and ndim == 4 and shape and len(shape) == 4 and shape[3] == 1:
+            try:
+                from .preprocessing_utils import extract_nifti_frame
+                extract_nifti_frame(written_nii_path, 0, written_nii_path)
+                return written_nii_path, "ok_singleton_frame_squeezed", f"Converted 4D singleton to 3D: {msg}"
+            except Exception as e:
+                # If we can't squeeze, treat as failure and follow policy
+                ok = False
+                msg = f"singleton-4D squeeze failed: {type(e).__name__}: {e}; original: {msg}"
+
+        # Unexpected multiframe 4D (or unknown) -> apply policy
+        if policy == "skip":
+            _delete_nifti_and_sidecars(written_nii_path)
+            return None, "skipped_expected_3d_got_4d", msg
+
+        # keep_first
+        try:
+            from .preprocessing_utils import extract_nifti_frame
+            extract_nifti_frame(written_nii_path, 0, written_nii_path)
+            return written_nii_path, "ok_first_frame_only", f"[WARN] Expected 3D but got multi-frame; kept frame 0. {msg}"
+        except Exception as e:
+            _delete_nifti_and_sidecars(written_nii_path)
+            return None, "failed", f"Failed to extract first frame: {type(e).__name__}: {e}; original: {msg}"
 
     # ---------- worker ----------
     def _convert_row(row: pd.Series) -> dict:
@@ -3023,8 +3107,34 @@ def convert_dicom_plan(
                         rec["nii_path"] = ""
                         return rec
 
-                rec["status"] = "ok"
-                rec["nii_path"] = written
+                # For *non-primary* sequences, we expect a single-frame/3D output.
+                # Some DICOM series that "should" be 3D (e.g., vendor-derived maps like DWI_TRACE)
+                # can be stored as multi-frame in the source directory and convert to 4D.
+                # Apply policy: keep frame 0 (default) or skip.
+                if not _is_expected_4d_primary_row(row, rec):
+                    pol = _resolve_unexpected_multiframe_policy(row)
+                    final_path, st, msg = _enforce_expected_single_frame(written, pol)
+                    if final_path is None:
+                        rec["status"] = st
+                        rec["message"] = msg
+                        rec["nii_path"] = ""
+                        return rec
+                    written = final_path
+                    # Preserve warnings/messages in the log
+                    if msg:
+                        rec["message"] = msg
+                    # Only override status if it indicates a non-standard success
+                    if st != "ok":
+                        rec["status"] = st
+                        rec["nii_path"] = written
+                        # Continue to optional NRRD export
+                    else:
+                        rec["status"] = "ok"
+                        rec["nii_path"] = written
+
+                if rec.get("status") is None:
+                    rec["status"] = "ok"
+                    rec["nii_path"] = written
 
                 # Also export diffusion NRRD for Slicer compatibility (parent diffusion only).
                 # We keep NIfTI + sidecars as primary outputs.
@@ -3127,8 +3237,19 @@ def convert_dicom_plan(
                     primary_label=primary_label,
                     derived_label=derived_label,
                 )
-                rec["status"] = "ok"
-                rec["nii_path"] = written
+
+                # Derived outputs are expected to be single-frame/3D.
+                pol = _resolve_unexpected_multiframe_policy(row)
+                final_path, st, msg = _enforce_expected_single_frame(written, pol)
+                if final_path is None:
+                    rec["status"] = st
+                    rec["message"] = msg
+                    rec["nii_path"] = ""
+                    return rec
+                if msg:
+                    rec["message"] = msg
+                rec["status"] = "ok" if st == "ok" else st
+                rec["nii_path"] = final_path
 
                 # Optional: also export a diffusion NRRD for DWI parent series to improve
                 # 3D Slicer / SlicerDMRI compatibility (embedded gradients).
@@ -3621,6 +3742,15 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
                    help="Identify derived scan types missing for each primary in an exam and add DERIVE jobs to the plan.")
     p.add_argument("--make_derived_from_scratch", action="store_true",
                    help="Ignore existing derived scans and plan DERIVE jobs for all supported derived types from primaries.")
+    p.add_argument(
+        "--unexpectedMultiframePolicy",
+        choices=["keep_first", "skip"],
+        default="keep_first",
+        help=(
+            "What to do if a sequence expected to be single-frame/3D converts to multi-frame/4D. "
+            "keep_first = keep frame 0 (warn); skip = skip conversion (warn)."
+        ),
+    )
     def _run_plan(a):
         plan_dicom_to_nifti_conversion(
             patient_metadata=a.patientMetadata,
@@ -3636,6 +3766,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             use_actual_exam_ids=getattr(a, "use_actual_exam_ids", False),
             add_missing_derived=getattr(a, "add_missing_derived", False),
             make_derived_from_scratch=getattr(a, "make_derived_from_scratch", False),
+            unexpected_multiframe_policy=getattr(a, "unexpectedMultiframePolicy", "keep_first"),
         )
     p.set_defaults(func=_run_plan)
 
@@ -3661,6 +3792,15 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--n_workers", type=int, default=None, help="Parallel workers (I/O-bound).")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output NIfTI if present.")
     p.add_argument("--logOut", default=None, help="Optional CSV/TSV log path for results.")
+    p.add_argument(
+        "--unexpectedMultiframePolicy",
+        choices=["keep_first", "skip"],
+        default="keep_first",
+        help=(
+            "What to do if a sequence expected to be single-frame/3D converts to multi-frame/4D. "
+            "keep_first = keep frame 0 (warn); skip = skip conversion (warn)."
+        ),
+    )
     def _run_convert(a):
         convert_dicom_plan(
             plan_path=a.plan,
@@ -3668,6 +3808,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             overwrite=a.overwrite,
             log_out=a.logOut,
             show_progress=True,
+            unexpected_multiframe_policy=getattr(a, "unexpectedMultiframePolicy", "keep_first"),
         )
     p.set_defaults(func=_run_convert)
 

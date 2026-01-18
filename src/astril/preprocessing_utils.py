@@ -2396,6 +2396,7 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
     files = files[:max_files]
 
     recs = []
+    nframes_per_file = []
     for fp in files:
         try:
             ds = pydicom.dcmread(fp, stop_before_pixels=True, specific_tags=[
@@ -2404,6 +2405,7 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
                 (0x0020,0x0013),  # InstanceNumber
                 (0x0020,0x0032),  # ImagePositionPatient
                 (0x0020,0x1041),  # SliceLocation
+                (0x0028,0x0008),  # NumberOfFrames
                 (0x0018,0x9087),  # Diffusion b-value
                 (0x0018,0x9089),  # Diffusion Gradient Orientation
                 (0x0018,0x0080),  # RepetitionTime (ms)
@@ -2428,6 +2430,14 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
                 "bval": float(bval) if bval is not None else None,
                 "bvec": [float(x) for x in grad] if grad is not None else None,
             })
+
+            # Track multiframe-per-file layouts (common in some diffusion exports)
+            try:
+                nf = getattr(ds, "NumberOfFrames", None)
+                nf = int(nf) if nf is not None else None
+            except Exception:
+                nf = None
+            nframes_per_file.append(nf)
         except Exception:
             continue
 
@@ -2440,11 +2450,28 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
     else:
         slices_per_vol = None
 
+    # Robustness: handle "one multiframe DICOM per volume" layouts.
+    multiframe_per_file = False
+    inferred_slices_per_vol_from_frames = None
+    try:
+        nfs = [nf for nf in nframes_per_file if nf is not None]
+        if len(files) > 1 and nfs:
+            max_nf = max(nfs)
+            if max_nf and max_nf > 1 and (slices_per_vol is None or int(slices_per_vol) <= 1):
+                multiframe_per_file = True
+                inferred_slices_per_vol_from_frames = int(max_nf)
+                slices_per_vol = inferred_slices_per_vol_from_frames
+    except Exception:
+        pass
+
     use_trigger = any(r.get("trigger_time_s") is not None for r in recs)
     key = "trigger_time_s" if use_trigger else "acq_time_s"
 
     times = []
-    if slices_per_vol:
+    if multiframe_per_file:
+        # One DICOM file per volume: times are already per-volume, so do NOT chunk.
+        times = [r.get(key) for r in recs]
+    elif slices_per_vol:
         for i in range(0, len(recs), slices_per_vol):
             chunk = recs[i:i+slices_per_vol]
             tvals = [r.get(key) for r in chunk if r.get(key) is not None]
@@ -2460,7 +2487,11 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
     unique_bvals = sorted({round(float(b), 2) for b in bvals}) if bvals else None
 
     bvecs = [r["bvec"] for r in recs if r.get("bvec") is not None]
-    if bvecs and slices_per_vol:
+    if multiframe_per_file:
+        # One file per volume: bvecs are already per-volume (when present).
+        if len(bvecs) != len(recs):
+            bvecs = None
+    elif bvecs and slices_per_vol:
         B = []
         for i in range(0, len(bvecs), slices_per_vol):
             chunk = [v for v in bvecs[i:i+slices_per_vol] if v is not None]
@@ -2484,6 +2515,7 @@ def build_dynamic_sidecar_from_dicoms(dicom_dir: str, *, max_files: int = 5000) 
         "estimated_TR_sec": est_TR,
         "unique_bvals": unique_bvals,
         "bvecs_per_frame": bvecs,
+        "multiframe_per_file": bool(multiframe_per_file),
         "notes": "Times normalized to first frame; no absolute dates/times stored."
     }
 
