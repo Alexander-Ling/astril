@@ -694,6 +694,7 @@ def main():
     p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
     p.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for hd-bet skull stripping.")
     p.add_argument("--enable_tta", action="store_true", help="Enable test-time augmentation (TTA) for hd-bet skull stripping.")
+    p.add_argument("--skip_qc", action="store_true", help="Skip creation of PDF QC files showing the center axial slice from each preprocessed volume.")
     p.add_argument("--debug", action="store_true", help="Keep temp dirs from underlying preprocessing.")
     p.add_argument("--verbose", action="store_true", help="Print logging from underlying preprocessing.")
 
@@ -730,6 +731,18 @@ def main():
         debug=args.debug,
         quiet=not args.verbose,
     )
+
+    if not args.skip_qc:
+        from .preprocess import generate_preprocessing_qc_pdfs
+
+        if args.verbose:
+            print(f"[QC] Preparing PDF QC files to visualize preprocessed MRI volumes...")
+
+        generate_preprocessing_qc_pdfs(
+            root_dir=args.out_dir,
+            n_workers=args.n_workers,
+            out_dir=args.out_dir + "/QC/"
+        )
 
 
 if __name__ == "__main__":

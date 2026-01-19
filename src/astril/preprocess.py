@@ -3393,6 +3393,166 @@ def convert_dicom_plan(
 # CLI entry point
 # ------------------------------------------------------------------------
 
+
+
+# -----------------------------------------------------------------------------
+# QC PDF generation for preprocessed MRI libraries
+# -----------------------------------------------------------------------------
+
+def _qc_generate_one_patient_qc_pdfs_worker(args):
+    """Top-level worker for Windows ProcessPoolExecutor (must be picklable)."""
+    patient_dir, series_order, out_dir, max_exams_per_page, left_margin_scale = args
+    from .preprocessing_utils import generate_patient_qc_pdfs
+    brain_pdf, brain_norm_pdf = generate_patient_qc_pdfs(
+        patient_dir=patient_dir,
+        series_order=series_order,
+        out_dir=out_dir,
+        max_exams_per_page=max_exams_per_page,
+        left_margin_scale=left_margin_scale,
+    )
+    return patient_dir, brain_pdf, brain_norm_pdf
+
+
+def generate_preprocessing_qc_pdfs(
+    root_dir: str,
+    n_workers: int | None = None,
+    out_dir: str | None = None,
+    show_progress: bool = True,
+    *,
+    max_exams_per_page: int = 4,
+    left_margin_scale: float = 2.25,
+):
+    """Generate per-patient QC PDFs for a preprocessed MRI library.
+
+    Directory layout:
+        root_dir/{patient_dirs}/{exam_dirs}/*.nii.gz
+
+    Filenames expected:
+        {patient}_{timepoint}_{seriesType}_brain.nii.gz
+        {patient}_{timepoint}_{seriesType}_brain_norm.nii.gz
+
+    Skips:
+        - *_unregistered.nii.gz
+        - non-.nii.gz (e.g., .nrrd)
+
+    Produces two PDFs per patient:
+        - *_qc_brain.pdf
+        - *_qc_brain_norm.pdf
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    try:
+        from tqdm import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+
+    from .preprocessing_utils import collect_preprocessed_series_types, _progress
+
+    root_dir = os.path.abspath(os.fspath(root_dir))
+    if not os.path.isdir(root_dir):
+        raise FileNotFoundError(f"--dir not found or not a directory: {root_dir}")
+
+    patient_dirs = [
+        os.path.join(root_dir, d)
+        for d in sorted(os.listdir(root_dir))
+        if os.path.isdir(os.path.join(root_dir, d))
+    ]
+
+    series_order = collect_preprocessed_series_types(root_dir)
+    if not series_order:
+        raise RuntimeError(
+            "No eligible preprocessed NIfTI files found under --dir. "
+            "Expected *_brain.nii.gz or *_brain_norm.nii.gz under {patient}/{exam}/"
+        )
+
+    # count exams for progress reporting
+    patient_exam_counts = {}
+    total_exams = 0
+    for pdir in patient_dirs:
+        try:
+            n_exams = sum(1 for d in os.listdir(pdir) if os.path.isdir(os.path.join(pdir, d)))
+        except Exception:
+            n_exams = 0
+        patient_exam_counts[pdir] = n_exams
+        total_exams += n_exams
+
+    if n_workers is None:
+        try:
+            n_workers = max(1, min(8, os.cpu_count() or 1))
+        except Exception:
+            n_workers = 1
+    else:
+        n_workers = int(n_workers)
+        if n_workers < 1:
+            n_workers = 1
+
+    patients_total = len(patient_dirs)
+
+    if show_progress and _tqdm is not None:
+        pbar_pat = _tqdm(total=patients_total, desc="QC PDFs (patients)", unit="patient")
+        pbar_ex = _tqdm(total=total_exams, desc="QC PDFs (exams)", unit="exam")
+    else:
+        pbar_pat = None
+        pbar_ex = None
+
+    results = []
+    try:
+        if n_workers == 1:
+            it = patient_dirs
+            if pbar_pat is None:
+                it = _progress(it, total=patients_total, desc="QC PDFs", unit="patient", enable=show_progress)
+            from .preprocessing_utils import generate_patient_qc_pdfs
+            for pdir in it:
+                brain_pdf, brain_norm_pdf = generate_patient_qc_pdfs(
+                    patient_dir=pdir,
+                    series_order=series_order,
+                    out_dir=out_dir,
+                    max_exams_per_page=max_exams_per_page,
+                    left_margin_scale=left_margin_scale,
+                )
+                results.append({
+                    "patient_dir": pdir,
+                    "qc_brain_pdf": brain_pdf,
+                    "qc_brain_norm_pdf": brain_norm_pdf,
+                })
+                if pbar_pat is not None:
+                    pbar_pat.update(1)
+                if pbar_ex is not None:
+                    pbar_ex.update(patient_exam_counts.get(pdir, 0))
+        else:
+            job_args = [
+                (pdir, series_order, out_dir, max_exams_per_page, left_margin_scale)
+                for pdir in patient_dirs
+            ]
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futs = {pool.submit(_qc_generate_one_patient_qc_pdfs_worker, a): a[0] for a in job_args}
+                it = as_completed(futs)
+                if pbar_pat is None:
+                    it = _progress(it, total=patients_total, desc="QC PDFs", unit="patient", enable=show_progress)
+                for fut in it:
+                    pdir = futs[fut]
+                    try:
+                        _pdir, brain_pdf, brain_norm_pdf = fut.result()
+                    except Exception as e:
+                        brain_pdf, brain_norm_pdf = None, None
+                        print(f"[generate_preprocessing_qc_pdfs][WARN] Failed for {pdir}: {e}")
+                    results.append({
+                        "patient_dir": pdir,
+                        "qc_brain_pdf": brain_pdf,
+                        "qc_brain_norm_pdf": brain_norm_pdf,
+                    })
+                    if pbar_pat is not None:
+                        pbar_pat.update(1)
+                    if pbar_ex is not None:
+                        pbar_ex.update(patient_exam_counts.get(pdir, 0))
+    finally:
+        if pbar_pat is not None:
+            pbar_pat.close()
+        if pbar_ex is not None:
+            pbar_ex.close()
+
+    return results
 def _build_cli_parser() -> "argparse.ArgumentParser":
     # Combine RawText (preserve newlines) + show defaults
     class _SmartFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -3811,6 +3971,32 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             unexpected_multiframe_policy=getattr(a, "unexpectedMultiframePolicy", "keep_first"),
         )
     p.set_defaults(func=_run_convert)
+
+    # ---- generate_preprocessing_qc_pdfs
+    p = sub.add_parser(
+        "generate_preprocessing_qc_pdfs",
+        help="Generate per-patient QC PDF(s) from preprocessed NIfTI volumes.",
+        formatter_class=_SmartFormatter,
+    )
+    p.add_argument("--dir", required=True, help="Root directory of preprocessed MRIs: {dir}/{patient_dirs}/{exam_dirs}.")
+    p.add_argument("--n_workers", type=int, default=None, help="Parallel workers (per-patient).")
+    p.add_argument("--outDir", default=None, help="Optional output directory for PDFs (default: patient_dir).")
+    p.add_argument("--maxExamsPerPage", type=int, default=4, help="Max exams per PDF page (landscape).")
+    p.add_argument("--leftMarginScale", type=float, default=2.25, help="Scale factor for left margin used by row labels.")
+    p.add_argument("--noProgress", action="store_true", help="Disable progress bars.")
+
+    def _run_qc(a):
+        generate_preprocessing_qc_pdfs(
+            root_dir=a.dir,
+            n_workers=a.n_workers,
+            out_dir=a.outDir,
+            show_progress=not a.noProgress,
+            max_exams_per_page=a.maxExamsPerPage,
+            left_margin_scale=a.leftMarginScale,
+        )
+
+    p.set_defaults(func=_run_qc)
+
 
 
     return parser

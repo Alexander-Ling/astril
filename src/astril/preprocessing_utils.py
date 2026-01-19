@@ -2982,3 +2982,267 @@ def copy_sidecars_for_output(sidecar_paths: list[str], source_nifti: str, output
         if not dry_run:
             shutil.copy2(sp, dest)
     return dests
+
+
+# -----------------------------------------------------------------------------
+# QC PDF helpers for preprocessed MRI libraries
+# -----------------------------------------------------------------------------
+#
+# These helpers support generate_preprocessing_qc_pdfs() in preprocess.py.
+# They are imported lazily where possible.
+
+# Optional plotting deps (only used by QC PDF helpers)
+try:
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+except Exception:
+    plt = None
+    PdfPages = None
+
+
+def parse_preprocessed_series_filename(fname: str):
+    """Parse filenames like:
+
+        {patient}_{timepoint}_{series_type}_brain.nii.gz
+        {patient}_{timepoint}_{series_type}_brain_norm.nii.gz
+
+    Returns
+    -------
+    (patient, timepoint, series_type, kind) or None
+        kind is 'brain' or 'brain_norm'
+    """
+    base = os.path.basename(fname)
+    if not base.endswith('.nii.gz'):
+        return None
+    if base.endswith('_unregistered.nii.gz'):
+        return None
+
+    kind = None
+    stem = base[:-7]  # strip .nii.gz
+    if stem.endswith('_brain_norm'):
+        kind = 'brain_norm'
+        core = stem[:-11]
+    elif stem.endswith('_brain'):
+        kind = 'brain'
+        core = stem[:-6]
+    else:
+        return None
+
+    parts = core.split('_')
+    if len(parts) < 3:
+        return None
+    patient = parts[0]
+    timepoint = parts[1]
+    series_type = '_'.join(parts[2:])
+    if not series_type:
+        return None
+    return patient, timepoint, series_type, kind
+
+
+def iter_patient_exam_dirs(root_dir: str):
+    root_dir = os.path.abspath(os.fspath(root_dir))
+    for pd in sorted(os.listdir(root_dir)):
+        pdir = os.path.join(root_dir, pd)
+        if not os.path.isdir(pdir):
+            continue
+        exam_dirs = []
+        try:
+            for ed in sorted(os.listdir(pdir)):
+                edir = os.path.join(pdir, ed)
+                if os.path.isdir(edir):
+                    exam_dirs.append(edir)
+        except Exception:
+            exam_dirs = []
+        yield pdir, exam_dirs
+
+
+def sort_series_types(series_types: list[str]) -> list[str]:
+    """Stable, deterministic series ordering.
+
+    Groups derived under parent prefix (first token before underscore), then sorts within.
+    Parent series appears before derived series.
+    """
+    def key(s: str):
+        parts = s.split('_')
+        parent = parts[0]
+        # parent should sort before derived: derived_flag = 1 if derived else 0
+        derived_flag = 1 if len(parts) > 1 else 0
+        rest = '_'.join(parts[1:]) if len(parts) > 1 else ''
+        return (parent, derived_flag, rest)
+
+    return sorted(series_types, key=key)
+
+
+def collect_preprocessed_series_types(root_dir: str) -> list[str]:
+    """Scan entire library and return global ordered list of series types."""
+    series = set()
+    for pdir, exam_dirs in iter_patient_exam_dirs(root_dir):
+        for edir in exam_dirs:
+            try:
+                for fn in os.listdir(edir):
+                    parsed = parse_preprocessed_series_filename(fn)
+                    if not parsed:
+                        continue
+                    _patient, _tp, series_type, _kind = parsed
+                    series.add(series_type)
+            except Exception:
+                continue
+    return sort_series_types(list(series))
+
+
+def _robust_scale_to_uint8(slice2d: np.ndarray) -> np.ndarray:
+    """Percentile-based scaling to 0..255 for display."""
+    x = np.asarray(slice2d, dtype=float)
+    if not np.isfinite(x).any():
+        return np.zeros_like(x, dtype=np.uint8)
+    lo, hi = np.nanpercentile(x, [1, 99])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = np.nanmin(x)
+        hi = np.nanmax(x)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return np.zeros_like(x, dtype=np.uint8)
+    y = (x - lo) / (hi - lo)
+    y = np.clip(y, 0.0, 1.0)
+    return (y * 255.0).astype(np.uint8)
+
+
+def load_center_axial_slice(nifti_path: str) -> np.ndarray:
+    """Load NIfTI, take frame 0 if 4D, return center axial slice as uint8."""
+    img = nib.load(nifti_path)
+    data = img.get_fdata()
+    if data.ndim == 4:
+        data = data[..., 0]
+    if data.ndim != 3:
+        raise ValueError(f"Expected 3D or 4D NIfTI for QC slice, got ndim={data.ndim}: {nifti_path}")
+    z = data.shape[2] // 2
+    sl = data[:, :, z]
+    # Display convention: transpose to show radiological-ish orientation consistently
+    sl = np.asarray(sl).T
+    return _robust_scale_to_uint8(sl)
+
+
+def _collect_exam_images(exam_dir: str):
+    """Return mapping kind->series_type->path for one exam dir."""
+    out = {'brain': {}, 'brain_norm': {}}
+    try:
+        for fn in os.listdir(exam_dir):
+            parsed = parse_preprocessed_series_filename(fn)
+            if not parsed:
+                continue
+            _patient, _tp, series_type, kind = parsed
+            out[kind][series_type] = os.path.join(exam_dir, fn)
+    except Exception:
+        pass
+    return out
+
+
+def generate_patient_qc_pdfs(
+    patient_dir: str,
+    series_order: list[str],
+    out_dir: str | None = None,
+    *,
+    max_exams_per_page: int = 4,
+    left_margin_scale: float = 2.25,
+) -> tuple[str | None, str | None]:
+    """Generate two PDFs for a patient: brain and brain_norm.
+
+    The page height is always 8.5" and row heights are fixed by always allocating
+    max_exams_per_page exam slots per page (unused slots are left blank).
+
+    Width is 2.25" per series column.
+    """
+    if plt is None or PdfPages is None:
+        raise ImportError("matplotlib is required to generate QC PDFs (install matplotlib).")
+
+    patient_dir = os.path.abspath(os.fspath(patient_dir))
+    if not os.path.isdir(patient_dir):
+        return None, None
+
+    exam_names = [d for d in sorted(os.listdir(patient_dir)) if os.path.isdir(os.path.join(patient_dir, d))]
+    exam_dirs = [os.path.join(patient_dir, d) for d in exam_names]
+    if not exam_dirs:
+        return None, None
+
+    # output location
+    patient_name = os.path.basename(patient_dir.rstrip(os.sep))
+    out_base_dir = os.path.abspath(os.fspath(out_dir)) if out_dir else patient_dir
+    os.makedirs(out_base_dir, exist_ok=True)
+    out_brain = os.path.join(out_base_dir, f"{patient_name}_qc_brain.pdf")
+    out_norm = os.path.join(out_base_dir, f"{patient_name}_qc_brain_norm.pdf")
+
+    def _write(kind: str, out_path: str):
+        n_series = len(series_order)
+        # page geometry
+        page_h = 8.5
+        page_w = 2.25 * max(1, n_series)
+
+        # allocate an extra label column (inches) via gridspec width ratios
+        label_w_units = 0.4 * float(left_margin_scale)  # relative units vs series cols
+        width_ratios = [label_w_units] + [1.0] * n_series
+
+        # rows: max_exams_per_page exams, 2 rows each
+        n_rows = max_exams_per_page
+        n_rows_total = n_rows + 1  # header row
+        height_ratios = [0.25] + [1.0] * n_rows
+
+        with PdfPages(out_path) as pdf:
+            # paginate exams
+            for start in range(0, len(exam_dirs), max_exams_per_page):
+                batch = list(zip(exam_names[start:start+max_exams_per_page], exam_dirs[start:start+max_exams_per_page]))
+                # pad to full page rows for consistent row height
+                while len(batch) < max_exams_per_page:
+                    batch.append((None, None))
+
+                fig = plt.figure(figsize=(page_w, page_h))
+                gs = fig.add_gridspec(nrows=n_rows_total, ncols=n_series + 1, width_ratios=width_ratios, height_ratios=height_ratios)
+
+                # column headers
+                for c, st in enumerate(series_order):
+                    axh = fig.add_subplot(gs[0, c+1])
+                    axh.axis('off')
+                    axh.text(0.5, 0.5, st, ha='center', va='center', fontsize=8, rotation=0)
+
+                # For each exam slot
+                for i, (ename, edir) in enumerate(batch):
+                    # each exam uses two rows: raw+norm in original design; here we only render one kind
+                    r0 = 1 + i
+
+                    # row label spanning two rows (place on first row)
+                    axlbl = fig.add_subplot(gs[r0, 0])
+                    axlbl.axis('off')
+                    if ename is not None:
+                        axlbl.text(0.0, 0.5, ename, ha='left', va='center', fontsize=8)
+
+                    if edir is None:
+                        # fill blank axes
+                        rr = r0
+                        for c in range(n_series):
+                            ax = fig.add_subplot(gs[rr, c+1])
+                            ax.axis('off')
+                        continue
+
+                    exam_map = _collect_exam_images(edir)
+                    # occupy both rows with the same kind (top row used, bottom row blank to keep 2-row structure)
+                    # top row: images
+                    rr = r0
+                    for c, st in enumerate(series_order):
+                        ax = fig.add_subplot(gs[rr, c+1])
+                        ax.axis('off')
+                        pth = exam_map.get(kind, {}).get(st)
+                        if pth:
+                            try:
+                                sl = load_center_axial_slice(pth)
+                                ax.imshow(sl, cmap='gray', aspect='auto')
+                            except Exception:
+                                # leave blank on error
+                                pass
+
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+    _write('brain', out_brain)
+    _write('brain_norm', out_norm)
+    return out_brain, out_norm
