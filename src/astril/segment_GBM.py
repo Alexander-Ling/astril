@@ -15,29 +15,11 @@ import argparse
 import shutil
 from pathlib import Path
 import configparser
-
-# Import existing segmentation pipeline functions.
-from .create_segmentation_config import create_segmentation_config, parse_train_config_for_model_parameters
-from .remap_gt_classes import remap_gt_classes
-from .merge_seg_volumes import merge_seg_volumes
-from .quantify_volumes import quantify_segmentation_volumes
-
-# For later use in our helper functions, import functions from run_segmentation.
-from .run_segmentation import (
-    read_paths_from_file,
-    load_val_data,
-    ValDataGenerator,
-    undo_all_transforms,
-    apply_inverse_canonical_4d,
-    majority_vote,
-    custom_objects_dict,
-    load_pretrained_model,
-    load_models_for_config,
-)
-import nibabel as nib
-import numpy as np
-from tensorflow.keras.models import load_model
-from .models_download import locate_models_dir
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    # Optional: keeps editors/type-checkers happy without importing at runtime
+    import nibabel as nib  # noqa: F401
+    import numpy as np     # noqa: F401
 
 # ------------------------------------------------------------
 # Model set specification (single source of truth)
@@ -54,6 +36,8 @@ GBM_V1_SPEC = {
 
 def _resolve_gbm_family_root(family: str = "GBM_seg_v1") -> Path:
     """Base directory where the GBM model family lives inside package models/."""
+    # Lazy import so CLI help is instant (avoid importing anything heavy at module import time)
+    from .models_download import locate_models_dir
     return Path(locate_models_dir()) / family
 
 def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1"):
@@ -184,6 +168,18 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     Process one subject (identified by its mask file in the segmentation config)
     using the provided pre-loaded models (for one segmentation stage).
     """
+    # Lazy imports: avoid TF/nibabel/numpy at module import time
+    import nibabel as nib
+    import numpy as np
+    from .run_segmentation import (
+        read_paths_from_file,
+        load_val_data,
+        ValDataGenerator,
+        undo_all_transforms,
+        apply_inverse_canonical_4d,
+        majority_vote,
+    )
+
     # Parse segmentation config file.
     cp = configparser.ConfigParser()
     cp.read(seg_config_file)
@@ -319,6 +315,17 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
       5. Process Model 2 segmentation.
       6. Clean up intermediate files in the subject's directory immediately.
     """
+    # Lazy imports: avoid importing these (and their transitive deps) unless we actually run segmentation
+    from .create_segmentation_config import (
+        create_segmentation_config,
+        parse_train_config_for_model_parameters,
+    )
+    from .remap_gt_classes import remap_gt_classes
+    from .run_segmentation import (
+        read_paths_from_file,
+        load_models_for_config,
+    )
+
     if channel_patterns is None:
         channel_patterns = ["_T1c_brain_norm.nii.gz",
                             "_T1n_brain_norm.nii.gz",
@@ -478,9 +485,12 @@ def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_o
 
 
 def main():
-
+    import __main__
+    module = getattr(__main__, "__spec__", None)
+    prog = f"python -m {module.name}" if module and module.name else None
     parser = argparse.ArgumentParser(
-        description="Run the full GBM segmentation pipeline using pre-trained models."
+        prog=prog,
+        description="Run the full GBM segmentation pipeline using pre-trained models. Output segmentation volumes will have 4 levels: 0 = normal brain, 1 = tumor, 2 = surgical artefact, 3 = edema"
     )
     parser.add_argument("input_directory",
                         help="Directory containing input scans for segmentation.")

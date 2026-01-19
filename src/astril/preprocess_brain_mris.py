@@ -640,7 +640,11 @@ def _parse_family_parent_map(val: str | None) -> dict[str, str] | None:
 
 
 def main():
+    import __main__
+    module = getattr(__main__, "__spec__", None)
+    prog = f"python -m {module.name}" if module and module.name else None
     p = argparse.ArgumentParser(
+        prog=prog,
         description="Batch brain MRI preprocessing over a NIFTI library (patient/exam tree)."
     )
     p.add_argument("--in_dir", required=True, help="Path to NIFTI library root (converted by convert_dicom_plan).")
