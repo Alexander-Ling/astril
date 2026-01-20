@@ -137,16 +137,16 @@ def compute_final_segmentation_path(mask_path, original_mask_pattern, final_mask
       original_mask_pattern (str): The pattern used to create the Model 1 mask file 
           (typically provided via --brainmask_pattern).
       final_mask_pattern (str): The pattern used for Model 2 mask files (e.g. "_Model_2_mask.nii.gz").
-      segment_suffix (str): The suffix to use in the final segmentation filename (e.g. "_GBM_seg.nii.gz").
+      segment_suffix (str): The suffix to use in the final segmentation filename (e.g. "_GBM-seg.nii.gz").
 
     Returns:
       Path: The full path (as a Path object) to the expected final segmentation file.
       
     Example:
-      If mask_path is "074_d_62_E39089072_brainmask.nii.gz", original_mask_pattern is
+      If mask_path is "074_d_62_E12345_brainmask.nii.gz", original_mask_pattern is
       "_brainmask.nii.gz", final_mask_pattern is "_Model_2_mask.nii.gz", and segment_suffix is
-      "_GBM_seg.nii.gz", then the function returns a Path corresponding to
-      "074_d_62_E39089072_GBM_seg.nii.gz".
+      "_GBM-seg.nii.gz", then the function returns a Path corresponding to
+      "074_d_62_E12345_GBM-seg.nii.gz".
     """
     base_name = os.path.basename(mask_path)
     if final_mask_pattern in base_name:
@@ -304,7 +304,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
 def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
                              overwrite_existing_outputs=False,
                              channel_patterns=None, brainmask_pattern="_brainmask.nii.gz",
-                             segment_suffix="_GBM_seg.nii.gz", debug_models=False):
+                             segment_suffix="_GBM-seg.nii.gz", debug_models=False):
     """
     Implements the GBM segmentation pipeline per subject:
       1. Create and use a Model 1 segmentation config for all subjects.
@@ -327,10 +327,10 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     )
 
     if channel_patterns is None:
-        channel_patterns = ["_T1c_brain_norm.nii.gz",
-                            "_T1n_brain_norm.nii.gz",
-                            "_T2f_brain_norm.nii.gz",
-                            "_T2w_brain_norm.nii.gz"]
+        channel_patterns = ["_T1c_brain-norm.nii.gz",
+                            "_T1n_brain-norm.nii.gz",
+                            "_T2f_brain-norm.nii.gz",
+                            "_T2w_brain-norm.nii.gz"]
     channels = ["t1c", "t1n", "t2f", "t2w"]
     
     working_dir = os.path.join(input_dir, "Segmentation_Configs")
@@ -502,11 +502,11 @@ def main():
                         help="Overwrite existing segmentation outputs if they exist.")
     parser.add_argument("--channel_patterns", nargs="+",
                         help=("List of filename patterns for the input scans (in order: T1-post, T1-pre, T2-FLAIR, and T2). "
-                              "Default: _T1c_brain_norm.nii.gz _T1n_brain_norm.nii.gz _T2f_brain_norm.nii.gz _T2w_brain_norm.nii.gz"))
+                              "Default: _T1c_brain-norm.nii.gz _T1n_brain-norm.nii.gz _T2f_brain-norm.nii.gz _T2w_brain-norm.nii.gz"))
     parser.add_argument("--brainmask_pattern", type=str, default="_brainmask.nii.gz",
                         help="Brainmask pattern for Model 1 (default: _brainmask.nii.gz)")
-    parser.add_argument("--segment_suffix", type=str, default="_GBM_seg.nii.gz",
-                        help="Suffix to use in the final segmentation file names (default: _GBM_seg.nii.gz)")
+    parser.add_argument("--segment_suffix", type=str, default="_GBM-seg.nii.gz",
+                        help="Suffix to use in the final segmentation file names (default: _GBM-seg.nii.gz)")
     args = parser.parse_args()
 
     # Fail early with a clear instruction if user hasn't fetched models yet

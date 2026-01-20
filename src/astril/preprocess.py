@@ -803,8 +803,8 @@ def register_images(
     # Optional dummy references
     if save_dummy_ref and transform_path:
         base = os.path.splitext(str(transform_path))[0]
-        fixed_dummy_path = base + "_fixed_ref.nii.gz"
-        moving_dummy_path = base + "_moving_ref.nii.gz"
+        fixed_dummy_path = base + "-fixed-ref.nii.gz"
+        moving_dummy_path = base + "-moving-ref.nii.gz"
 
         for ref_img, path in [(fixed_for_reg, fixed_dummy_path), (moving_for_reg, moving_dummy_path)]:
             zero_array = np.zeros(sitk.GetArrayFromImage(ref_img).shape, dtype=np.float32)
@@ -2923,8 +2923,22 @@ def convert_dicom_plan(
 
     # ---------- expected-4D validation helpers ----------
     def _base_label(lbl: str) -> str:
-        s = str(lbl or '').strip()
-        return s.split('(', 1)[0].strip().upper()
+         # Base label is the parent "family" name for a series label.
+         #
+         # New convention: derived labels use '-' within the label (e.g., DWI-FA).
+         # Classifier labels may use parentheses (e.g., DWI(FA)).
+         # Legacy data may still include '_' (e.g., DWI_FA).
+         s = str(lbl or "").strip()
+         # Parentheses form: DWI(FA) -> DWI
+         if '(' in s:
+             s = s.split('(', 1)[0]
+         # Hyphen form: DWI-FA -> DWI
+         if '-' in s:
+             s = s.split('-', 1)[0]
+         # Legacy underscore form: DWI_FA -> DWI
+         if '_' in s:
+             s = s.split('_', 1)[0]
+         return s.strip().upper()
 
     _EXPECTED_4D_BASE_LABELS = {"DWI", "PERFUSION"}
 
@@ -3140,12 +3154,17 @@ def convert_dicom_plan(
                 # We keep NIfTI + sidecars as primary outputs.
                 try:
                     lbl_raw = (rec.get("final_label") or rec.get("PrimaryLabel") or "").strip()
-                    lbl = lbl_raw.upper()
-                    # Accept common diffusion parent labels
-                    is_parent_diffusion = (lbl == "DWI") or lbl.startswith("DWI_") or (lbl == "DTI")
+                    raw_up = lbl_raw.upper()
+                    # Only export NRRD for the *base primary* acquisitions explicitly supported:
+                    #   - DWI
+                    #   - PERFUSION
+                    #
+                    # Important: vendor-derived maps can still be Action=CONVERT and look like
+                    # "DWI(FA)" / "DWI-FA" / legacy "DWI_FA". We must NOT export NRRD for those.
+                    is_base_primary = raw_up in {"DWI", "PERFUSION"}
                     is_derived = bool((rec.get("DerivedLabel") or "").strip()) or (str(rec.get("Action","")).upper() == "DERIVE")
-
-                    if is_parent_diffusion and not is_derived:
+ 
+                    if is_base_primary and not is_derived:
                         from .preprocessing_utils import export_dwi_nrrd_from_dicoms
                         if out_path.lower().endswith(".nii.gz"):
                             stem = out_path[:-7]
@@ -3429,7 +3448,7 @@ def generate_preprocessing_qc_pdfs(
 
     Filenames expected:
         {patient}_{timepoint}_{seriesType}_brain.nii.gz
-        {patient}_{timepoint}_{seriesType}_brain_norm.nii.gz
+        {patient}_{timepoint}_{seriesType}_brain-norm.nii.gz
 
     Skips:
         - *_unregistered.nii.gz
@@ -3437,7 +3456,7 @@ def generate_preprocessing_qc_pdfs(
 
     Produces two PDFs per patient:
         - *_qc_brain.pdf
-        - *_qc_brain_norm.pdf
+        - *_qc_brain-norm.pdf
     """
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -3463,7 +3482,7 @@ def generate_preprocessing_qc_pdfs(
     if not series_order:
         raise RuntimeError(
             "No eligible preprocessed NIfTI files found under --dir. "
-            "Expected *_brain.nii.gz or *_brain_norm.nii.gz under {patient}/{exam}/"
+            "Expected *_brain.nii.gz or *_brain-norm.nii.gz under {patient}/{exam}/ (legacy *_brain_norm also supported)."
         )
 
     # count exams for progress reporting

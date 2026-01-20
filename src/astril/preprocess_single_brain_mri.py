@@ -226,13 +226,14 @@ def run_preprocessing_pipeline(
 
 
     def _label_family(label: str) -> str:
-        # Default family grouping: prefix before first underscore (e.g., DWI_TRACE -> DWI)
-        return label.split("_")[0] if "_" in label else label
+        # Default family grouping: prefix before first within-field separator ('-' preferred; legacy '_' supported)
+        # Examples: DWI-TRACE -> DWI, DWI_TRACE -> DWI
+        return label.split('-', 1)[0] if '-' in label else (label.split('_', 1)[0] if '_' in label else label)
 
     def _estimate_and_record_registration(lbl: str, src: str):
         # Estimate a new transform lbl->anchor, save reg volume, move tfm + dummy refs, record provenance.
         ndim, shape = get_nifti_ndim(src)
-        tfm = os.path.join(temp_dir, f"{lbl}_to_{anchor_label}.tfm")
+        tfm = os.path.join(temp_dir, f"{lbl}-to-{anchor_label}.tfm")
 
         # Note: 4D scans are allowed as family parents so we can estimate a transform from the 4D series
         # to the anchor (typically from a representative frame). However, we do not carry forward a registered
@@ -296,8 +297,8 @@ def run_preprocessing_pipeline(
         tfm_dest = os.path.join(transform_dir, os.path.basename(tfm))
         shutil.move(tfm, tfm_dest)
 
-        moving_ref_dummy = tfm.replace(".tfm", "_moving_ref.nii.gz")
-        fixed_ref_dummy = tfm.replace(".tfm", "_fixed_ref.nii.gz")
+        moving_ref_dummy = tfm.replace(".tfm", "-moving-ref.nii.gz")
+        fixed_ref_dummy = tfm.replace(".tfm", "-fixed-ref.nii.gz")
 
         moving_ref_dest = os.path.join(transform_dir, os.path.basename(moving_ref_dummy))
         fixed_ref_dest = os.path.join(transform_dir, os.path.basename(fixed_ref_dummy))
@@ -310,7 +311,7 @@ def run_preprocessing_pipeline(
             "moving_reference": f"./{transform_basedir}/{os.path.basename(moving_ref_dest)}",
             "estimated_from": "frame0" if ndim == 4 else "volume",
         }
-        transform_records[lbl]["initial_registration"] = info
+        transform_records[lbl]["initial-registration"] = info
         return info, ndim
 
     def _apply_parent_transform(lbl: str, src: str, parent_info: dict, parent_ndim: int, parent_label: str, parent_src: str):
@@ -351,7 +352,7 @@ def run_preprocessing_pipeline(
             raise ValueError(f"Unsupported NIfTI dimensionality for label '{lbl}': ndim={ndim} path={src}")
 
         # Record provenance: reuse parent transform/refs, and note the parent label used.
-        transform_records[lbl]["initial_registration"] = {
+        transform_records[lbl]["initial-registration"] = {
             **parent_info,
             "applied_from_parent": parent_label,
             "estimated_from": "frame0" if ndim == 4 else "volume",
@@ -464,8 +465,8 @@ def run_preprocessing_pipeline(
         coreg_tfm_dest = os.path.join(transform_dir, os.path.basename(coreg_tfm))
         shutil.move(coreg_tfm, coreg_tfm_dest)
 
-        coreg_moving_ref_dummy = coreg_tfm.replace(".tfm", "_moving_ref.nii.gz")
-        coreg_fixed_ref_dummy = coreg_tfm.replace(".tfm", "_fixed_ref.nii.gz")
+        coreg_moving_ref_dummy = coreg_tfm.replace(".tfm", "-moving-ref.nii.gz")
+        coreg_fixed_ref_dummy = coreg_tfm.replace(".tfm", "-fixed-ref.nii.gz")
         coreg_moving_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_moving_ref_dummy))
         coreg_fixed_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_fixed_ref_dummy))
         shutil.move(coreg_moving_ref_dummy, coreg_moving_ref_dest)
@@ -577,7 +578,7 @@ def run_preprocessing_pipeline(
             print(f"[Step 4b] Skull-strip 4D scan (native space, unregistered): {lbl}")
 
         # Estimate a forward transform (4D->anchor) using register_images, but we do not keep the resampled 4D output.
-        tfm = os.path.join(temp_dir, f"{lbl}_to_{anchor_label}.tfm")
+        tfm = os.path.join(temp_dir, f"{lbl}-to-{anchor_label}.tfm")
         tmp_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_TEMP_REG_SHOULD_NOT_USE.nii.gz")
         register_images(
             fixed_path=coreg_anchor_path,
@@ -667,13 +668,13 @@ def run_preprocessing_pipeline(
 
     # Optionally save skull-containing (registered/coregistered) scans
     if save_scans_with_skulls:
-        skull_dir = os.path.join(output_dir, "with_skulls")
+        skull_dir = os.path.join(output_dir, "with-skulls")
         os.makedirs(skull_dir, exist_ok=True)
         for lbl, src_reg in reg_paths.items():
             # Avoid writing 4D skull volumes (they should not be registered outputs in this pipeline).
             if ndim_by_label.get(lbl, 3) == 4:
                 continue
-            shutil.copy(src_reg, os.path.join(skull_dir, f"{basename_prefix}_{lbl}_with_skull.nii.gz"))
+            shutil.copy(src_reg, os.path.join(skull_dir, f"{basename_prefix}_{lbl}_with-skull.nii.gz"))
 
     # ---- Step 5: normalize masked scans ----
     if verbose:
@@ -682,7 +683,7 @@ def run_preprocessing_pipeline(
     norm_paths: dict[str, str] = {}
     # 3D only: 4D scans are intentionally not normalized
     for lbl, src_brain in brain_paths.items():
-        out_norm = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain_norm_temp.nii.gz")
+        out_norm = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain-norm_temp.nii.gz")
         normalize_masked_anydim(src_brain, brainmask_temp, out_norm)
         norm_paths[lbl] = out_norm
 
@@ -700,7 +701,7 @@ def run_preprocessing_pipeline(
 
     for lbl in threed_labels:
         out_brain = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain.nii.gz")
-        out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain_norm.nii.gz")
+        out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain-norm.nii.gz")
         resize_mri(brain_paths[lbl], out_brain, final_dims, final_voxels, interp="linear")
         resize_mri(norm_paths[lbl], out_norm, final_dims, final_voxels, interp="linear")
         final_brain_paths[lbl] = out_brain
@@ -736,14 +737,14 @@ def run_preprocessing_pipeline(
             pass
 
         # Save transform record for each label
-        record_path = os.path.join(output_dir, f"{basename_prefix}_{lbl}_transform_record.json")
+        record_path = os.path.join(output_dir, f"{basename_prefix}_{lbl}_transform-record.json")
         transform_records[lbl]["inputs"] = {"original": os.fspath(scans[lbl])}
         transform_records[lbl]["outputs"] = {
             "brain": os.path.basename(out_brain),
-            "brain_norm": os.path.basename(out_norm),
+            "brain-norm": os.path.basename(out_norm),
         }
         transform_records[lbl]["brainmask"] = os.path.basename(os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz"))
-        transform_records[lbl]["brainmask_source"] = brainmask_source
+        transform_records[lbl]["brainmask-source"] = brainmask_source
         with open(record_path, "w") as f:
             json.dump(transform_records[lbl], f, indent=2)
 

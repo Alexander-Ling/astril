@@ -1847,7 +1847,8 @@ def build_derived_output_name(exam_alias: str, out_root: str, primary_label: str
       {out_root}/{exam_alias}/{derived_label}.nii.gz
     """
     exam_alias = str(exam_alias).strip().replace(os.sep, "_")
-    derived_label = str(derived_label).strip().replace(" ", "_")
+    # Within-field separators should be '-', not '_'. Use the global sanitizer.
+    derived_label = _sanitize_label(str(derived_label).strip())
     return os.path.join(out_root, exam_alias, f"{derived_label}.nii.gz")
 
 
@@ -2086,8 +2087,15 @@ def _finalize_output(src_nii: str, dest_nii: str) -> str:
         and base diffusion modality exactly "DWI".
         """
         stem = os.path.basename(_base(path_nii))
-        # base DWI ends with _DWI (and NOT _DWI_<something>)
-        return stem.upper().endswith("_DWI")
+        # Parse outer underscore-delimited fields and inspect the *series label* field.
+        # New convention: label-internal separators use '-', so a derived diffusion like
+        # {pid}_{tp}_DWI-FA would have label "DWI-FA", while base diffusion is exactly "DWI".
+        parts = stem.split("_")
+        if len(parts) < 3:
+            return False
+        series_label = parts[2].strip().upper()
+        # Base DWI must be exactly DWI (not DWI-FA / DWI(FA) / etc.)
+        return series_label == "DWI"
 
     # Always carry JSON. Only carry diffusion vectors for base DWI outputs.
     exts = [".json"]
@@ -2300,11 +2308,29 @@ def update_fsl_vectors_after_transform(
         return out
 
 def _sanitize_label(lbl: str) -> str:
-    if lbl is None: return "Unknown"
+    """Sanitize a label for use inside filenames.
+
+    **Naming policy:** outer filename fields are separated by underscores, but *within-field*
+    separators must be hyphens ("-"). This function therefore converts underscores to
+    hyphens to prevent ambiguous parsing later.
+    """
+    if lbl is None:
+        return "Unknown"
+
     s = str(lbl).strip()
-    s = s.replace("(", "_").replace(")", "_")
-    s = re.sub(r"[^\w\-\+\.]+", "_", s)
-    s = re.sub(r"__+", "_", s).strip("_")
+
+    # Never allow underscores inside the field; treat them as within-field separators.
+    s = s.replace("_", "-")
+
+    # Replace common punctuation with within-field separator.
+    s = s.replace("(", "-").replace(")", "-")
+
+    # Keep alphanumerics and a conservative set of safe characters; convert everything else to '-'.
+    # NOTE: '\w' includes '_' but we've already converted '_' to '-'.
+    s = re.sub(r"[^\w\-\+\.]+", "-", s)
+
+    # Collapse repeated separators and trim.
+    s = re.sub(r"-+", "-", s).strip("-")
     return s or "Unknown"
 
 
@@ -3006,12 +3032,12 @@ def parse_preprocessed_series_filename(fname: str):
     """Parse filenames like:
 
         {patient}_{timepoint}_{series_type}_brain.nii.gz
-        {patient}_{timepoint}_{series_type}_brain_norm.nii.gz
+        {patient}_{timepoint}_{series_type}_brain-norm.nii.gz
 
     Returns
     -------
     (patient, timepoint, series_type, kind) or None
-        kind is 'brain' or 'brain_norm'
+        kind is 'brain' or 'brain_norm' (file tag 'brain' or 'brain-norm')
     """
     base = os.path.basename(fname)
     if not base.endswith('.nii.gz'):
@@ -3021,7 +3047,13 @@ def parse_preprocessed_series_filename(fname: str):
 
     kind = None
     stem = base[:-7]  # strip .nii.gz
-    if stem.endswith('_brain_norm'):
+
+    # New convention: kind tag uses within-field '-' (brain-norm).
+    # Backwards-compatible with legacy *_brain_norm filenames.
+    if stem.endswith('_brain-norm'):
+        kind = 'brain_norm'
+        core = stem[:-11]
+    elif stem.endswith('_brain_norm'):
         kind = 'brain_norm'
         core = stem[:-11]
     elif stem.endswith('_brain'):
@@ -3061,15 +3093,23 @@ def iter_patient_exam_dirs(root_dir: str):
 def sort_series_types(series_types: list[str]) -> list[str]:
     """Stable, deterministic series ordering.
 
-    Groups derived under parent prefix (first token before underscore), then sorts within.
+    Groups derived under parent prefix.
+
+    **New convention:** derived labels are separated from parent with '-' (e.g., DWI-FA).
+    This function remains backwards-compatible with legacy '_' (e.g., DWI_FA).
+
     Parent series appears before derived series.
     """
     def key(s: str):
-        parts = s.split('_')
-        parent = parts[0]
-        # parent should sort before derived: derived_flag = 1 if derived else 0
-        derived_flag = 1 if len(parts) > 1 else 0
-        rest = '_'.join(parts[1:]) if len(parts) > 1 else ''
+        if '-' in s:
+            parent, rest = s.split('-', 1)
+            derived_flag = 1
+        elif '_' in s:
+            parent, rest = s.split('_', 1)
+            derived_flag = 1
+        else:
+            parent, rest = s, ''
+            derived_flag = 0
         return (parent, derived_flag, rest)
 
     return sorted(series_types, key=key)
@@ -3170,13 +3210,13 @@ def generate_patient_qc_pdfs(
     out_base_dir = os.path.abspath(os.fspath(out_dir)) if out_dir else patient_dir
     os.makedirs(out_base_dir, exist_ok=True)
     out_brain = os.path.join(out_base_dir, f"{patient_name}_qc_brain.pdf")
-    out_norm = os.path.join(out_base_dir, f"{patient_name}_qc_brain_norm.pdf")
+    out_norm = os.path.join(out_base_dir, f"{patient_name}_qc_brain-norm.pdf")
 
     def _write(kind: str, out_path: str):
         n_series = len(series_order)
         # page geometry
         page_h = 8.5
-        page_w = 2.25 * max(1, n_series)
+        page_w = 2.15 * max(1, n_series)
 
         # allocate an extra label column (inches) via gridspec width ratios
         label_w_units = 0.4 * float(left_margin_scale)  # relative units vs series cols
