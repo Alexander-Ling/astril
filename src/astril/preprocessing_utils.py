@@ -21,6 +21,7 @@ import subprocess
 import glob
 import contextlib
 import threading
+import atexit
 from scipy.ndimage import zoom
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -31,6 +32,43 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+
+# --- temp-dir leak prevention for dcm2niix conversions ---
+# Some call paths request an explicit output_path (so the converted NIfTI is immediately moved/copied
+# out of a dcm2niix temp folder). Historically, those temp folders were not removed, which can
+# accumulate and fill disks during large conversions.
+_TEMP_DIRS_FOR_ATEXIT_CLEANUP: set[str] = set()
+_TEMP_DIRS_FOR_ATEXIT_LOCK = threading.Lock()
+
+
+def _register_temp_dir_for_atexit(d: str, *, verbose=None) -> None:
+    """Register a temp directory for best-effort cleanup at process exit."""
+    if not d:
+        return
+    # Normalize and only register existing directories.
+    try:
+        d = os.path.abspath(d)
+    except Exception:
+        return
+    if not os.path.isdir(d):
+        return
+    with _TEMP_DIRS_FOR_ATEXIT_LOCK:
+        _TEMP_DIRS_FOR_ATEXIT_CLEANUP.add(d)
+
+
+def _cleanup_registered_temp_dirs() -> None:
+    # Avoid holding the lock while deleting.
+    with _TEMP_DIRS_FOR_ATEXIT_LOCK:
+        dirs = list(_TEMP_DIRS_FOR_ATEXIT_CLEANUP)
+        _TEMP_DIRS_FOR_ATEXIT_CLEANUP.clear()
+    for d in dirs:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_registered_temp_dirs)
 
 
 # -----------------------------------------------------------------------------
@@ -1922,16 +1960,35 @@ def _nifti_from_any(input_path_or_dir: str,
     Accept a DICOM series directory or a NIfTI file path.
     If DICOM dir, convert to a temp NIfTI (keeping 4D if present).
     Uses dcm2niix (emits bval/bvec when applicable) with optional JPEG-lossless transcode+retry.
-    Return (nifti_path, cleanup_temp_bool). If output_path is provided, the returned path is output_path and cleanup=False.
+
+    Return (nifti_path, cleanup_temp_bool).
+      * If output_path is provided, the returned path is output_path and cleanup_temp_bool=False.
+      * If output_path is None and the input is DICOM, the returned NIfTI path lives in a temp folder and
+        cleanup_temp_bool=True (best-effort cleanup is registered for process exit).
     """
     if _is_dicom_dir(input_path_or_dir):
         _dbg(verbose, "Input is DICOM dir:", input_path_or_dir)
         # Ensure dcm2niix exists
         if not _which("dcm2niix"):
             raise RuntimeError("dcm2niix not found on PATH. Please install dcm2niix and ensure it is discoverable.")
+
+        tmpdirs_created: list[str] = []
+        def _mk_tmp(prefix: str) -> str:
+            d = tempfile.mkdtemp(prefix=prefix)
+            tmpdirs_created.append(d)
+            return d
+
+        def _cleanup_now():
+            # Best-effort cleanup of temp directories created in this call.
+            for d in reversed(tmpdirs_created):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+
         # Try dcm2niix (with optional transcode+retry)
         try:
-            tmpdir = tempfile.mkdtemp(prefix="dcm2niix_")
+            tmpdir = _mk_tmp(prefix="dcm2niix_")
             cmd = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir]
             _dbg(verbose, "running:", " ".join(cmd))
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1941,7 +1998,11 @@ def _nifti_from_any(input_path_or_dir: str,
                 _dbg(verbose, "dcm2niix failed; attempting JPEG-lossless transcode and retry.")
                 decoded = _transcode_dicom_dir_to_explicit_le(input_path_or_dir, verbose=verbose)
                 if decoded:
-                    tmpdir2 = tempfile.mkdtemp(prefix="dcm2niix_")
+                    # Track decoded dir for cleanup too
+                    if decoded not in tmpdirs_created:
+                        tmpdirs_created.append(decoded)
+
+                    tmpdir2 = _mk_tmp(prefix="dcm2niix_")
                     cmd2 = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir2, decoded]
                     _dbg(verbose, "retry:", " ".join(cmd2))
                     proc2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1964,7 +2025,11 @@ def _nifti_from_any(input_path_or_dir: str,
                         # Move/copy to output_path if requested
                         if output_path:
                             dest = _finalize_output(nifti_path, output_path)
+                            _cleanup_now()
                             return dest, False
+                        # Keep temp output around for the caller; cleanup at process exit.
+                        for d in tmpdirs_created:
+                            _register_temp_dir_for_atexit(d, verbose=verbose)
                         return nifti_path, True
                 # If transcode+retry did not succeed, fall through to fallback
                 err = (proc.stderr or proc.stdout or "").strip()
@@ -1990,10 +2055,16 @@ def _nifti_from_any(input_path_or_dir: str,
                 _dbg(verbose, "WARNING: failed to write JSON sidecar:", e)
             if output_path:
                 dest = _finalize_output(nifti_path, output_path)
+                _cleanup_now()
                 return dest, False
+
+            # Keep temp output around for the caller; cleanup at process exit.
+            for d in tmpdirs_created:
+                _register_temp_dir_for_atexit(d, verbose=verbose)
             return nifti_path, True
         except Exception as e:
-            # No fallback: surface the dcm2niix error clearly
+            # No fallback: surface the dcm2niix error clearly, but don't leak temp dirs
+            _cleanup_now()
             msg = f"dcm2niix could not convert '{input_path_or_dir}': {type(e).__name__}: {e}"
             _dbg(verbose, msg)
             raise RuntimeError(msg)
