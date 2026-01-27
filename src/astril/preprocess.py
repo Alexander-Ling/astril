@@ -3312,12 +3312,32 @@ def convert_dicom_plan(
         if convert_jobs:
             def _update_primary4d_ok(r: "pd.Series", rec: dict):
                 # Only track *primary* members of expected-4D families (DWI/Perfusion).
+                #
+                # IMPORTANT:
+                # Derivation may run in a later invocation where the primary NIfTI already exists.
+                # In that case _convert_row() returns status="exists" and we must re-validate the
+                # dimensionality from disk; otherwise we can incorrectly block DERIVE jobs.
                 try:
                     if _is_expected_4d_primary_row(r, rec):
+                        from .preprocessing_utils import get_nifti_ndim
+
                         key = (str(rec.get("ExamDirectory", "")), _base_label(rec.get("final_label", "")))
-                        if rec.get("status") == "ok":
-                            primary4d_ok[key] = True
+                        status = str(rec.get("status", "") or "").strip().lower()
+                        nii_path = str(rec.get("nii_path", "") or "").strip()
+
+                        # For both freshly converted and pre-existing primaries, confirm on-disk ndim.
+                        if status in {"ok", "exists"} and nii_path and os.path.isfile(nii_path):
+                            try:
+                                ndim, _shape = get_nifti_ndim(nii_path)
+                                if int(ndim) == 4:
+                                    primary4d_ok[key] = True
+                                else:
+                                    primary4d_ok.setdefault(key, False)
+                            except Exception:
+                                # If we can't read ndim, be conservative and mark as not-ok.
+                                primary4d_ok.setdefault(key, False)
                         else:
+                            # Any non-ok status (or missing file) is treated as not-ok.
                             primary4d_ok.setdefault(key, False)
                 except Exception:
                     pass
