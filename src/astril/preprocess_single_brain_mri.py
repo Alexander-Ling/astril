@@ -587,7 +587,7 @@ def run_preprocessing_pipeline(
     else:
         if verbose:
             print("[Step 3] HD-BET skull strip on anchor and generate brainmask...")
-        print(f"Creating temporary brainmask at {brainmask_temp}...")
+            print(f"Creating temporary brainmask at {brainmask_temp}...")
         run_hd_bet(
             input_path=coreg_anchor_path,
             output_path=None,
