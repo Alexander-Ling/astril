@@ -413,9 +413,35 @@ def run_preprocessing_pipeline(
  
         if parent is None:
             parent = _default_parent_for_family(fam, labels)
- 
-        parent_src = scans[parent]
-        parent_info, parent_ndim = _estimate_and_record_registration(parent, parent_src)
+
+        # ---- Robust parent selection: if chosen parent fails registration, try other labels in the family ----
+        parent_info = None
+        parent_ndim = None
+        parent_src = None
+
+        parent_candidates = [parent] + [l for l in labels if l != parent]
+        for cand in parent_candidates:
+            cand_src = scans[cand]
+            try:
+                parent_info, parent_ndim = _estimate_and_record_registration(cand, cand_src)
+                parent = cand
+                parent_src = cand_src
+                break
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] Registration failed for family parent candidate '{cand}' (family={fam}): {e}")
+
+        # If no parent in this family can be registered, skip the entire family.
+        if parent_info is None or parent_ndim is None or parent_src is None:
+            if verbose:
+                print(f"[WARN] Skipping family '{fam}' entirely: no label could be registered to anchor.")
+            # Record that these labels were skipped
+            for lbl in labels:
+                transform_records[lbl]["initial-registration"] = {
+                    "skipped": True,
+                    "reason": "registration_failed_for_all_family_candidates",
+                }
+            continue
  
         for lbl in labels:
             if lbl == parent:
@@ -423,15 +449,25 @@ def run_preprocessing_pipeline(
  
             src = scans[lbl]
             # If geometry matches parent, reuse transform; otherwise fall back to individual registration.
-            if nifti_geometry_compatible(src, parent_src):
-                _apply_parent_transform(lbl, src, parent_info, parent_ndim, parent, parent_src)
-            else:
+            try:
+                if nifti_geometry_compatible(src, parent_src):
+                    _apply_parent_transform(lbl, src, parent_info, parent_ndim, parent, parent_src)
+                else:
+                    if verbose:
+                        print(
+                            f"{lbl} is not geometry-compatible with parent {parent} (family {fam}); "
+                            f"falling back to individual registration."
+                        )
+                    _estimate_and_record_registration(lbl, src)
+            except Exception as e:
+                # Final fallback: skip this label and continue with others.
                 if verbose:
-                    print(
-                        f"{lbl} is not geometry-compatible with parent {parent} (family {fam}); "
-                        f"falling back to individual registration."
-                    )
-                _estimate_and_record_registration(lbl, src)
+                    print(f"[WARN] Skipping label '{lbl}' due to registration failure: {e}")
+                transform_records[lbl]["initial-registration"] = {
+                    "skipped": True,
+                    "reason": f"registration_failed: {e}",
+                }
+                continue
 
     # ---- Step 2: optionally co-register anchor space to provided reference ----
     # Apply the same T1c->ref transform to anchor and all other registered scans.
@@ -539,7 +575,13 @@ def run_preprocessing_pipeline(
         else:
             if verbose:
                 print("Provided brainmask grid does not match anchor; resampling mask to anchor grid...")
-            match_direction_matrices(brainmask_path, coreg_anchor_path, brainmask_temp)
+            try:
+                match_direction_matrices(brainmask_path, coreg_anchor_path, brainmask_temp, debug=debug)
+            except Exception as e:
+                if verbose or debug:
+                    print(f"[WARN] match_direction_matrices failed for brainmask '{brainmask_path}' -> '{coreg_anchor_path}': {e}. Will fall back to direct resample-to-anchor later.")
+                # Fall back: keep original brainmask; downstream resample will handle grid.
+                brainmask_temp = brainmask_path
             brainmask_source = {"type": "provided", "path": brainmask_path, "resampled": True}
         
     else:
@@ -555,6 +597,16 @@ def run_preprocessing_pipeline(
             verbose=verbose,
             n_workers=n_workers_per_hd_bet_process,
         )
+        patient_id_for_mask = basename_prefix.split("_", 1)[0]
+        patient_out_dir = os.path.dirname(output_dir.rstrip(os.sep))
+        patient_ref_mask = os.path.join(patient_out_dir, f"{patient_id_for_mask}_brainmask_ref.nii.gz")
+        if not os.path.exists(patient_ref_mask):
+            shutil.copy(brainmask_temp, patient_ref_mask)
+            if verbose:
+                print(f"[Info] Saved per-patient reference-space brainmask for reuse: {patient_ref_mask}")
+        else:
+            if verbose:
+                print(f"[WARN] f{patient_ref_mask} already exists. Not saving new reference mask.")
 
     # ---- Step 4: apply mask to all scans ----
     if verbose:
@@ -566,8 +618,30 @@ def run_preprocessing_pipeline(
         if ndim_by_label.get(lbl, 3) != 3:
             continue
         out_brain = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain_temp.nii.gz")
-        apply_mask_anydim(src_reg, brainmask_temp, out_brain)
-        brain_paths[lbl] = out_brain
+        try:
+            apply_mask_anydim(src_reg, brainmask_temp, out_brain)
+
+            # Guardrail: if masking produced an all-zero volume, treat as failure and skip.
+            try:
+                import nibabel as nib
+                import numpy as np
+                dat = nib.load(out_brain).get_fdata(dtype=np.float32)
+                if np.nanmax(np.abs(dat)) == 0.0:
+                    raise RuntimeError("masked volume is all zeros")
+            except Exception as e:
+                raise
+
+            brain_paths[lbl] = out_brain
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Skipping label '{lbl}' due to mask/application failure: {e}")
+            # Ensure we don't carry forward empty/bad files
+            try:
+                if os.path.exists(out_brain):
+                    os.remove(out_brain)
+            except Exception:
+                pass
+            continue
 
     # 4D scans: keep native-space; skull-strip only.
     # We map the anchor brainmask back into each 4D scan's native space using the inverse of a frame-based transform.
@@ -580,33 +654,58 @@ def run_preprocessing_pipeline(
         # Estimate a forward transform (4D->anchor) using register_images, but we do not keep the resampled 4D output.
         tfm = os.path.join(temp_dir, f"{lbl}-to-{anchor_label}.tfm")
         tmp_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_TEMP_REG_SHOULD_NOT_USE.nii.gz")
-        register_images(
-            fixed_path=coreg_anchor_path,
-            moving_path=src_4d,
-            output_path=tmp_reg,
-            transform_path=tfm,
-            apply_only=False,
-            similarity_metric=registration_metric,
-            registration_strategy=registration_strategy,
-            n_workers=n_workers_per_registration_process,
-            save_dummy_ref=True,
-            verbose=False,
-            debug=debug,
-        )
-        # Map the anchor brainmask back into the original 4D grid
-        mask_in_native = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brainmask_native_temp.nii.gz")
-        inverse_transform_image(
-            original_image_path=src_4d,
-            transformed_image_path=brainmask_temp,
-            transform_path=tfm,
-            output_path=mask_in_native,
-            interpolation="nearest",
-            verbose=False,
-        )
-
-        # Apply the native-space mask to the original 4D scan (no registration/resampling of the 4D data)
         out_unreg = os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nii.gz")
-        apply_mask_anydim(src_4d, mask_in_native, out_unreg)
+        mask_in_native = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brainmask_native_temp.nii.gz")
+
+        try:
+            register_images(
+                fixed_path=coreg_anchor_path,
+                moving_path=src_4d,
+                output_path=tmp_reg,
+                transform_path=tfm,
+                apply_only=False,
+                similarity_metric=registration_metric,
+                registration_strategy=registration_strategy,
+                n_workers=n_workers_per_registration_process,
+                save_dummy_ref=True,
+                verbose=False,
+                debug=debug,
+            )
+
+            # Map the anchor brainmask back into the original 4D grid
+            inverse_transform_image(
+                original_image_path=src_4d,
+                transformed_image_path=brainmask_temp,
+                transform_path=tfm,
+                output_path=mask_in_native,
+                interpolation="nearest",
+                verbose=False,
+            )
+
+            # Apply the native-space mask to the original 4D scan (no registration/resampling of the 4D data)
+            apply_mask_anydim(src_4d, mask_in_native, out_unreg)
+
+            # Guardrail: don't keep an empty 4D output (e.g., mask mapped off-target)
+            try:
+                import nibabel as nib
+                import numpy as np
+                dat = nib.load(out_unreg).get_fdata(dtype=np.float32)
+                if np.nanmax(np.abs(dat)) == 0.0:
+                    raise RuntimeError("4D masked output is all zeros")
+            except Exception as e:
+                raise
+
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Skipping 4D label '{lbl}' due to native skull-strip failure: {e}")
+            # Clean up partial outputs
+            for p in (out_unreg, mask_in_native, tfm, tmp_reg):
+                try:
+                    if p and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            continue
 
         # If a sibling 4D NRRD exists (e.g., diffusion NRRD for Slicer), skull-strip it as well.
         # We do NOT estimate any additional transforms here: we reuse the same native-space mask.
@@ -682,10 +781,22 @@ def run_preprocessing_pipeline(
 
     norm_paths: dict[str, str] = {}
     # 3D only: 4D scans are intentionally not normalized
-    for lbl, src_brain in brain_paths.items():
+    for lbl, src_brain in list(brain_paths.items()):
         out_norm = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain-norm_temp.nii.gz")
-        normalize_masked_anydim(src_brain, brainmask_temp, out_norm)
-        norm_paths[lbl] = out_norm
+        try:
+            normalize_masked_anydim(src_brain, brainmask_temp, out_norm)
+            norm_paths[lbl] = out_norm
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Skipping label '{lbl}' due to normalization failure: {e}")
+            # If normalization fails, drop this label entirely (avoid partial outputs)
+            try:
+                if os.path.exists(out_norm):
+                    os.remove(out_norm)
+            except Exception:
+                pass
+            brain_paths.pop(lbl, None)
+            continue
 
     # ---- Step 6: resize to final shape/voxel dims ----
     if verbose:
@@ -699,7 +810,10 @@ def run_preprocessing_pipeline(
     brainmask_out = os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz")
     resize_mri(brainmask_temp, brainmask_out, final_dims, final_voxels, interp="nearest")
 
-    for lbl in threed_labels:
+    # Only output labels that survived all prior steps (registration -> masking -> normalization)
+    output_3d_labels = sorted(set(brain_paths.keys()).intersection(norm_paths.keys()))
+
+    for lbl in output_3d_labels:
         out_brain = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain.nii.gz")
         out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain-norm.nii.gz")
         resize_mri(brain_paths[lbl], out_brain, final_dims, final_voxels, interp="linear")

@@ -31,7 +31,7 @@ from typing import List, Dict
 # Function to normalize an MRI image using only the masked region
 # -----------------------------------------------------------------
 
-def normalize_masked_image(input_image_path, mask_path, output_path=None):
+def normalize_masked_image(input_image_path, mask_path, output_path=None, zero_outside_mask=False):
     # Lazy imports
     import nibabel as nib
     import numpy as np
@@ -66,7 +66,10 @@ def normalize_masked_image(input_image_path, mask_path, output_path=None):
     if std == 0:
         raise ValueError("Standard deviation within mask is zero.")
 
-    normalized_data = np.where(mask_data > 0, (data - mean) / std, 0)
+    if zero_outside_mask:
+        normalized_data = np.where(mask_data > 0, (data - mean) / std, 0)
+    else:
+        normalized_data = (data - mean) / std
 
     normalized_img = nib.Nifti1Image(normalized_data, affine=img.affine, header=img.header)
 
@@ -239,10 +242,41 @@ def resize_mri(
 
             final_data = apply_padding_anydim(interped, shape_padding)
 
-        # Update affine (same as your existing logic)
+        # Update affine (robust for non-diagonal / permuted affines)
+        # NOTE: Do NOT rely on np.diag(...) here; many valid affines have zeros on the diagonal
+        # (e.g., axis permutations), and using diag-signs can create a singular affine that nibabel
+        # cannot decompose into qform/sform.
         new_affine = img.affine.copy()
-        new_affine[:3, :3] = np.diag(np.sign(np.diag(new_affine[:3, :3])) * np.array(target_voxel_dims))
-        new_affine = update_origin_for_padding(new_affine, np.array(padding_record["shape_padding"], dtype=int), target_voxel_dims)
+        R = new_affine[:3, :3].astype(np.float64, copy=True)
+        eps = 1e-8
+
+        # Direction cosines from affine columns (handles rotations / axis permutations)
+        D = np.zeros((3, 3), dtype=np.float64)
+        for ax in range(3):
+            col = R[:, ax]
+            n = float(np.linalg.norm(col))
+            if (not np.isfinite(n)) or (n < eps):
+                # Fallback to canonical axis if the column is degenerate
+                D[:, ax] = 0.0
+                D[ax, ax] = 1.0
+            else:
+                D[:, ax] = col / n
+
+        # Orthonormalize to protect against numerical drift
+        Q, _ = np.linalg.qr(D)
+        if np.linalg.det(Q) < 0:
+            Q[:, 0] *= -1.0
+
+        tvd = np.asarray(target_voxel_dims, dtype=np.float64)
+        if tvd.shape != (3,):
+            raise ValueError(f"target_voxel_dims must be length-3, got {tvd!r}")
+        if (not np.all(np.isfinite(tvd))) or np.any(tvd <= 0):
+            raise ValueError(f"target_voxel_dims must be finite positive values, got {tvd!r}")
+
+        new_affine[:3, :3] = Q @ np.diag(tvd)
+        new_affine = update_origin_for_padding(
+            new_affine, np.array(padding_record["shape_padding"], dtype=int), tvd
+        )
 
     # ---------------------------------------------------------------------
     # Save output
@@ -388,34 +422,213 @@ def reverse_resize_mri(input_filepath, output_filepath, padding_record_path, int
 # Function to match affine matrices between two nifti files
 # -------------------------------------------------------------------------
 
-def match_direction_matrices(input_path, donor_path, output_path):
+def match_direction_matrices(input_path, donor_path, output_path, *, debug: bool = False):
+    """Resample `input_path` onto `donor_path` grid (shape/origin/spacing/direction).
+
+    Primary implementation uses nibabel+nilearn (keeps headers consistent with the rest of the pipeline),
+    but some vendor/converted NIfTI files can have headers/affines that nibabel cannot safely decompose
+    (e.g., NaNs in scl_slope/scl_inter or rank-deficient qform). In those cases, we fall back to a
+    SimpleITK resample, which is typically more tolerant, then (best-effort) sanitize the output header.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to a NIfTI image to be resampled.
+    donor_path : str
+        Path to a NIfTI image providing the target grid.
+    output_path : str
+        Path to write the resampled output.
+    debug : bool
+        Print verbose geometry/header diagnostics.
+
+    Notes
+    -----
+    * Setting qform can fail for rank-deficient affines (cannot be decomposed into a quaternion).
+      In that case we still set sform and clear qform.
     """
-    Resample an input NIfTI image to match the affine direction matrix and shape of a donor image.
+    import numpy as np
 
-    Args:
-        input_path (str): Path to input NIfTI image
-        donor_path (str): Path to donor NIfTI image
-        output_path (str): Path to save the matched image
-    """
-    import nibabel as nib
-    from nilearn.image import resample_to_img
+    def _sanitize_nifti_header_inplace_local(path: str) -> None:
+        """Best-effort header cleanup to avoid nibabel warnings / decompositions later."""
+        try:
+            import nibabel as nib
 
-    donor_img = nib.load(donor_path)
-    input_img = nib.load(input_path)
+            img = nib.load(path)
+            aff = np.array(img.affine, dtype=float, copy=True)
+            hdr = img.header.copy()
 
-    # Resample to match donor using nearest neighbor (default for labels, safe fallback for others)
-    resampled_img = resample_to_img(input_img, donor_img, interpolation='nearest', force_resample = True, copy_header = True)
+            # Fix invalid/zero/NaN zooms
+            try:
+                zooms = tuple(float(z) for z in hdr.get_zooms()[:3])
+            except Exception:
+                zooms = (None, None, None)
 
-    # Preserve data type from original image
-    resampled_data = resampled_img.get_fdata().astype(input_img.get_data_dtype())
+            def _valid_zooms(zs):
+                return (zs is not None) and all((z is not None and np.isfinite(z) and float(z) > 0) for z in zs)
 
-    # Create a new image with the donor's affine, preserving header information
-    header = input_img.header.copy()
-    header.set_qform(donor_img.affine, code=1)
-    header.set_sform(donor_img.affine, code=1)
+            if not _valid_zooms(zooms):
+                col_norms = tuple(float(np.linalg.norm(aff[:3, i])) for i in range(3))
+                fixed_zooms = tuple((n if (np.isfinite(n) and n > 0) else 1.0) for n in col_norms)
+                rest = list(hdr.get_zooms()[3:]) if len(hdr.get_zooms()) > 3 else []
+                try:
+                    hdr.set_zooms(tuple(list(fixed_zooms) + rest))
+                except Exception:
+                    pass
+                if debug:
+                    print(f"[match_direction_matrices][debug] Sanitized zooms for {path}: {zooms} -> {fixed_zooms}")
 
-    output_img = nib.Nifti1Image(resampled_data, affine=donor_img.affine, header=header)
-    nib.save(output_img, output_path)
+            # Clear any scaling fields that can become NaN
+            try:
+                slope = float(hdr.get("scl_slope", 1.0))
+                inter = float(hdr.get("scl_inter", 0.0))
+                if (not np.isfinite(slope)) or slope == 0.0:
+                    hdr["scl_slope"] = 1.0
+                if not np.isfinite(inter):
+                    hdr["scl_inter"] = 0.0
+            except Exception:
+                pass
+
+            # Ensure qform/sform are set to the affine so downstream tools don't fall back to base affine
+            try:
+                hdr.set_qform(aff, code=1)
+                hdr.set_sform(aff, code=1)
+            except Exception:
+                # If qform fails due to quaternion decomposition, keep sform only.
+                try:
+                    hdr["qform_code"] = 0
+                    hdr.set_sform(aff, code=1)
+                except Exception:
+                    pass
+
+            data = img.get_fdata(dtype=np.float32)
+            out = nib.Nifti1Image(data, aff, header=hdr)
+            nib.save(out, path)
+        except Exception:
+            return
+
+    # -------- Attempt nibabel + nilearn path first --------
+    try:
+        import nibabel as nib
+        from nilearn.image import resample_to_img
+
+        donor_img = nib.load(donor_path)
+        input_img = nib.load(input_path)
+
+        if debug:
+            try:
+                in_aff = np.asarray(input_img.affine)
+                dn_aff = np.asarray(donor_img.affine)
+                print(f"[match_direction_matrices][debug] input_path={input_path}")
+                print(f"[match_direction_matrices][debug] donor_path={donor_path}")
+                print(f"[match_direction_matrices][debug] input shape={input_img.shape} dtype={input_img.get_data_dtype()}")
+                print(f"[match_direction_matrices][debug] donor shape={donor_img.shape} dtype={donor_img.get_data_dtype()}")
+                print(f"[match_direction_matrices][debug] input affine=\n{in_aff}")
+                print(f"[match_direction_matrices][debug] donor affine=\n{dn_aff}")
+                try:
+                    print(f"[match_direction_matrices][debug] rank(input_aff[:3,:3])={np.linalg.matrix_rank(in_aff[:3,:3])}")
+                except Exception:
+                    pass
+                try:
+                    print(f"[match_direction_matrices][debug] rank(donor_aff[:3,:3])={np.linalg.matrix_rank(dn_aff[:3,:3])}")
+                except Exception:
+                    pass
+
+                ih = input_img.header
+                dh = donor_img.header
+                print(f"[match_direction_matrices][debug] input zooms={ih.get_zooms()} units={ih.get_xyzt_units()}")
+                print(f"[match_direction_matrices][debug] donor zooms={dh.get_zooms()} units={dh.get_xyzt_units()}")
+                print(f"[match_direction_matrices][debug] input qform={ih.get_qform(coded=True)}")
+                print(f"[match_direction_matrices][debug] input sform={ih.get_sform(coded=True)}")
+                print(f"[match_direction_matrices][debug] input base_affine=\n{ih.get_base_affine()}")
+                print(f"[match_direction_matrices][debug] donor qform={dh.get_qform(coded=True)}")
+                print(f"[match_direction_matrices][debug] donor sform={dh.get_sform(coded=True)}")
+                print(f"[match_direction_matrices][debug] donor base_affine=\n{dh.get_base_affine()}")
+            except Exception as _e:
+                print(f"[match_direction_matrices][debug] Failed to print debug header/affine info: {_e}")
+
+        resampled_img = resample_to_img(
+            input_img,
+            donor_img,
+            interpolation="nearest",
+            force_resample=True,
+            copy_header=True,
+        )
+
+        resampled_data = resampled_img.get_fdata().astype(input_img.get_data_dtype())
+        header = input_img.header.copy()
+
+        # qform may fail for rank-deficient affines (cannot be decomposed into quaternion).
+        # sform does not require quaternion decomposition, so we still set sform as best-effort.
+        try:
+            header.set_qform(donor_img.affine, code=1)
+        except Exception as e:
+            try:
+                header["qform_code"] = 0
+            except Exception:
+                pass
+            if debug:
+                print(f"[match_direction_matrices][debug] set_qform FAILED: {e}")
+
+        try:
+            header.set_sform(donor_img.affine, code=1)
+        except Exception as e:
+            if debug:
+                print(f"[match_direction_matrices][debug] set_sform FAILED: {e}")
+
+        output_img = nib.Nifti1Image(resampled_data, affine=donor_img.affine, header=header)
+
+        if debug:
+            try:
+                oh = output_img.header
+                print(f"[match_direction_matrices][debug] output_path={output_path}")
+                print(f"[match_direction_matrices][debug] output qform={oh.get_qform(coded=True)}")
+                print(f"[match_direction_matrices][debug] output sform={oh.get_sform(coded=True)}")
+                print(f"[match_direction_matrices][debug] output base_affine=\n{oh.get_base_affine()}")
+            except Exception as _e:
+                print(f"[match_direction_matrices][debug] Failed to print output header info: {_e}")
+
+        nib.save(output_img, output_path)
+        _sanitize_nifti_header_inplace_local(output_path)
+        return
+
+    except Exception as e:
+        if debug:
+            print(f"[match_direction_matrices][debug] nibabel/nilearn path FAILED; falling back to SimpleITK. error={e!r}")
+
+    # -------- Fallback: SimpleITK resample (tolerates many header issues) --------
+    try:
+        import SimpleITK as sitk
+
+        donor = sitk.ReadImage(str(donor_path))
+        inp = sitk.ReadImage(str(input_path))
+
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(donor)
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+        resampler.SetDefaultPixelValue(0)
+
+        # Identity transform (resampler maps from input physical space into donor grid)
+        tx = sitk.Transform(3, sitk.sitkIdentity)
+        resampler.SetTransform(tx)
+
+        out = resampler.Execute(inp)
+        sitk.WriteImage(out, str(output_path))
+
+        _sanitize_nifti_header_inplace_local(output_path)
+
+        if debug:
+            try:
+                print(f"[match_direction_matrices][debug] SimpleITK fallback wrote: {output_path}")
+                print(f"[match_direction_matrices][debug] donor direction={donor.GetDirection()}")
+                print(f"[match_direction_matrices][debug] input direction={inp.GetDirection()}")
+                print(f"[match_direction_matrices][debug] out direction={out.GetDirection()}")
+            except Exception:
+                pass
+        return
+    except Exception as e2:
+        if debug:
+            print(f"[match_direction_matrices][debug] SimpleITK fallback FAILED: {e2!r}")
+        raise
 
 # -------------------------------------------------------------------------
 # Function to merge mask files into a single mask
@@ -545,6 +758,66 @@ def register_images(
     """
     import os
     import SimpleITK as sitk
+
+    # ------------------------------------------------------------------
+    # Helper: sanitize NIfTI headers written by ITK/SimpleITK (can sometimes
+    # emit pixdim/zooms that trigger nibabel warnings or downstream failures).
+    # ------------------------------------------------------------------
+    def _sanitize_nifti_header_inplace(path: str):
+        try:
+            import numpy as np
+            import nibabel as nib
+
+            img = nib.load(path)
+            aff = np.array(img.affine, dtype=float, copy=True)
+            hdr = img.header.copy()
+
+            # Fix invalid/zero/NaN zooms
+            try:
+                zooms = tuple(float(z) for z in hdr.get_zooms()[:3])
+            except Exception:
+                zooms = (None, None, None)
+
+            def _valid_zooms(zs):
+                return (zs is not None) and all((z is not None and np.isfinite(z) and float(z) > 0) for z in zs)
+
+            if not _valid_zooms(zooms):
+                col_norms = tuple(float(np.linalg.norm(aff[:3, i])) for i in range(3))
+                fixed_zooms = tuple((n if (np.isfinite(n) and n > 0) else 1.0) for n in col_norms)
+                rest = list(hdr.get_zooms()[3:]) if len(hdr.get_zooms()) > 3 else []
+                try:
+                    hdr.set_zooms(tuple(list(fixed_zooms) + rest))
+                except Exception:
+                    pass
+                if debug:
+                    print(f"[register_images][debug] Sanitized zooms for {path}: {zooms} -> {fixed_zooms}")
+
+
+            # Clear any scaling fields that can become NaN (can break nibabel affine decomposition).
+            try:
+                slope = float(hdr.get("scl_slope", 1.0))
+                inter = float(hdr.get("scl_inter", 0.0))
+                if (not np.isfinite(slope)) or slope == 0.0:
+                    hdr["scl_slope"] = 1.0
+                if not np.isfinite(inter):
+                    hdr["scl_inter"] = 0.0
+            except Exception:
+                pass
+
+            # Ensure qform/sform are set to the affine so downstream tools don't fall back to base affine
+            try:
+                hdr.set_qform(aff, code=1)
+                hdr.set_sform(aff, code=1)
+            except Exception:
+                pass
+
+            # Rewrite using a fresh NIfTI container (keeps geometry consistent)
+            data = img.get_fdata(dtype=np.float32)
+            out = nib.Nifti1Image(data, aff, header=hdr)
+            nib.save(out, path)
+        except Exception:
+            # Best-effort only
+            return
     import numpy as np
 
     # Lightweight dimensionality check (nibabel is OK here; used elsewhere in the package)
@@ -703,6 +976,8 @@ def register_images(
         )
         registered = resampler.Execute(moving_img)
         sitk.WriteImage(registered, str(output_path))
+        # Sanitize header to avoid nibabel warnings / decompositions later.
+        _sanitize_nifti_header_inplace(str(output_path))
     else:
         # Apply transform to each 3D frame, in memory, then re-stack to 4D.
         n_frames = moving_shape[3] if moving_ndim == 4 else 1
@@ -785,6 +1060,7 @@ def register_images(
             pass
 
         nib.save(out_nii, str(output_path))
+        _sanitize_nifti_header_inplace(str(output_path))
 
         if debug:
             a = fixed_nii.affine
@@ -3623,8 +3899,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--input", required=True, help="Input NIfTI image (.nii|.nii.gz).")
     p.add_argument("--mask", required=True, help="Binary mask NIfTI (same shape; >0=in brain).")
     p.add_argument("--output", required=True, help="Output NIfTI path for normalized image.")
+    p.add_argument("--zero_outside_mask", action="store_true", help="Set voxels outside masked region to 0.")
     def _run_normalize(a):
-        normalize_masked_image(a.input, a.mask, a.output)
+        normalize_masked_image(a.input, a.mask, a.output, a.zero_outside_mask)
     p.set_defaults(func=_run_normalize)
 
     # ---------- resize ----------

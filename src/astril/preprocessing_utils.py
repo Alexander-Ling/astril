@@ -2631,10 +2631,26 @@ def get_nifti_ndim(nifti_path):
     Return (ndim, shape) for a NIfTI file.
     ndim is 3 or 4 for typical MRI volumes.
     """
+    import numpy as np
     import nibabel as nib
-    img = nib.load(nifti_path)
+
+    try:
+        img = nib.load(nifti_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load NIfTI: {nifti_path}\n{e}")
+
     shape = img.shape
     ndim = len(shape)
+
+    # Best-effort diagnostics for broken headers that can later trigger affine/zoom issues.
+    # (Do not spam; only print if clearly invalid.)
+    try:
+        zooms = img.header.get_zooms()
+        if any((not np.isfinite(float(z)) or float(z) <= 0) for z in zooms[:3]):
+            print(f"[WARN][get_nifti_ndim] Invalid zooms for {nifti_path}: {zooms}. affine=\n{img.affine}")
+    except Exception:
+        pass
+
     return ndim, shape
 
 def extract_nifti_frame(nifti_4d_path, frame_index, out_path):
@@ -2901,7 +2917,7 @@ def apply_mask_anydim(input_image_path, mask_path, output_path):
     nib.save(nib.Nifti1Image(out, img.affine, img.header), output_path)
     return output_path
 
-def normalize_masked_anydim(input_image_path, mask_path, output_path):
+def normalize_masked_anydim(input_image_path, mask_path, output_path, zero_outside_mask=False):
     import nibabel as nib
     import numpy as np
 
@@ -2924,7 +2940,10 @@ def normalize_masked_anydim(input_image_path, mask_path, output_path):
             sigma = vals.std()
             if sigma <= 0:
                 sigma = 1.0
-            out[mask] = (vals - mu) / sigma
+            if zero_outside_mask:
+                out[mask] = (vals - mu) / sigma
+            else:
+                out = (data - mu) / sigma
 
     elif data.ndim == 4:
         if data.shape[:3] != mask.shape:
@@ -2941,7 +2960,10 @@ def normalize_masked_anydim(input_image_path, mask_path, output_path):
             if sigma <= 0:
                 sigma = 1.0
             out_frame = out[..., t]          # view
-            out_frame[mask] = (vals - mu) / sigma
+            if zero_outside_mask:
+                out_frame[mask] = (vals - mu) / sigma
+            else:
+                out_frame = (frame - mu) / sigma
 
     else:
         raise ValueError(f"Unsupported ndim={data.ndim} for {input_image_path}")

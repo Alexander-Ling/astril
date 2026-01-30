@@ -106,28 +106,196 @@ def _read_old_coreg_logs(paths: list[Path]) -> dict[str, Path]:
     return mapping
 
 
+def _estimate_anchor_quality(nifti_path: Path) -> tuple[float, dict]:
+    """
+    Heuristic quality score for picking a per-patient co-registration reference.
+
+    Higher is better.
+
+    Returns:
+        (score, info_dict)
+
+    info_dict contains lightweight metadata that we can log for auditing:
+        - shape
+        - zooms_mm
+        - voxel_volume_mm3
+        - anisotropy
+        - sample_std
+        - sample_nonzero_frac
+        - error (optional)
+    """
+    info: dict = {
+        "shape": "",
+        "zooms_mm": "",
+        "voxel_volume_mm3": "",
+        "anisotropy": "",
+        "sample_std": "",
+        "sample_nonzero_frac": "",
+    }
+    try:
+        import math
+        import numpy as np
+        import nibabel as nib
+
+        img = nib.load(os.fspath(nifti_path))
+        shape = tuple(int(x) for x in img.shape)
+        if len(shape) != 3:
+            info["error"] = f"ndim={len(shape)}"
+            return float("-inf"), info
+
+        zooms = tuple(float(z) for z in img.header.get_zooms()[:3])
+        if any((not np.isfinite(z)) or (z <= 0) for z in zooms):
+            info["error"] = f"bad_zooms={zooms}"
+            return float("-inf"), info
+
+        vx_vol = float(zooms[0] * zooms[1] * zooms[2])
+        aniso = float(max(zooms) / max(1e-6, min(zooms)))
+
+        # Sample a few central slices without loading the whole volume
+        dataobj = img.dataobj
+        z = shape[2]
+        zs = sorted(set([
+            int(z * 0.50),
+            int(z * 0.40),
+            int(z * 0.60),
+            int(z * 0.33),
+            int(z * 0.67),
+        ]))
+        zs = [zi for zi in zs if 0 <= zi < z]
+
+        samples = []
+        for zi in zs:
+            sl = np.asanyarray(dataobj[:, :, zi]).astype(np.float32, copy=False)
+            if sl.size:
+                samples.append(sl)
+        if not samples:
+            info["error"] = "no_samples"
+            return float("-inf"), info
+
+        samp = np.concatenate([s.ravel() for s in samples])
+        if samp.size < 1024:
+            info["error"] = "small_sample"
+            return float("-inf"), info
+        if not np.isfinite(samp).all():
+            info["error"] = "nonfinite"
+            return float("-inf"), info
+
+        std = float(np.std(samp))
+        nonzero_frac = float(np.mean(np.abs(samp) > 1e-6))
+
+        if std < 1e-4 or nonzero_frac < 0.01:
+            info["error"] = f"low_signal std={std:.3g} nonzero_frac={nonzero_frac:.3g}"
+            return float("-inf"), info
+
+        # Populate info for logging
+        info.update(
+            {
+                "shape": "x".join(map(str, shape)),
+                "zooms_mm": ",".join(f"{z:.6g}" for z in zooms),
+                "voxel_volume_mm3": f"{vx_vol:.6g}",
+                "anisotropy": f"{aniso:.6g}",
+                "sample_std": f"{std:.6g}",
+                "sample_nonzero_frac": f"{nonzero_frac:.6g}",
+            }
+        )
+
+        # Score components (simple, fast, and fairly robust)
+        nvox = float(shape[0] * shape[1] * shape[2])
+
+        score = 0.0
+        # Resolution bonus: smaller voxel volume => higher
+        score += 50.0 * (1.0 / max(vx_vol, 1e-6))
+        # Mild preference for larger volumes (coverage)
+        score += 1e-7 * nvox
+        # Penalize anisotropy (thick slices)
+        score -= 2.5 * (aniso - 1.0)
+        # Mild contrast/texture bonus
+        score += 2.0 * math.log1p(std)
+        # Prefer non-empty samples
+        score += 2.0 * nonzero_frac
+
+        return float(score), info
+
+    except Exception as e:
+        info["error"] = str(e)
+        return float("-inf"), info
+
+
 def _choose_reference_for_patient(
     patient_dir: Path,
     in_dir: Path,
     old_coreg_maps: dict[str, Path] | None,
     anchor_label: str,
-) -> Path | None:
+    reference_selection: str = "highest_quality",
+) -> tuple[Path | None, dict]:
     """
-    If old_coreg_maps has an entry for this patient, reuse it (if it exists).
-    Else pick earliest timepoint (smallest 'day') that has a matching anchor label file.
+    Choose the per-patient reference image used for co-registration.
 
-    Returns absolute Path to the reference anchor nifti, or None if not found.
+    Priority:
+      1) If old_coreg_maps has an entry for this patient, reuse it (if it exists).
+      2) Otherwise:
+           - reference_selection == 'highest_quality': score all candidate anchor volumes and pick the best
+           - reference_selection == 'earliest': pick earliest timepoint that has an anchor (legacy behavior)
+
+    Returns:
+      (reference_path_or_none, info_dict_for_coreg_log)
     """
     patient = patient_dir.name
+    info: dict = {
+        "SelectionMethod": "",
+        "QualityScore": "",
+        "Shape": "",
+        "ZoomsMM": "",
+        "VoxelVolumeMM3": "",
+        "Anisotropy": "",
+        "SampleStd": "",
+        "SampleNonzeroFrac": "",
+        "Error": "",
+    }
 
     # A) Old logs preference
     if old_coreg_maps and patient in old_coreg_maps:
         candidate = in_dir / old_coreg_maps[patient]
         if candidate.exists():
-            return candidate.resolve()
+            info["SelectionMethod"] = "old_coreg_log"
+            return candidate.resolve(), info
 
-    # B) Earliest timepoint with anchor
     exams = [p for p in patient_dir.iterdir() if p.is_dir()]
+    patterns = (f"*_{anchor_label}.nii.gz", f"*_{anchor_label}.nii")
+
+    # B) Highest quality (default)
+    if (reference_selection or "").lower() in ("highest_quality", "best", "quality"):
+        candidates: list[Path] = []
+        for ex in exams:
+            for pat in patterns:
+                candidates.extend(list(ex.glob(pat)))
+
+        best: Path | None = None
+        best_score = float("-inf")
+        best_info: dict | None = None
+
+        for c in candidates:
+            s, meta = _estimate_anchor_quality(c)
+            if s > best_score:
+                best_score = s
+                best = c
+                best_info = meta
+
+        if best is not None and best_score != float("-inf") and best_info is not None:
+            info["SelectionMethod"] = "highest_quality"
+            info["QualityScore"] = f"{best_score:.6g}"
+            info["Shape"] = best_info.get("shape", "")
+            info["ZoomsMM"] = best_info.get("zooms_mm", "")
+            info["VoxelVolumeMM3"] = best_info.get("voxel_volume_mm3", "")
+            info["Anisotropy"] = best_info.get("anisotropy", "")
+            info["SampleStd"] = best_info.get("sample_std", "")
+            info["SampleNonzeroFrac"] = best_info.get("sample_nonzero_frac", "")
+            if "error" in best_info:
+                info["Error"] = best_info.get("error", "")
+            return best.resolve(), info
+        # else fall through to earliest
+
+    # C) Earliest timepoint with anchor
     exams_sorted = sorted(
         exams,
         key=lambda p: (
@@ -135,14 +303,17 @@ def _choose_reference_for_patient(
             _parse_timepoint_from_exam_name(p.name)[0],
         ),
     )
-
-    patterns = (f"*_{anchor_label}.nii.gz", f"*_{anchor_label}.nii")
     for ex in exams_sorted:
         for pat in patterns:
             cand = list(ex.glob(pat))
             if cand:
-                return cand[0].resolve()
-    return None
+                info["SelectionMethod"] = "earliest"
+                return cand[0].resolve(), info
+
+    info["SelectionMethod"] = "none"
+    info["Error"] = "no_anchor_found"
+    return None, info
+
 
 
 def _find_exam_dir_for_file(patient_dir: Path, file_path: Path) -> Path | None:
@@ -188,48 +359,16 @@ def _is_exam_already_processed(out_exam: Path, prefix: str) -> bool:
         return True
     return False
 
-
-def _patient_level_brainmask_path(patient_out_dir: Path, patient: str) -> Path:
-    """
-    Canonical per-patient brainmask path that batch mode will try to reuse.
-    """
-    return patient_out_dir / f"{patient}_brainmask.nii.gz"
-
-
 def _find_existing_patient_brainmask(patient_out_dir: Path, patient: str) -> Path | None:
     """
     Look for an existing per-patient brainmask, first at the canonical location, then by scanning
     all exam outputs for *_brainmask.nii.gz and choosing the newest one.
     """
-    canonical = _patient_level_brainmask_path(patient_out_dir, patient)
+    canonical = patient_out_dir / f"{patient}_brainmask_ref.nii.gz"
     if canonical.exists():
         return canonical
-
-    # Search under the patient output tree for any exam-level brainmask
-    masks = list(patient_out_dir.glob("**/*_brainmask.nii.gz"))
-    if not masks:
+    else:
         return None
-
-    # Choose newest by mtime (often the one that was most recently produced/updated)
-    masks.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return masks[0]
-
-
-def _promote_exam_brainmask_to_patient_level(
-    patient_out_dir: Path,
-    patient: str,
-    exam_brainmask: Path,
-) -> Path:
-    """
-    Copy an exam-level brainmask to the canonical patient-level location.
-    """
-    patient_out_dir.mkdir(parents=True, exist_ok=True)
-    dst = _patient_level_brainmask_path(patient_out_dir, patient)
-    # Copy (not move) so exam output remains self-contained.
-    import shutil
-    shutil.copy2(exam_brainmask, dst)
-    return dst
-
 
 # ----------------------------
 # Core batch function
@@ -247,6 +386,7 @@ def preprocess_library(
     n_workers_per_hd_bet_process: int | None = None,
     overwrite: bool = False,
     reuse_patient_brainmask: bool = True,
+    reference_selection: str = "highest_quality",
     # Passthrough options to preprocess_single_brain_mri
     modalities: list[str] | None = None,
     anchor_label: str = "T1c",
@@ -349,26 +489,71 @@ def preprocess_library(
 
     # Determine a reference for each patient (or None)
     patient_ref: dict[str, Path | None] = {}
+    patient_ref_info: dict[str, dict] = {}
+
     for pd in patient_dirs:
         if dont_coregister:
             patient_ref[pd.name] = None
+            patient_ref_info[pd.name] = {
+                "SelectionMethod": "dont_coregister",
+                "QualityScore": "",
+                "Shape": "",
+                "ZoomsMM": "",
+                "VoxelVolumeMM3": "",
+                "Anisotropy": "",
+                "SampleStd": "",
+                "SampleNonzeroFrac": "",
+                "Error": "",
+            }
         else:
-            patient_ref[pd.name] = _choose_reference_for_patient(
-                patient_dir=pd, in_dir=in_dir, old_coreg_maps=old_maps, anchor_label=anchor_label
+            ref, info = _choose_reference_for_patient(
+                patient_dir=pd,
+                in_dir=in_dir,
+                old_coreg_maps=old_maps,
+                anchor_label=anchor_label,
+                reference_selection=reference_selection,
             )
+            patient_ref[pd.name] = ref
+            patient_ref_info[pd.name] = info
 
     # Write the coreg log up front (what we will try to use)
     with coreg_log.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Patient", "ReferenceRelativePath"])
-        for pat, ref in sorted(patient_ref.items(), key=lambda kv: kv[0]):
+        w.writerow([
+            "Patient",
+            "ReferenceRelativePath",
+            "SelectionMethod",
+            "QualityScore",
+            "Shape",
+            "ZoomsMM",
+            "VoxelVolumeMM3",
+            "Anisotropy",
+            "SampleStd",
+            "SampleNonzeroFrac",
+            "Error",
+        ])
+        for pat in sorted(patient_ref.keys()):
+            ref = patient_ref.get(pat)
+            info = patient_ref_info.get(pat, {})
             rel = ""
             if ref is not None:
                 try:
                     rel = str(ref.resolve().relative_to(in_dir))
                 except Exception:
                     rel = str(ref)
-            w.writerow([pat, rel])
+            w.writerow([
+                pat,
+                rel,
+                info.get("SelectionMethod", ""),
+                info.get("QualityScore", ""),
+                info.get("Shape", ""),
+                info.get("ZoomsMM", ""),
+                info.get("VoxelVolumeMM3", ""),
+                info.get("Anisotropy", ""),
+                info.get("SampleStd", ""),
+                info.get("SampleNonzeroFrac", ""),
+                info.get("Error", ""),
+            ])
 
     # Prepare the preprocess log (delimiter from extension; line-buffered)
     delim = "\t" if str(preprocess_log).lower().endswith(".tsv") else ","
@@ -394,22 +579,21 @@ def preprocess_library(
         all_exam_dirs.extend([p for p in pd.iterdir() if p.is_dir()])
     total_exams = len(all_exam_dirs)
 
+    done_count_box = [0]
+
     if tqdm:
         pbar = tqdm(total=total_exams, desc="Preprocessing exams", unit="exam",
                     dynamic_ncols=True, leave=False, file=sys.stdout)
     else:
         pbar = None
-        done_count = 0
 
     def _advance(n: int = 1):
-        nonlocal done_count
         if pbar:
             pbar.update(n)
             pbar.refresh()
         else:
-            done_count += n
-            print(f"[Progress] {done_count}/{total_exams} exams completed", flush=True)
-
+            done_count_box[0] += n
+            print(f"[Progress] {done_count_box[0]}/{total_exams} exams completed", flush=True)
     def _log_row(row: list[object]):
         with log_lock:
             with preprocess_log.open("a", newline="", encoding="utf-8", buffering=1) as f:
@@ -482,14 +666,18 @@ def preprocess_library(
 
         # Determine existing patient brainmask (from prior runs)
         patient_mask: Path | None = None
+        if debug:
+            print(f"reuse_patient_brainmask = {reuse_patient_brainmask}")
         if reuse_patient_brainmask:
             patient_mask = _find_existing_patient_brainmask(patient_out_dir, patient)
-            # If we found an exam-level mask (not canonical), promote it so future runs are consistent
-            if patient_mask and patient_mask != _patient_level_brainmask_path(patient_out_dir, patient):
-                try:
-                    patient_mask = _promote_exam_brainmask_to_patient_level(patient_out_dir, patient, patient_mask)
-                except Exception:
-                    pass
+            if debug:
+                print(f"[Debug] For {patient_out_dir} reusing brainmask {patient_mask}")
+                if patient_mask is not None:
+                    import nibabel as nib
+                    import os as os
+                    mask_file = nib.load(os.fspath(patient_mask))
+                    temp_data = mask_file.get_fdata()
+                    print(f"[Debug] brainmask shape = {temp_data.shape}")
 
         # Determine exam processing order:
         #   1) If we need to create a patient mask and we have a reference exam dir, do that first.
@@ -536,15 +724,6 @@ def preprocess_library(
                 brainmask_path=patient_mask,
                 coreg_ref_used_for_exam=coreg_ref_used,
             )
-
-            # After the first successful run for this patient, if we still lack a patient mask,
-            # promote the exam brainmask to patient-level and use it for subsequent exams.
-            if reuse_patient_brainmask and (patient_mask is None) and status == "OK" and exam_bm is not None:
-                try:
-                    patient_mask = _promote_exam_brainmask_to_patient_level(patient_out_dir, patient, exam_bm)
-                except Exception:
-                    # If promote fails, we keep going without a patient-level mask.
-                    pass
 
             _log_row([
                 patient, exam, status, msg,
@@ -655,6 +834,17 @@ def main():
     p.add_argument("--dont_coregister", action="store_true", help="Disable co-registration; run each exam independently.")
     p.add_argument("--n_workers", type=int, default=1, help="Parallel workers across patients (threaded). Use 1 to run serially.")
     p.add_argument(
+    "--reference_selection",
+    default="highest_quality",
+    choices=["highest_quality", "earliest"],
+    help=(
+        "How to choose the per-patient co-registration reference anchor. "
+        "'highest_quality' scores all candidate anchor volumes and picks the best; "
+        "'earliest' uses the smallest timepoint day (legacy behavior). "
+        "(default: highest_quality)"
+    ),
+    )
+    p.add_argument(
         "--n_workers_per_registration_process",
         type=int,
         default=None,
@@ -722,6 +912,7 @@ def main():
         n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         overwrite=args.overwrite,
         reuse_patient_brainmask=not args.no_reuse_patient_brainmask,
+        reference_selection=args.reference_selection,
         modalities=modalities,
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
