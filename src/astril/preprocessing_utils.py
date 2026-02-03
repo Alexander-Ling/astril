@@ -173,6 +173,40 @@ def global_sitk_thread_cap(n_workers, enabled: bool, verbose: bool = False):
                 pass
 
 
+def _interp_to_sitk_interpolator(interp):
+    """Map a user-facing interpolation spec to a SimpleITK interpolator enum.
+
+    Accepts:
+      - int 0-5 (scipy.ndimage.zoom order semantics)
+      - strings supported by _interp_to_scipy_order (nearest, linear, quadratic, cubic, quartic, quintic)
+      - 'bspline' (treated as cubic B-spline; order=3)
+
+    Notes
+    -----
+    SimpleITK exposes a single BSpline interpolator enum (cubic). Higher-order spline
+    interpolation (order 4/5) is not directly selectable via ResampleImageFilter's
+    SetInterpolator. We therefore map any order >=2 to sitkBSpline.
+    """
+    import SimpleITK as sitk
+
+    if interp is None:
+        return sitk.sitkLinear, "linear", 1
+
+    # Special-case a direct 'bspline' request.
+    if isinstance(interp, str) and interp.strip().lower() in {"bspline", "b-spline", "b_spline"}:
+        return sitk.sitkBSpline, "bspline", 3
+
+    # Reuse the scipy-order parser for ints and known strings.
+    order = _interp_to_scipy_order(interp)
+
+    if order <= 0:
+        return sitk.sitkNearestNeighbor, "nearest", 0
+    if order == 1:
+        return sitk.sitkLinear, "linear", 1
+    # 2-5 -> cubic B-spline in SimpleITK
+    return sitk.sitkBSpline, "bspline", int(order)
+
+
 def make_sitk_resampler(
     *,
     reference_img,
@@ -181,10 +215,19 @@ def make_sitk_resampler(
     pixel_id,
     n_workers=None,
     interpolator=None,
+    interp=None,
 ):
     """Create a ResampleImageFilter with optional per-object thread cap.
 
     Parameters are keyword-only to keep callsites explicit.
+
+    Parameters
+    ----------
+    interpolator : SimpleITK interpolator enum or None
+        If provided, used verbatim (advanced usage).
+    interp : int|str|None
+        Convenience wrapper. When interpolator is None, this is parsed using
+        _interp_to_scipy_order() semantics (0-5 or 'linear'/'cubic'/...).
     """
     import SimpleITK as sitk
 
@@ -192,12 +235,99 @@ def make_sitk_resampler(
     set_sitk_object_threads(f, n_workers)
     f.SetReferenceImage(reference_img)
     f.SetTransform(transform)
+
     if interpolator is None:
-        interpolator = sitk.sitkLinear
+        interpolator, _, _ = _interp_to_sitk_interpolator(interp)
     f.SetInterpolator(interpolator)
+
     f.SetDefaultPixelValue(float(default_value))
     f.SetOutputPixelType(pixel_id)
     return f
+
+
+# -------- spacing / downsampling helpers --------
+def _normalize_spacing_mm(spec):
+    """Normalize a user spacing specification to a 3-tuple of floats (mm, mm, mm).
+
+    Accepts:
+      - None
+      - (sx, sy, sz) list/tuple
+      - "sx,sy,sz" or "sx sy sz"
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        out = tuple(float(x) for x in spec)
+    elif isinstance(spec, str):
+        s = spec.strip().replace("x", ",").replace("X", ",")
+        parts = [p for p in re.split(r"[\s,]+", s) if p]
+        if len(parts) != 3:
+            raise ValueError(f"Expected 3 values for spacing, got: {spec!r}")
+        out = tuple(float(x) for x in parts)
+    else:
+        raise TypeError(f"Unsupported spacing spec type: {type(spec).__name__}")
+    if any((not (x > 0 and np.isfinite(x))) for x in out):
+        raise ValueError(f"Invalid spacing values (must be finite >0): {out}")
+    return out
+
+
+def sitk_resample_to_spacing(
+    img,
+    target_spacing_mm,
+    *,
+    interp=None,
+    interpolator=None,
+    default_value: float = 0.0,
+    pixel_id=None,
+    n_workers=None,
+):
+    """Resample a 3D SimpleITK image to a target voxel spacing.
+
+    This is intended for *registration-time* downsampling to speed up optimization.
+    It preserves physical space (origin/direction) and approximately preserves the
+    field of view by adjusting output size based on spacing ratios.
+
+    Notes
+    -----
+    - If target_spacing_mm is equal (within tolerance) to the input spacing,
+      the input image is returned unchanged.
+    - For masks/labels, pass interp='nearest'. For intensities, interp='linear' is typical.
+    """
+    import SimpleITK as sitk
+
+    if img.GetDimension() != 3:
+        raise ValueError(f"sitk_resample_to_spacing supports only 3D images, got dim={img.GetDimension()}")
+
+    target = _normalize_spacing_mm(target_spacing_mm)
+    in_spacing = tuple(float(x) for x in img.GetSpacing())
+
+    # If already effectively at target spacing, return as-is (avoid work).
+    if all(abs(in_spacing[i] - target[i]) <= 1e-6 for i in range(3)):
+        return img
+
+    in_size = tuple(int(x) for x in img.GetSize())
+    # Preserve physical extent: new_size ~= old_size * old_spacing / new_spacing
+    new_size = [
+        max(1, int(round(in_size[i] * (in_spacing[i] / target[i]))))
+        for i in range(3)
+    ]
+
+    f = sitk.ResampleImageFilter()
+    set_sitk_object_threads(f, n_workers)
+
+    f.SetOutputSpacing(tuple(float(x) for x in target))
+    f.SetSize([int(x) for x in new_size])
+    f.SetOutputOrigin(img.GetOrigin())
+    f.SetOutputDirection(img.GetDirection())
+    f.SetTransform(sitk.Transform())  # identity (pure resampling)
+
+    if interpolator is None:
+        interpolator, _, _ = _interp_to_sitk_interpolator(interp)
+    f.SetInterpolator(interpolator)
+
+    f.SetDefaultPixelValue(float(default_value))
+    f.SetOutputPixelType(pixel_id if pixel_id is not None else img.GetPixelID())
+    return f.Execute(img)
 
 # -------- small helper for progress --------
 def _progress(iterable, total=None, desc=None, unit=None, enable=True):
@@ -263,30 +393,52 @@ def apply_padding(data, pad):
 
 
 def _interp_to_scipy_order(interp):
+    """Normalize an interpolation spec to a scipy.ndimage.zoom spline order (0-5).
+
+    Accepts:
+      - int / np.integer in [0, 5]
+      - str names: nearest, linear/bilinear, quadratic, cubic, quartic, quintic
+      - str integer forms: "0".."5" (also allows surrounding whitespace)
+
+    Returns
+    -------
+    int
+        scipy.ndimage.zoom spline order in [0, 5].
+    """
     # Accept ints directly
     if isinstance(interp, (int, np.integer)):
         order = int(interp)
+
     elif isinstance(interp, str):
         key = interp.strip().lower()
-        mapping = {
-            "nearest": 0,
-            "linear": 1,
-            "bilinear": 1,
-            "quadratic": 2,
-            "cubic": 3,
-            "quartic": 4,
-            "quintic": 5,
-        }
-        if key not in mapping:
-            raise ValueError(f"Unknown interp='{interp}'. Use one of: {sorted(mapping)} or an int 0-5.")
-        order = mapping[key]
+
+        # Allow numeric strings like "3"
+        if key and key.lstrip("+-").isdigit():
+            order = int(key)
+        else:
+            mapping = {
+                "nearest": 0,
+                "linear": 1,
+                "bilinear": 1,
+                "quadratic": 2,
+                "cubic": 3,
+                "quartic": 4,
+                "quintic": 5,
+            }
+            if key not in mapping:
+                raise ValueError(
+                    f"Unknown interp={interp!r}. Use one of: {sorted(mapping)} or an int 0-5."
+                )
+            order = mapping[key]
+
     else:
-        raise TypeError(f"interp must be an int (0-5) or a string like 'linear'. Got {type(interp)}")
+        raise TypeError(
+            f"interp must be an int (0-5) or a string like 'linear'. Got {type(interp)}"
+        )
 
     if order < 0 or order > 5:
         raise ValueError(f"scipy.ndimage.zoom order must be in [0,5]. Got {order}")
     return order
-
 def prepare_zoom(original_voxel_dims, target_voxel_dims, interp):
     """Precompute scipy.ndimage.zoom factors + interpolation order."""
     zoom_factors = np.divide(original_voxel_dims, target_voxel_dims)
@@ -3155,12 +3307,13 @@ def parse_preprocessed_series_filename(fname: str):
     else:
         return None
 
+
     parts = core.split('_')
-    if len(parts) < 3:
+    if len(parts) != 3: # Exclude files that have too few fields, or too many -- explicitly excludes duplicate scans at different resolutions produced by brain preprocessing pipeline for example
         return None
     patient = parts[0]
     timepoint = parts[1]
-    series_type = '_'.join(parts[2:])
+    series_type = parts[2]
     if not series_type:
         return None
     return patient, timepoint, series_type, kind

@@ -1,4 +1,4 @@
-# preprocessing_functions.py
+# preprocess.py
 # Author: Alex Ling
 # E. Antonio Chiocca Group, BWH
 # Description: Preprocessing utilities for MRI normalization, resampling, etc.
@@ -688,10 +688,12 @@ def register_images(
     apply_only=False,
     registration_type="rigid",
     similarity_metric="mi",
-    registration_strategy="accurate",
+    registration_strategy="medium",
     metric_sampling_seed=None,
     verbose=False,
     save_dummy_ref=False,
+    interpolation="auto",
+    registration_voxel_mm="1,1,1",
     n_workers: int = None,
     *,
     fixed_frame_index: int = 0,
@@ -743,6 +745,19 @@ def register_images(
     save_dummy_ref : bool, default=False
         If True (and transform_path is provided), write de-identified 0-filled dummy references alongside
         the transform, preserving geometry for later apply/reverse steps.
+    interpolation : int | str, default="auto"
+        Interpolation used for (1) the registration optimizer interpolator and (2) final resampling into fixed space.
+        Accepts int 0–5 or strings: nearest, linear/bilinear, quadratic, cubic, quartic, quintic, bspline.
+        "auto": if apply_only=True, try to reuse the interpolation saved next to transform_path (.meta.json); if unavailable, defaults to linear.
+    registration_voxel_mm : (float, float, float) | str | None, default="1,1,1"
+        Optional spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False).
+        This speeds up registration by downsampling both fixed and moving frames to a common voxel size
+        before optimization.
+        - Examples: (1, 1, 1) or "1,1,1"
+        - If you request a spacing finer than both input scans along any axis, that axis is clamped to the
+          finest available input spacing and a warning is printed (to avoid unintended upsampling).
+        The final resampling to output_path is still done onto the fixed grid at full resolution.
+    
     n_workers : int, default = None
         Limits how many CPU threads are used for registration and resampling. Default behavior is to use all available threads.
     fixed_frame_index : int, default=0
@@ -757,7 +772,51 @@ def register_images(
     None
     """
     import os
+    import json
     import SimpleITK as sitk
+
+    # ------------------------------------------------------------------
+    # Interpolation handling
+    # ------------------------------------------------------------------
+    # We accept a scipy.ndimage.zoom-like interpolation spec (int 0-5 or strings like
+    # 'linear'/'cubic'). For SimpleITK resampling, orders >=2 are mapped to cubic B-spline.
+    from .preprocessing_utils import _interp_to_sitk_interpolator
+
+    def _transform_meta_path(tfm_path: str) -> str:
+        # Store sidecar JSON next to the .tfm so apply/reverse steps can stay consistent.
+        return os.path.splitext(str(tfm_path))[0] + ".meta.json"
+
+    def _read_transform_meta(tfm_path: str):
+        meta_path = _transform_meta_path(tfm_path)
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _write_transform_meta(tfm_path: str, meta: dict):
+        meta_path = _transform_meta_path(tfm_path)
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, sort_keys=True)
+        except Exception:
+            # Best-effort only; the transform itself is the critical artifact.
+            return
+
+    # Resolve interpolation: allow 'auto' to reuse prior settings when applying an existing transform.
+    interp_spec = interpolation
+    if isinstance(interp_spec, str) and interp_spec.strip().lower() == "auto":
+        interp_spec = None
+
+    if apply_only and interp_spec is None and transform_path:
+        meta = _read_transform_meta(transform_path)
+        if isinstance(meta, dict) and "interp" in meta:
+            interp_spec = meta["interp"]
+            if verbose:
+                print(f"[register_images] Using recorded interpolation from sidecar: {interp_spec!r}")
+
+    sitk_interp, sitk_interp_name, scipy_order = _interp_to_sitk_interpolator(interp_spec)
+
 
     # ------------------------------------------------------------------
     # Helper: sanitize NIfTI headers written by ITK/SimpleITK (can sometimes
@@ -834,6 +893,8 @@ def register_images(
         set_sitk_object_threads,
         global_sitk_thread_cap,
         make_sitk_resampler,
+        sitk_resample_to_spacing,
+        _normalize_spacing_mm,
     )
     n_workers = normalize_n_workers(n_workers)
 
@@ -852,6 +913,55 @@ def register_images(
     # For registration, pick 3D frames if needed.
     fixed_for_reg = fixed_img if fixed_ndim == 3 else sitk_extract_3d_from_4d(fixed_img, int(fixed_frame_index))
     moving_for_reg = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, int(moving_frame_index))
+
+    # ------------------------------------------------------------------
+    # Optional downsampling for transform estimation (registration-time only)
+    # ------------------------------------------------------------------
+    # User can request a target spacing (mm, mm, mm). This affects only the transform
+    # estimation step (apply_only=False). The final resampling to output_path is still
+    # performed on the full-resolution fixed grid.
+    fixed_reg_img = fixed_for_reg
+    moving_reg_img = moving_for_reg
+
+    req_spacing = _normalize_spacing_mm(registration_voxel_mm)
+    if req_spacing is not None and not apply_only:
+        fixed_sp = tuple(float(x) for x in fixed_for_reg.GetSpacing())
+        moving_sp = tuple(float(x) for x in moving_for_reg.GetSpacing())
+
+        # Clamp any axis that would be finer than BOTH inputs (avoid unintended upsampling).
+        adj = list(req_spacing)
+        clamped_axes = []
+        for i in range(3):
+            finest_in = min(fixed_sp[i], moving_sp[i])
+            if adj[i] < finest_in:
+                adj[i] = finest_in
+                clamped_axes.append(i)
+        adj = tuple(float(x) for x in adj)
+        if clamped_axes and verbose:
+            ax = ["x", "y", "z"]
+            which = ",".join(ax[i] for i in clamped_axes)
+            print(
+                f"[register_images] WARNING: requested registration_voxel_mm={req_spacing} is finer than both inputs "
+                f"on axis(es) {which}; clamping to finest available input spacing -> {adj}."
+            )
+
+        # Downsample both frames to the requested spacing for faster optimization.
+        fixed_reg_img = sitk_resample_to_spacing(
+            fixed_for_reg,
+            adj,
+            interp=interpolation,
+            default_value=0.0,
+            pixel_id=sitk.sitkFloat32,
+            n_workers=n_workers,
+        )
+        moving_reg_img = sitk_resample_to_spacing(
+            moving_for_reg,
+            adj,
+            interp=interpolation,
+            default_value=0.0,
+            pixel_id=sitk.sitkFloat32,
+            n_workers=n_workers,
+        )
 
     if apply_only:
         if not transform_path or not os.path.isfile(transform_path):
@@ -899,9 +1009,103 @@ def register_images(
         else:
             raise ValueError("Invalid registration_type. Choose 'rigid', 'affine', or 'translation'.")
 
+
+        # ------------------------------------------------------------------
+        # Initializer: translation pre-pass ("translation_then_main")
+        # ------------------------------------------------------------------
+        # Default behavior: do a coarse translation-only registration on heavily
+        # downsampled images, then use that translation to initialize the main
+        # rigid/affine/translation optimization. This often reduces iterations to
+        # convergence and helps avoid poor local minima for high-res volumes.
+        prepass_offset = (0.0, 0.0, 0.0)
+        try:
+            fixed_sp = tuple(float(x) for x in fixed_for_reg.GetSpacing())
+            moving_sp = tuple(float(x) for x in moving_for_reg.GetSpacing())
+            req_sp = _normalize_spacing_mm(registration_voxel_mm)
+            # Aim for ~2mm isotropic (or coarser), but never upsample beyond the finest available axis.
+            # If the user already requested a coarser spacing for the main pass, reuse that.
+            prepass_spacing = []
+            for i in range(3):
+                finest_in = min(fixed_sp[i], moving_sp[i])
+                user_req = float(req_sp[i]) if req_sp is not None else 0.0
+                prepass_spacing.append(max(2.0, user_req, finest_in))
+            prepass_spacing = tuple(prepass_spacing)
+
+            fixed_pre = sitk_resample_to_spacing(
+                fixed_for_reg,
+                prepass_spacing,
+                interp="linear",
+                default_value=0.0,
+                pixel_id=sitk.sitkFloat32,
+                n_workers=n_workers,
+            )
+            moving_pre = sitk_resample_to_spacing(
+                moving_for_reg,
+                prepass_spacing,
+                interp="linear",
+                default_value=0.0,
+                pixel_id=sitk.sitkFloat32,
+                n_workers=n_workers,
+            )
+
+            tx_pre = sitk.TranslationTransform(3)
+            init_pre = sitk.CenteredTransformInitializer(
+                fixed_pre, moving_pre, tx_pre, sitk.CenteredTransformInitializerFilter.GEOMETRY
+            )
+
+            reg_pre = sitk.ImageRegistrationMethod()
+            reg_pre.SetInitialTransform(init_pre, inPlace=False)
+            set_sitk_object_threads(reg_pre, n_workers)
+
+            # Metric (keep user's choice, but keep it light)
+            if similarity_metric == "correlation":
+                reg_pre.SetMetricAsCorrelation()
+            else:
+                reg_pre.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+
+            reg_pre.SetShrinkFactorsPerLevel([4, 2, 1])
+            reg_pre.SetSmoothingSigmasPerLevel([2, 1, 0])
+            reg_pre.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+            # Always sample stochastically for speed
+            reg_pre.SetMetricSamplingStrategy(reg_pre.RANDOM)
+            if metric_sampling_seed is None:
+                reg_pre.SetMetricSamplingPercentage(0.10)
+            else:
+                reg_pre.SetMetricSamplingPercentage(0.10, int(metric_sampling_seed))
+
+            reg_pre.SetInterpolator(sitk.sitkLinear)
+            reg_pre.SetOptimizerAsRegularStepGradientDescent(
+                learningRate=2.0,
+                minStep=1e-4,
+                numberOfIterations=60,
+                gradientMagnitudeTolerance=1e-6,
+            )
+            reg_pre.SetOptimizerScalesFromPhysicalShift()
+
+            use_global_cap_pre = (n_workers is not None and not set_sitk_object_threads(reg_pre, n_workers))
+            with global_sitk_thread_cap(n_workers, enabled=use_global_cap_pre, verbose=False):
+                tfm_pre = reg_pre.Execute(fixed_pre, moving_pre)
+
+            prepass_offset = tuple(float(x) for x in tfm_pre.GetOffset())
+            if verbose:
+                print(f"[register_images] translation pre-pass spacing={prepass_spacing} offset={prepass_offset}")
+        except Exception as e:
+            # Pre-pass is a performance/robustness optimization; failure should not abort registration.
+            if verbose:
+                print(f"[register_images] WARNING: translation pre-pass failed: {type(e).__name__}: {e}")
+
         initial_transform = sitk.CenteredTransformInitializer(
-            fixed_for_reg, moving_for_reg, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
+            fixed_reg_img, moving_reg_img, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
         )
+
+        # Add pre-pass translation to the main initializer if supported.
+        try:
+            base = np.array(initial_transform.GetTranslation(), dtype=float)
+            off = np.array(prepass_offset, dtype=float)
+            initial_transform.SetTranslation(tuple((base + off).tolist()))
+        except Exception:
+            pass
 
         registration = sitk.ImageRegistrationMethod()
         registration.SetInitialTransform(initial_transform, inPlace=False)
@@ -938,7 +1142,7 @@ def register_images(
                 print(f"[{strategy}] metric sampling: RANDOM ({f:.3f} of voxels), seed={metric_sampling_seed}")
 
         # Optimizer
-        registration.SetInterpolator(sitk.sitkLinear)
+        registration.SetInterpolator(sitk_interp)
         registration.SetOptimizerAsRegularStepGradientDescent(
             learningRate=2.0,
             minStep=1e-4,
@@ -951,13 +1155,24 @@ def register_images(
         # optionally fall back to a global cap (LAST RESORT).
         use_global_cap = (n_workers is not None and not reg_threads_ok)
         with global_sitk_thread_cap(n_workers, enabled=use_global_cap, verbose=verbose):
-            transform = registration.Execute(fixed_for_reg, moving_for_reg)
+            transform = registration.Execute(fixed_reg_img, moving_reg_img)
 
         if verbose:
             print(f"Final {similarity_metric} = {registration.GetMetricValue():.4f}")
 
         if transform_path:
             sitk.WriteTransform(transform, transform_path)
+            _write_transform_meta(
+                transform_path,
+                {
+                    "interp": interp_spec if interp_spec is not None else "linear",
+                    "sitk_interpolator": sitk_interp_name,
+                    "scipy_order": int(scipy_order),
+                    "registration_type": str(registration_type),
+                    "similarity_metric": str(similarity_metric),
+                    "registration_strategy": str(registration_strategy),
+                },
+            )
 
     # ------------------------------------------------------------------
     # Resample moving -> fixed space
@@ -973,6 +1188,7 @@ def register_images(
             default_value=0.0,
             pixel_id=moving_img.GetPixelID(),
             n_workers=n_workers,
+            interp=interp_spec,
         )
         registered = resampler.Execute(moving_img)
         sitk.WriteImage(registered, str(output_path))
@@ -983,15 +1199,19 @@ def register_images(
         n_frames = moving_shape[3] if moving_ndim == 4 else 1
 
         out_frames = []
+
+        # Build resampler ONCE (same reference grid/transform/interpolator for every frame)
+        resampler = make_sitk_resampler(
+            reference_img=spatial_ref,
+            transform=transform,
+            default_value=0.0,
+            pixel_id=moving_for_reg.GetPixelID(),
+            n_workers=n_workers,
+            interp=interp_spec,
+        )
+
         for t in range(int(n_frames)):
             frame3d = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, t)
-            resampler = make_sitk_resampler(
-                reference_img=spatial_ref,
-                transform=transform,
-                default_value=0.0,
-                pixel_id=frame3d.GetPixelID(),
-                n_workers=n_workers,
-            )
             reg3d = resampler.Execute(frame3d)
             out_frames.append(reg3d)
 
@@ -1178,13 +1398,25 @@ def inverse_transform_image(
         inverse_transform = transform.GetInverse()
     except Exception as e:
         raise ValueError(f"Failed to compute inverse transform for '{transform_path}': {e}")
+    # Interpolation: by default, reuse whatever was used for the forward registration if available.
+    from .preprocessing_utils import _interp_to_sitk_interpolator
 
-    if interpolation == "linear":
-        interp_method = sitk.sitkLinear
-    elif interpolation == "nearest":
-        interp_method = sitk.sitkNearestNeighbor
-    else:
-        raise ValueError("interpolation must be 'linear' or 'nearest'")
+    interp_spec = interpolation
+    if isinstance(interp_spec, str) and interp_spec.strip().lower() == "auto":
+        interp_spec = None
+        # Try to read from register_images() sidecar JSON.
+        try:
+            meta_path = os.path.splitext(str(transform_path))[0] + ".meta.json"
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict) and "interp" in meta:
+                interp_spec = meta["interp"]
+                if verbose:
+                    print(f"[inverse_transform_image] Using recorded interpolation from sidecar: {interp_spec!r}")
+        except Exception:
+            interp_spec = None
+
+    interp_method, interp_name, _ = _interp_to_sitk_interpolator(interp_spec)
 
     if tr_ndim == 3:
         recovered = sitk.Resample(
@@ -1457,7 +1689,7 @@ def apply_or_reverse_transforms(
     transform_record_path,
     output_path,
     mode="apply",
-    interp=1
+    interp=None,  # <-- None means "use stored interpolation unless user overrides"
 ):
     """
     Apply or reverse a transform pipeline defined in a transform_record.json.
@@ -1467,20 +1699,75 @@ def apply_or_reverse_transforms(
         transform_record_path (str): Path to the transform_record.json file.
         output_path (str): Where to write the transformed result.
         mode (str): "apply" or "reverse".
-        interp (int): Interpolation order (0=nearest, 1=linear).
+        interp (int|str|None): If provided, overrides stored interpolation.
+            - For resize steps: 0=nearest, 1=linear
+            - For inverse .tfm steps: "nearest" or "linear"
+            If None, interpolation is inferred from each transform_record entry (fallback=linear).
     """
     assert mode in ["apply", "reverse"], "mode must be 'apply' or 'reverse'"
+
+    import os
+    import json
+    import shutil
+    import tempfile
+
     from .preprocessing_utils import read_padding_record
+    # assumes these are in-scope/importable in your module
+    # from .preprocessing_functions import register_images, inverse_transform_image, resize_mri, reverse_resize_mri
+
+    def _normalize_interp_override(user_interp):
+        """
+        Returns:
+          (resize_order_int, sitk_interp_str) or (None, None) if user_interp is None
+        """
+        if user_interp is None:
+            return None, None
+        if isinstance(user_interp, str):
+            s = user_interp.strip().lower()
+            if s in ("linear", "lin", "1"):
+                return 1, "linear"
+            if s in ("nearest", "nn", "0"):
+                return 0, "nearest"
+            raise ValueError(f"interp override string must be 'linear' or 'nearest' (got {user_interp!r})")
+        try:
+            i = int(user_interp)
+        except Exception:
+            raise ValueError(f"interp override must be int/str/None (got {user_interp!r})")
+        if i not in (0, 1):
+            raise ValueError(f"interp override int must be 0 or 1 (got {i})")
+        return i, ("nearest" if i == 0 else "linear")
+
+    def _infer_interp_from_record(record_entry):
+        """
+        Try a few likely keys. Supports:
+          - int 0/1
+          - str "nearest"/"linear"
+        Falls back to linear.
+        """
+        if not isinstance(record_entry, dict):
+            return 1, "linear"
+
+        # Common key candidates (add/remove as needed to match your record)
+        for k in ("interpolation", "interp", "resample_interp", "resample_interpolation"):
+            if k in record_entry and record_entry[k] is not None:
+                v = record_entry[k]
+                # reuse override parser for consistent behavior
+                return _normalize_interp_override(v)
+
+        return 1, "linear"
 
     base_dir = os.path.dirname(os.path.abspath(transform_record_path))
 
     # Load the record
-    with open(transform_record_path, 'r') as f:
+    with open(transform_record_path, "r") as f:
         record = json.load(f)
 
     steps = list(record.items())
     if mode == "reverse":
         steps = list(reversed(steps))
+
+    # If user overrides, apply to ALL steps. If None, infer per-step.
+    user_resize_order, user_sitk_interp = _normalize_interp_override(interp)
 
     temp_file = input_path
     temp_files = []
@@ -1492,9 +1779,18 @@ def apply_or_reverse_transforms(
                 ref_path = os.path.normpath(os.path.join(base_dir, record_entry.get("fixed_reference", "")))
             else:
                 ref_path = os.path.normpath(os.path.join(base_dir, record_entry.get("moving_reference", "")))
+
+            # Determine interpolation for this step
+            if user_resize_order is None:
+                step_resize_order, step_sitk_interp = _infer_interp_from_record(record_entry)
+            else:
+                step_resize_order, step_sitk_interp = user_resize_order, user_sitk_interp
         else:
             tfm_path = os.path.normpath(os.path.join(base_dir, record_entry))
             ref_path = None
+
+            # Non-dict entries: no metadata available
+            step_resize_order, step_sitk_interp = (user_resize_order, user_sitk_interp) if user_resize_order is not None else (1, "linear")
 
         if tfm_path.endswith(".tfm"):
             intermediate = tempfile.mktemp(suffix=".nii.gz")
@@ -1502,13 +1798,16 @@ def apply_or_reverse_transforms(
                 raise RuntimeError(f"[Error] Reference image not found for transform: {tfm_path}")
 
             if mode == "apply":
+                # NOTE: your current register_images() apply-only path uses its own interpolator internally.
+                # If you want stored interpolation to affect APPLY direction too, we should add an
+                # interpolation param to register_images() and pass it through to the resampler.
                 register_images(
                     fixed_path=ref_path,
                     moving_path=temp_file,
                     output_path=intermediate,
                     transform_path=tfm_path,
                     apply_only=True,
-                    verbose=False
+                    verbose=False,
                 )
             else:
                 inverse_transform_image(
@@ -1516,15 +1815,15 @@ def apply_or_reverse_transforms(
                     transformed_image_path=temp_file,
                     transform_path=tfm_path,
                     output_path=intermediate,
-                    interpolation="linear",
-                    verbose=False
+                    interpolation=step_sitk_interp,  # <-- was hardcoded "linear"
+                    verbose=False,
                 )
+
             temp_files.append(intermediate)
             temp_file = intermediate
 
         elif tfm_path.endswith("_padding.txt"):
             padding_record = read_padding_record(tfm_path)
-
             intermediate = tempfile.mktemp(suffix=".nii.gz")
 
             if mode == "apply":
@@ -1533,18 +1832,19 @@ def apply_or_reverse_transforms(
                     output_filepath=intermediate,
                     target_shape=padding_record["target_shape"],
                     target_voxel_dims=padding_record["target_voxel_dims"],
-                    interp=interp,
+                    interp=step_resize_order,  # <-- inferred unless user overrides
                     save_padding_record=False,
                     padding_record_path=tfm_path,
-                    translation_only=False
+                    translation_only=False,
                 )
             else:
                 reverse_resize_mri(
                     input_filepath=temp_file,
                     output_filepath=intermediate,
                     padding_record_path=tfm_path,
-                    interp=interp
+                    interp=step_resize_order,  # <-- inferred unless user overrides
                 )
+
             temp_files.append(intermediate)
             temp_file = intermediate
 
@@ -3983,7 +4283,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     basic.add_argument(
         "--registration_strategy",
         choices=["accurate", "medium", "fast"],
-        default="accurate",
+        default="medium",
         help=(
             "Speed/accuracy preset. 'accurate' uses all voxels; 'medium'/'fast' use random metric sampling."
         ),
@@ -3996,6 +4296,9 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             "Optional integer seed for deterministic random metric sampling (only relevant for 'medium'/'fast')."
         ),
     )
+    basic.add_argument("--interp", default="cubic", help="Interpolation for registration+resampling. Accepts int 0-5 or strings like linear/cubic; use 'auto' to reuse recorded interpolation when --apply_only.")
+    basic.add_argument("--registration_voxel_mm", default="1,1,1", help="Optional spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
+
     io = p.add_argument_group("Transforms I/O")
     io.add_argument("--transform",
                     help="Where to save the fitted transform (.tfm), or load from when --apply_only is set.")
@@ -4013,6 +4316,8 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             registration_strategy=a.registration_strategy,
             metric_sampling_seed=a.metric_sampling_seed,
             save_dummy_ref=a.save_dummy_ref,
+            interpolation=a.interp,
+            registration_voxel_mm=a.registration_voxel_mm,
             verbose=a.verbose,
         )
     p.set_defaults(func=_run_register)
@@ -4027,7 +4332,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--transformed", required=True, help="Image currently in transformed space.")
     p.add_argument("--transform", required=True, help="Transform file (.tfm) to invert.")
     p.add_argument("--output", required=True, help="Output NIfTI path for inverse-transformed image.")
-    p.add_argument("--interp", choices=["linear","nearest"], default="linear", help="Resampling kernel.")
+    p.add_argument("--interp", default="auto", help="Interpolation for inverse resampling. Accepts int 0-5 or strings like linear/cubic; default \"auto\" reuses recorded interpolation from the forward registration if available.")
     p.add_argument("--verbose", action="store_true", help="Print actions and summary.")
     def _run_inverse(a):
         inverse_transform_image(

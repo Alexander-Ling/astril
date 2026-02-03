@@ -13,14 +13,81 @@ import tempfile
 import shutil
 import json
 
+
+def _parse_triplet(value, *, cast=float, name="value"):
+    """Parse 'a,b,c' or 'a x b x c' or 'a b c' into a 3-tuple.
+
+    This is used to support CLI inputs like:
+      --final_dims 240,240,155 --final_dims 480,480,310
+      --final_voxels 1,1,1 --final_voxels 0.5,0.5,0.5
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return (cast(value[0]), cast(value[1]), cast(value[2]))
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string like 'a,b,c' or a length-3 sequence. Got {type(value)}")
+    s = value.strip().lower().replace('x', ',').replace(' ', ',')
+    parts = [p for p in s.split(',') if p != '']
+    if len(parts) != 3:
+        raise ValueError(f"{name} must have 3 values. Got: {value!r}")
+    return (cast(parts[0]), cast(parts[1]), cast(parts[2]))
+
+
+def _normalize_final_targets(final_dims, final_voxels):
+    """Normalize final_dims/final_voxels to parallel lists of 3-tuples."""
+    # final_dims/final_voxels may be:
+    #   - single triplet (tuple/list)
+    #   - list of triplets (list[tuple])
+    #   - list of strings from CLI (list[str])
+    def _is_triplet(x):
+        return isinstance(x, (list, tuple)) and len(x) == 3 and all(not isinstance(v, (list, tuple)) for v in x)
+
+    # dims
+    if final_dims is None:
+        dims_list = [(240, 240, 155)]
+    elif isinstance(final_dims, str) or _is_triplet(final_dims):
+        dims_list = [_parse_triplet(final_dims, cast=int, name='final_dims')]
+    else:
+        dims_list = [_parse_triplet(d, cast=int, name='final_dims') for d in list(final_dims)]
+
+    # voxels
+    if final_voxels is None:
+        vox_list = [(1.0, 1.0, 1.0)] * len(dims_list)
+    elif isinstance(final_voxels, str) or _is_triplet(final_voxels):
+        vox_list = [_parse_triplet(final_voxels, cast=float, name='final_voxels')]
+    else:
+        vox_list = [_parse_triplet(v, cast=float, name='final_voxels') for v in list(final_voxels)]
+
+    if len(vox_list) != len(dims_list):
+        raise ValueError(
+            f"You provided {len(dims_list)} set(s) of final_dims but {len(vox_list)} set(s) of final_voxels. "
+            "These must match 1:1."
+        )
+
+    return dims_list, vox_list
+
+
+def _fmt_dims(dims):
+    return "x".join(str(int(x)) for x in dims)
+
+
+def _fmt_vox(vox):
+    def _one(v):
+        v = float(v)
+        # keep filenames stable and portable
+        s = (f"{v:.6g}").rstrip("0").rstrip(".")
+        return s.replace(".", "p") if "." in s else s
+    return "x".join(_one(x) for x in vox)
+
 def run_preprocessing_pipeline(
     scans,
     output_dir,
     temp_dir,
     anchor_label="T1c",
     registration_metric="mi",
+    interp=3,
     co_register_path=None,
     registration_strategy="medium",
+    registration_voxel_mm="2,2,2",
     n_workers_per_registration_process=None,
     n_workers_per_hd_bet_process=None,
     save_scans_with_skulls=False,
@@ -44,7 +111,7 @@ def run_preprocessing_pipeline(
     scans : dict[str, str | os.PathLike]
         Mapping {label -> nifti_path}. Must include `anchor_label`.
         Supports any number of additional labels. 3D and 4D NIfTI are supported.
-        For 4D scans, registration estimates a transform from frame 0, then applies it to all frames.
+        For 4D scans, skullstripping is performed, but no registration.
     output_dir : str | os.PathLike
         Output directory for final preprocessed files.
     temp_dir : str | os.PathLike
@@ -54,6 +121,10 @@ def run_preprocessing_pipeline(
         Anchor must be a 3D NIfTI.
     registration_metric : str, default="mi"
         Similarity metric used for registration (passed to `register_images`), e.g. "mi" or "correlation".
+    registration_voxel_mm: str, default="2,2,2"
+        Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.
+    interp : int, default=3
+        Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...).
     co_register_path : str | os.PathLike | None, default=None
         Optional patient-level reference volume. If provided, the anchor-space outputs are co-registered
         to this reference and the same transform is applied to all scans.
@@ -95,6 +166,10 @@ def run_preprocessing_pipeline(
     verbose : bool, default=True
         If True, print progress messages.
     """
+
+    # Allow multiple output target grids for the final resize step.
+    final_dims_list, final_voxels_list = _normalize_final_targets(final_dims, final_voxels)
+
     import os
     import json
     import shutil
@@ -251,6 +326,8 @@ def run_preprocessing_pipeline(
                 transform_path=tfm,
                 apply_only=False,
                 similarity_metric=registration_metric,
+                interpolation=interp,
+                registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
@@ -269,6 +346,8 @@ def run_preprocessing_pipeline(
                 transform_path=tfm,
                 apply_only=False,
                 similarity_metric=registration_metric,
+                interpolation=interp,
+                registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
@@ -310,6 +389,7 @@ def run_preprocessing_pipeline(
             "fixed_reference": f"./{transform_basedir}/{os.path.basename(fixed_ref_dest)}",
             "moving_reference": f"./{transform_basedir}/{os.path.basename(moving_ref_dest)}",
             "estimated_from": "frame0" if ndim == 4 else "volume",
+            "interpolation": interp,
         }
         transform_records[lbl]["initial-registration"] = info
         return info, ndim
@@ -333,6 +413,7 @@ def run_preprocessing_pipeline(
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm_path,
+                interpolation=interp,
                 n_workers=n_workers_per_registration_process,
                 apply_only=True,
                 save_dummy_ref=False,
@@ -356,6 +437,7 @@ def run_preprocessing_pipeline(
             **parent_info,
             "applied_from_parent": parent_label,
             "estimated_from": "frame0" if ndim == 4 else "volume",
+            "interpolation": interp,
             "skipped_output": True if ndim == 4 else False,
         }
 
@@ -490,6 +572,8 @@ def run_preprocessing_pipeline(
             transform_path=coreg_tfm,
             apply_only=False,
             similarity_metric=registration_metric,
+            interpolation=interp,
+            registration_voxel_mm=registration_voxel_mm,
             registration_strategy=registration_strategy,
             n_workers=n_workers_per_registration_process,
             save_dummy_ref=True,
@@ -528,6 +612,7 @@ def run_preprocessing_pipeline(
                     co_register_path, src_reg, out_coreg,
                     n_workers=n_workers_per_registration_process,
                     transform_path=coreg_tfm_dest,
+                    interpolation=interp,
                     apply_only=True,
                     save_dummy_ref=False,
                     verbose=False,
@@ -543,6 +628,7 @@ def run_preprocessing_pipeline(
                 "fixed_reference": f"./{transform_basedir}/{os.path.basename(coreg_fixed_ref_dest)}",
                 "moving_reference": f"./{transform_basedir}/{os.path.basename(coreg_moving_ref_dest)}",
                 "reference": os.fspath(co_register_path),
+                "interpolation": interp,
                 "estimated_from": "anchor_volume",
             }
 
@@ -663,6 +749,8 @@ def run_preprocessing_pipeline(
                 moving_path=src_4d,
                 output_path=tmp_reg,
                 transform_path=tfm,
+                interpolation=interp,
+                registration_voxel_mm=registration_voxel_mm,
                 apply_only=False,
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
@@ -797,37 +885,66 @@ def run_preprocessing_pipeline(
                 pass
             brain_paths.pop(lbl, None)
             continue
-
     # ---- Step 6: resize to final shape/voxel dims ----
     if verbose:
         print("[Step 6] Resize scans to final dimensions/voxels...")
 
     # 3D only: 4D scans are intentionally not resized
 
-    final_brain_paths: dict[str, str] = {}
-    final_norm_paths: dict[str, str] = {}
-    # Save final brainmask (resized consistently with outputs)
-    brainmask_out = os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz")
-    resize_mri(brainmask_temp, brainmask_out, final_dims, final_voxels, interp="nearest")
+    # Store paths per-label per-target (tag = "{dims}_{vox}")
+    final_brain_paths: dict[str, dict[str, str]] = {}
+    final_norm_paths: dict[str, dict[str, str]] = {}
+    brainmask_outs: dict[str, str] = {}
 
     # Only output labels that survived all prior steps (registration -> masking -> normalization)
     output_3d_labels = sorted(set(brain_paths.keys()).intersection(norm_paths.keys()))
 
-    for lbl in output_3d_labels:
-        out_brain = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain.nii.gz")
-        out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}_brain-norm.nii.gz")
-        resize_mri(brain_paths[lbl], out_brain, final_dims, final_voxels, interp="linear")
-        resize_mri(norm_paths[lbl], out_norm, final_dims, final_voxels, interp="linear")
-        final_brain_paths[lbl] = out_brain
-        final_norm_paths[lbl] = out_norm
+    # Iterate over all requested output target grids
+    for i, (dims_i, vox_i) in enumerate(zip(final_dims_list, final_voxels_list)):
+        dims_tag = _fmt_dims(dims_i)
+        vox_tag = _fmt_vox(vox_i)
+        tag = f"{dims_tag}_{vox_tag}"
 
-        # Carry forward JSON sidecar from the original acquisition and annotate that it is original-acquisition metadata
+        # Backwards-compatible naming: first target uses legacy filenames (no suffix).
+        suffix = "" if i == 0 else f"_{dims_tag}_{vox_tag}"
+
+        # Save final brainmask (resized consistently with outputs)
+        if i == 0:
+            brainmask_out = os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz")
+        else:
+            brainmask_out = os.path.join(output_dir, f"{basename_prefix}_brainmask_{dims_tag}_{vox_tag}.nii.gz")
+
+        resize_mri(brainmask_temp, brainmask_out, dims_i, vox_i, interp="nearest")
+        brainmask_outs[tag] = brainmask_out
+
+        for lbl in output_3d_labels:
+            final_brain_paths.setdefault(lbl, {})
+            final_norm_paths.setdefault(lbl, {})
+
+            out_brain = os.path.join(output_dir, f"{basename_prefix}_{lbl}{suffix}_brain.nii.gz")
+            out_norm = os.path.join(output_dir, f"{basename_prefix}_{lbl}{suffix}_brain-norm.nii.gz")
+
+            resize_mri(brain_paths[lbl], out_brain, dims_i, vox_i, interp=interp)
+            resize_mri(norm_paths[lbl], out_norm, dims_i, vox_i, interp=interp)
+
+            final_brain_paths[lbl][tag] = out_brain
+            final_norm_paths[lbl][tag] = out_norm
+
+
+
+    # Carry forward JSON sidecar from the original acquisition and annotate that it is original-acquisition metadata
+    # for the *primary* (first) target outputs. Also record all multi-target outputs in the transform record.
+    primary_tag = f"{_fmt_dims(final_dims_list[0])}_{_fmt_vox(final_voxels_list[0])}"
+    for lbl in output_3d_labels:
+        out_brain_primary = final_brain_paths[lbl][primary_tag]
+        out_norm_primary = final_norm_paths[lbl][primary_tag]
+
         try:
             src_orig = scans[lbl]
             sidecars = find_sidecars_for_nifti(src_orig)
             jsons = [sp for sp in sidecars if sp.lower().endswith(".json")]
-            copied = copy_sidecars_for_output(jsons, src_orig, out_brain, dry_run=False)
-            copied_norm = copy_sidecars_for_output(jsons, src_orig, out_norm, dry_run=False)
+            copied = copy_sidecars_for_output(jsons, src_orig, out_brain_primary, dry_run=False)
+            copied_norm = copy_sidecars_for_output(jsons, src_orig, out_norm_primary, dry_run=False)
             # Stamp Astril.originalAcquisition so users know SliceThickness/etc refer to original acquisition.
             for cp in (copied + copied_norm):
                 if not cp.lower().endswith(".json"):
@@ -853,12 +970,21 @@ def run_preprocessing_pipeline(
         # Save transform record for each label
         record_path = os.path.join(output_dir, f"{basename_prefix}_{lbl}_transform-record.json")
         transform_records[lbl]["inputs"] = {"original": os.fspath(scans[lbl])}
-        transform_records[lbl]["outputs"] = {
-            "brain": os.path.basename(out_brain),
-            "brain-norm": os.path.basename(out_norm),
+
+        outputs = {
+            "brain": os.path.basename(out_brain_primary),
+            "brain-norm": os.path.basename(out_norm_primary),
         }
-        transform_records[lbl]["brainmask"] = os.path.basename(os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz"))
+
+        # Include all targets (including primary) for reproducibility
+        outputs["brain_multi"] = {k: os.path.basename(v) for k, v in final_brain_paths.get(lbl, {}).items()}
+        outputs["brain-norm_multi"] = {k: os.path.basename(v) for k, v in final_norm_paths.get(lbl, {}).items()}
+        outputs["brainmask_multi"] = {k: os.path.basename(v) for k, v in brainmask_outs.items()}
+
+        transform_records[lbl]["outputs"] = outputs
+        transform_records[lbl]["brainmask"] = os.path.basename(brainmask_outs.get(primary_tag, os.path.join(output_dir, f"{basename_prefix}_brainmask.nii.gz")))
         transform_records[lbl]["brainmask-source"] = brainmask_source
+
         with open(record_path, "w") as f:
             json.dump(transform_records[lbl], f, indent=2)
 
@@ -876,8 +1002,10 @@ def preprocess_single_brain_mri(
     modalities=None,
     anchor_label="T1c",
     registration_metric="mi",
+    interp=3,
     co_register_path=None,
     registration_strategy="medium",
+    registration_voxel_mm="2,2,2",
     n_workers_per_registration_process=None,
     n_workers_per_hd_bet_process: int | None = None,
     save_scans_with_skulls=False,
@@ -914,12 +1042,16 @@ def preprocess_single_brain_mri(
         Label in `scans` to use as the reference space for registration and skull stripping.
     registration_metric : str, default="mi"
         Similarity metric used for registration (passed to `register_images`).
+    interp : int, default=3
+        Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...).
     co_register_path : str | Path | None, default=None
         Optional patient-level reference volume. If provided, the anchor-space outputs are co-registered
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
-     n_workers_per_registration_process : int | None, default=None
+    registration_voxel_mm : str, default="2,2,2"
+        Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False).
+    n_workers_per_registration_process : int | None, default=None
          Passed down to run_preprocessing_pipeline and then to register_images(..., n_workers=...).
     n_workers_per_hd_bet_process : int | None, default=None
         Passed through to `run_hd_bet(..., n_workers=...)` to limit CPU threads used by HD-BET in CPU mode,
@@ -1022,8 +1154,10 @@ def preprocess_single_brain_mri(
             temp_dir=temp_dir,
             anchor_label=anchor_label,
             registration_metric=registration_metric,
+            interp=interp,
             co_register_path=co_register_path,
             registration_strategy=registration_strategy,
+            registration_voxel_mm=registration_voxel_mm,
             n_workers_per_registration_process=n_workers_per_registration_process,
             n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
             save_scans_with_skulls=save_scans_with_skulls,
@@ -1047,7 +1181,9 @@ def preprocess_single_brain_mri(
                 temp_dir=temp_dir,
                 anchor_label=anchor_label,
                 registration_metric=registration_metric,
+                interp=interp,
                 registration_strategy=registration_strategy,
+                registration_voxel_mm=registration_voxel_mm,
                 co_register_path=co_register_path,
                 n_workers_per_registration_process=n_workers_per_registration_process,
                 n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
@@ -1075,7 +1211,7 @@ def main():
         description=(
             "Full MRI preprocessing pipeline using T1c as the anchor by default. "
             "Processes any provided modalities (3D or 4D NIfTI). "
-            "For 4D scans, registers the first frame and applies the same transform to all frames."
+            "For 4D scans, skullstripping is performed, but no registration."
         )
     )
 
@@ -1150,11 +1286,13 @@ def main():
         default="mi",
         help="Metric for registration steps: 'correlation' or 'mi' (mutual information) (default: mi).",
     )
+    parser.add_argument("--interp", type=str, default="3", help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...). Accepts int 0-5 or strings like \'nearest\', \'linear\', \'cubic\'.")
     parser.add_argument(
         "--registration_strategy",
         default="medium",
         help="registration_strategy : {accurate, medium, or fast}, convenience preset controlling registration speed/accuracy tradeoffs",
     )
+    parser.add_argument("--registration_voxel_mm", default="2,2,2", help="Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
     parser.add_argument(
         "--n_workers_per_registration_process",
         type=int,
@@ -1176,8 +1314,8 @@ def main():
             "Use caution if scans contain PHI."
         ),
     )
-    parser.add_argument("--final_dims", default="240,240,155", help="Final data dimensions (default: 240,240,155)")
-    parser.add_argument("--final_voxels", default="1.0,1.0,1.0", help="Final voxel sizes (default: 1.0,1.0,1.0)")
+    parser.add_argument("--final_dims", action="append", default=None, help="Final data dimensions; repeatable. Provide like '240,240,155' (or '240x240x155'). If given multiple times, you must also provide --final_voxels the same number of times.")
+    parser.add_argument("--final_voxels", action="append", default=None, help="Final voxel dimensions (mm); repeatable. Provide like '1,1,1' (or '0.5,0.5,0.5'). If omitted, defaults to 1,1,1 (or repeats it to match --final_dims).")
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for hd-bet skull stripping.")
     parser.add_argument("--enable_tta", action="store_true", help="Enable test-time augmentation (TTA) for hd-bet skull stripping (slower, may improve accuracy; recommended when using GPU).")
     parser.add_argument(
@@ -1203,6 +1341,7 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose print logging.")
 
     args = parser.parse_args()
+    args.interp = _interp_to_scipy_order(args.interp)
 
     # Parse modalities
     modalities = None
@@ -1278,7 +1417,9 @@ def main():
         scan_dir=args.scan_dir,
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
+        interp=args.interp,
         registration_strategy=args.registration_strategy,
+        registration_voxel_mm=args.registration_voxel_mm,
         n_workers_per_registration_process=args.n_workers_per_registration_process,
         n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         co_register_path=args.co_register,
