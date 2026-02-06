@@ -1602,11 +1602,23 @@ def register_images(
 
             tx_pre = sitk.TranslationTransform(3)
             reg_pre = sitk.ImageRegistrationMethod()
-            reg_pre.SetInitialTransform(tx_pre, inPlace=False)
             
             # If requested, zero background voxels for the *metric images* (no hard masks).
             fixed_pre_use, moving_pre_use = _maybe_background_subtract_images(fixed_pre, moving_pre, stage="prepass")
             _maybe_set_metric_focus_masks(reg_pre, fixed_pre_use, moving_pre_use, stage="prepass")
+
+            # CenteredTransformInitializer returns a transform with a good initial offset.
+            # Using GEOMETRY (not MOMENTS) is typically more robust across modalities.
+            try:
+                tx_pre_init = sitk.CenteredTransformInitializer(
+                    fixed_pre_use,
+                    moving_pre_use,
+                    sitk.TranslationTransform(3),
+                    sitk.CenteredTransformInitializerFilter.GEOMETRY,
+                )
+            except Exception:
+                tx_pre_init = sitk.TranslationTransform(3)
+            reg_pre.SetInitialTransform(tx_pre_init, inPlace=False)
 
             set_sitk_object_threads(reg_pre, n_workers)
 
@@ -1638,7 +1650,20 @@ def register_images(
 
             use_global_cap_pre = (n_workers is not None and not set_sitk_object_threads(reg_pre, n_workers))
             with global_sitk_thread_cap(n_workers, enabled=use_global_cap_pre, verbose=False):
-                tfm_pre = reg_pre.Execute(fixed_pre_use, moving_pre_use)
+                try:
+                    tfm_pre = reg_pre.Execute(fixed_pre_use, moving_pre_use)
+                except Exception as e:
+                    # Common failure for partial-FOV scans: MI can't evaluate because samples are out of bounds.
+                    msg = str(e)
+                    if "All samples map outside moving image buffer" in msg:
+                        if verbose:
+                            print(
+                                "[register_images] WARNING: translation pre-pass MI failed due to insufficient overlap; "
+                                "falling back to center-alignment translation."
+                            )
+                        tfm_pre = tx_pre_init
+                    else:
+                        raise
 
             # SimpleITK may return a CompositeTransform even for a pure translation stage
             # (e.g., when an initial transform is provided with inPlace=False).

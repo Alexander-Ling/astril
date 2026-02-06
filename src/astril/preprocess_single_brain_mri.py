@@ -78,6 +78,12 @@ def _fmt_vox(vox):
         return s.replace(".", "p") if "." in s else s
     return "x".join(_one(x) for x in vox)
 
+def _is_perfusion_family(label: str) -> bool:
+    fam = label.split("-", 1)[0] if "-" in label else (label.split("_", 1)[0] if "_" in label else label)
+    f = fam.strip().lower()
+    # Keep this intentionally broad; your labeling upstream often uses "Perfusion" / "Perfusion(...)"
+    return f.startswith("perfusion") or f.startswith("perf") or f in {"pwi", "dsc", "dce", "asl", "pcasl"}
+ 
 def run_preprocessing_pipeline(
     scans,
     output_dir,
@@ -153,9 +159,17 @@ def run_preprocessing_pipeline(
         If generating a brainmask with HD-BET, enable test-time augmentation (TTA) when True.
         (Passed to hd-bet as disable_tta=not enable_tta.)
     brainmask_path : str | os.PathLike | None, default=None
-        Optional pre-existing brainmask (3D NIfTI). If provided, HD-BET is skipped. If the mask grid
-        does not match the (co-registered) anchor volume, it is resampled to the anchor grid using
-        nearest-neighbor interpolation.
+        Optional pre-existing brainmask (3D NIfTI). If provided, HD-BET is skipped.
+
+        **Space convention (IMPORTANT):**
+        - If `co_register_path` is provided, then `brainmask_path` is assumed to be in **co-registration
+          space** (i.e., on the voxel grid of `co_register_path`). It will be mapped back into anchor space
+          for early skull stripping / family registrations.
+        - If `co_register_path` is not provided, then `brainmask_path` is assumed to be in **anchor space**
+          (i.e., on the voxel grid of `scans[anchor_label]`).
+
+        In all cases, masks are treated as binary and resampled with nearest-neighbor when grid matching is
+        required.
     family_parent_map : dict[str, str] | None, default=None
         Optional mapping {family -> parent_label}. JSON string to specify which sequence to use for registration
         when processing modality families (i.e. parent + derived sequences) for co-registration. Transformation
@@ -298,6 +312,125 @@ def run_preprocessing_pipeline(
 
     reg_paths[anchor_label] = anchor_path
 
+    # ------------------------------------------------------------------
+    # Step 0: prepare an anchor-space brainmask (and a skull-stripped anchor)
+    # BEFORE any family registrations.
+    #
+    # Rationale:
+    #   Perfusion registrations are much more reliable when the fixed image is skull-stripped.
+    #   We therefore ensure we can create a skull-stripped version of the anchor volume early,
+    #   and use it as the fixed image for perfusion family registrations in Step 1.
+    #
+    # Space convention (enforced):
+    #   - If co_register_path is provided: a user-supplied brainmask_path is assumed to be in CO-REG space.
+    #   - If co_register_path is not provided: a user-supplied brainmask_path is assumed to be in ANCHOR space.
+    # ------------------------------------------------------------------
+
+    brainmask_anchor_path = os.path.join(temp_dir, f"{basename_prefix}_brainmask_anchor.nii.gz")
+    anchor_brain_for_reg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_brain_for_reg.nii.gz")
+
+    # If we need a co-registration transform early (for mapping a co-reg-space brainmask back to anchor space),
+    # compute it once and reuse it later in Step 2.
+    coreg_precomputed = False
+    coreg_tfm = None
+    anchor_coreg = None
+
+    brainmask_source = {"type": "hd-bet"}
+
+    def _prepare_coreg_transform_if_needed():
+        nonlocal coreg_precomputed, coreg_tfm, anchor_coreg
+        if coreg_precomputed:
+            return
+        if not co_register_path:
+            return
+        coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
+        anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
+        if verbose:
+            print(f"[Step 0] Precomputing anchor->coreg transform (needed for brainmask mapping): {anchor_label} -> {co_register_path}")
+        register_images(
+            fixed_path=co_register_path,
+            moving_path=anchor_path,
+            output_path=anchor_coreg,
+            transform_path=coreg_tfm,
+            apply_only=False,
+            similarity_metric=registration_metric,
+            interpolation=interp,
+            registration_voxel_mm=registration_voxel_mm,
+            registration_strategy=registration_strategy,
+            n_workers=n_workers_per_registration_process,
+            save_dummy_ref=True,
+            verbose=False,
+            debug=debug,
+        )
+        coreg_precomputed = True
+
+    if brainmask_path:
+        # User supplied a brainmask.
+        brainmask_path = os.fspath(brainmask_path)
+        if not os.path.exists(brainmask_path):
+            raise FileNotFoundError(f"Provided brainmask not found: {brainmask_path}")
+        bm_ndim, _ = get_nifti_ndim(brainmask_path)
+        if bm_ndim != 3:
+            raise ValueError(f"Provided brainmask must be 3D. Got ndim={bm_ndim} at: {brainmask_path}")
+
+        if co_register_path:
+            # Convention: brainmask is in CO-REG space; map it back into ANCHOR space.
+            _prepare_coreg_transform_if_needed()
+            if verbose:
+                print("[Step 0] Using provided brainmask in CO-REG space; mapping to anchor space for early skull stripping...")
+            inverse_transform_image(
+                original_image_path=anchor_path,
+                transformed_image_path=brainmask_path,
+                transform_path=coreg_tfm,
+                output_path=brainmask_anchor_path,
+                interpolation="nearest",
+                verbose=False,
+            )
+            brainmask_source = {"type": "provided", "path": brainmask_path, "space": "coreg", "resampled": True}
+        else:
+            # Convention: brainmask is already in ANCHOR space.
+            if verbose:
+                print("[Step 0] Using provided brainmask in ANCHOR space (skipping HD-BET)...")
+            if nifti_geometry_compatible(brainmask_path, anchor_path):
+                shutil.copy(brainmask_path, brainmask_anchor_path)
+                brainmask_source = {"type": "provided", "path": brainmask_path, "space": "anchor", "resampled": False}
+            else:
+                if verbose:
+                    print("[Step 0] Provided brainmask grid does not match anchor; resampling mask to anchor grid...")
+                try:
+                    match_direction_matrices(brainmask_path, anchor_path, brainmask_anchor_path, debug=debug)
+                except Exception as e:
+                    if verbose or debug:
+                        print(f"[WARN] match_direction_matrices failed for brainmask '{brainmask_path}' -> '{anchor_path}': {e}.")
+                    raise
+                brainmask_source = {"type": "provided", "path": brainmask_path, "space": "anchor", "resampled": True}
+
+    else:
+        # No brainmask provided: generate in ANCHOR space via HD-BET.
+        if verbose:
+            print("[Step 0] HD-BET skull strip on anchor and generate brainmask (needed before family registrations)...")
+            print(f"Creating temporary anchor-space brainmask at {brainmask_anchor_path}...")
+        run_hd_bet(
+            input_path=anchor_path,
+            output_path=None,
+            mask_path=brainmask_anchor_path,
+            device="cuda" if use_gpu else "cpu",
+            disable_tta=not enable_tta,
+            verbose=verbose,
+            n_workers=n_workers_per_hd_bet_process,
+        )
+        brainmask_source = {"type": "hd-bet", "space": "anchor"}
+
+    # Create skull-stripped anchor in ANCHOR space for perfusion-fixed registrations.
+    try:
+        apply_mask_anydim(anchor_path, brainmask_anchor_path, anchor_brain_for_reg)
+    except Exception as e:
+        raise RuntimeError(f"Failed to apply anchor brainmask for early skull stripping: {e}")
+
+    def _fixed_for_registration(label: str) -> str:
+        # Use skull-stripped fixed for perfusion families only.
+        return anchor_brain_for_reg if _is_perfusion_family(label) else anchor_path
+
 
 
     def _label_family(label: str) -> str:
@@ -317,10 +450,13 @@ def run_preprocessing_pipeline(
         if verbose:
             print(f"Registering {lbl} to {anchor_label}...")
 
+        metric_focus = "none"
+        if _is_perfusion_family(lbl):
+            metric_focus = "background_subtracted"
         if ndim == 3:
             out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
             register_images(
-                fixed_path=anchor_path,
+                fixed_path=_fixed_for_registration(lbl),
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm,
@@ -331,6 +467,7 @@ def run_preprocessing_pipeline(
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
+                metric_focus=metric_focus, #Shouldn't run into 3d perfusion scans, but I'll add this here just in case
                 verbose=False,
                 debug=debug,
             )
@@ -340,7 +477,7 @@ def run_preprocessing_pipeline(
             # 4D: estimate transform from a single frame (default frame 0). We do NOT keep a registered 4D output.
             out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
             register_images(
-                fixed_path=anchor_path,
+                fixed_path=_fixed_for_registration(lbl),
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm,
@@ -351,8 +488,9 @@ def run_preprocessing_pipeline(
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
+                metric_focus=metric_focus,
+                use_first_frame_only=True,
                 verbose=False,
-                moving_frame_index=0,
                 debug=debug,
             )
             # Discard the registered 4D output (we only keep the transform + dummy refs).
@@ -409,7 +547,7 @@ def run_preprocessing_pipeline(
         if ndim == 3:
             out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
             register_images(
-                fixed_path=anchor_path,
+                fixed_path=_fixed_for_registration(lbl),
                 moving_path=src,
                 output_path=out_reg,
                 transform_path=tfm_path,
@@ -553,6 +691,7 @@ def run_preprocessing_pipeline(
 
     # ---- Step 2: optionally co-register anchor space to provided reference ----
     # Apply the same T1c->ref transform to anchor and all other registered scans.
+    coreg_tfm_dest = None
     coreg_anchor_path = reg_paths[anchor_label]
     if co_register_path:
         if verbose:
@@ -561,36 +700,56 @@ def run_preprocessing_pipeline(
         # Apply co-registration ONLY to 3D scans
         # 4D scans are kept in their native space and handled later (skull-strip only).
 
-        coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
-        anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
+        # If we already computed the anchor->coreg transform in Step 0 (for brainmask mapping), reuse it.
+        # Otherwise compute it here.
+        if not coreg_precomputed:
+            coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
+            anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
 
-        if verbose:
+            if verbose:
                 print(f"Registering {anchor_label} to {co_register_path}...")
 
-        register_images(
-            co_register_path, coreg_anchor_path, anchor_coreg,
-            transform_path=coreg_tfm,
-            apply_only=False,
-            similarity_metric=registration_metric,
-            interpolation=interp,
-            registration_voxel_mm=registration_voxel_mm,
-            registration_strategy=registration_strategy,
-            n_workers=n_workers_per_registration_process,
-            save_dummy_ref=True,
-            verbose=False,
-            debug=debug,
-        )
+            register_images(
+                fixed_path=co_register_path,
+                moving_path=coreg_anchor_path,
+                output_path=anchor_coreg,
+                transform_path=coreg_tfm,
+                apply_only=False,
+                similarity_metric=registration_metric,
+                interpolation=interp,
+                registration_voxel_mm=registration_voxel_mm,
+                registration_strategy=registration_strategy,
+                n_workers=n_workers_per_registration_process,
+                save_dummy_ref=True,
+                verbose=False,
+                debug=debug,
+            )
+            coreg_precomputed = True
+        else:
+            # Sanity checks: Step 0 should have created these.
+            if coreg_tfm is None or anchor_coreg is None:
+                raise RuntimeError("Internal error: coreg_precomputed=True but coreg_tfm/anchor_coreg not set")
+            if not os.path.exists(coreg_tfm):
+                raise FileNotFoundError(f"Expected precomputed coreg transform not found: {coreg_tfm}")
+            if not os.path.exists(anchor_coreg):
+                raise FileNotFoundError(f"Expected precomputed coreg anchor not found: {anchor_coreg}")
 
         # Move coreg transform + dummy refs
         coreg_tfm_dest = os.path.join(transform_dir, os.path.basename(coreg_tfm))
+        if os.path.exists(coreg_tfm_dest):
+            # Avoid clobbering if caller reuses temp/output dirs.
+            os.remove(coreg_tfm_dest)
         shutil.move(coreg_tfm, coreg_tfm_dest)
 
         coreg_moving_ref_dummy = coreg_tfm.replace(".tfm", "-moving-ref.nii.gz")
         coreg_fixed_ref_dummy = coreg_tfm.replace(".tfm", "-fixed-ref.nii.gz")
         coreg_moving_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_moving_ref_dummy))
         coreg_fixed_ref_dest = os.path.join(transform_dir, os.path.basename(coreg_fixed_ref_dummy))
-        shutil.move(coreg_moving_ref_dummy, coreg_moving_ref_dest)
-        shutil.move(coreg_fixed_ref_dummy, coreg_fixed_ref_dest)
+        # If these exist at destination, replace them.
+        for _src, _dst in ((coreg_moving_ref_dummy, coreg_moving_ref_dest), (coreg_fixed_ref_dummy, coreg_fixed_ref_dest)):
+            if os.path.exists(_dst):
+                os.remove(_dst)
+            shutil.move(_src, _dst)
 
         # Apply to all registered scans (including anchor)
         new_reg_paths: dict[str, str] = {}
@@ -638,61 +797,50 @@ def run_preprocessing_pipeline(
         if verbose:
             print("[Step 2] No co-registration reference provided; staying in anchor space")
 
-    # ---- Step 3: skull strip anchor and generate brain mask ----
+    # ---- Step 3: finalize brainmask in the CURRENT working space (anchor or co-reg) ----
+    # At this point we already have an anchor-space brainmask (brainmask_anchor_path) created in Step 0.
+    # If co_register_path was provided, reg_paths are now in CO-REG space; we therefore also need a
+    # co-reg-space brainmask for masking Step 4.
     brainmask_temp = os.path.join(temp_dir, f"{basename_prefix}_brainmask_temp.nii.gz")
-    brainmask_source = {"type": "hd-bet"}
-    brainmask_resampled = False
 
-    
-    if brainmask_path:
+    if co_register_path:
+        # Map anchor-space brainmask into co-reg space using the anchor->coreg transform.
+        if coreg_tfm_dest is None:
+            raise RuntimeError("Internal error: co_register_path set but coreg_tfm_dest is None")
         if verbose:
-            print("[Step 3] Using provided brainmask (skipping HD-BET)...")
-        brainmask_path = os.fspath(brainmask_path)
-        if not os.path.exists(brainmask_path):
-            raise FileNotFoundError(f"Provided brainmask not found: {brainmask_path}")
-        bm_ndim, _ = get_nifti_ndim(brainmask_path)
-        if bm_ndim != 3:
-            raise ValueError(f"Provided brainmask must be 3D. Got ndim={bm_ndim} at: {brainmask_path}")
-        
-        # Ensure brainmask matches the grid of the (co-registered) anchor volume
-        if nifti_geometry_compatible(brainmask_path, coreg_anchor_path):
-            shutil.copy(brainmask_path, brainmask_temp)
-            brainmask_source = {"type": "provided", "path": brainmask_path, "resampled": False}
-        else:
-            if verbose:
-                print("Provided brainmask grid does not match anchor; resampling mask to anchor grid...")
-            try:
-                match_direction_matrices(brainmask_path, coreg_anchor_path, brainmask_temp, debug=debug)
-            except Exception as e:
-                if verbose or debug:
-                    print(f"[WARN] match_direction_matrices failed for brainmask '{brainmask_path}' -> '{coreg_anchor_path}': {e}. Will fall back to direct resample-to-anchor later.")
-                # Fall back: keep original brainmask; downstream resample will handle grid.
-                brainmask_temp = brainmask_path
-            brainmask_source = {"type": "provided", "path": brainmask_path, "resampled": True}
-        
-    else:
-        if verbose:
-            print("[Step 3] HD-BET skull strip on anchor and generate brainmask...")
-            print(f"Creating temporary brainmask at {brainmask_temp}...")
-        run_hd_bet(
-            input_path=coreg_anchor_path,
-            output_path=None,
-            mask_path=brainmask_temp,
-            device="cuda" if use_gpu else "cpu",
-            disable_tta=not enable_tta,
-            verbose=verbose,
-            n_workers=n_workers_per_hd_bet_process,
+            print("[Step 3] Mapping anchor-space brainmask into co-registration space...")
+        register_images(
+            fixed_path=co_register_path,
+            moving_path=brainmask_anchor_path,
+            output_path=brainmask_temp,
+            transform_path=coreg_tfm_dest,
+            apply_only=True,
+            interpolation="nearest",
+            n_workers=n_workers_per_registration_process,
+            save_dummy_ref=False,
+            verbose=False,
+            debug=debug,
         )
+    else:
+        # Working space is anchor space.
+        shutil.copy(brainmask_anchor_path, brainmask_temp)
+
+    # Save a per-patient *reference-space* brainmask for reuse, but only when we generated it via HD-BET.
+    # Reference space is:
+    #   - CO-REG space when co_register_path is provided
+    #   - ANCHOR space otherwise
+    if brainmask_source.get("type") == "hd-bet":
         patient_id_for_mask = basename_prefix.split("_", 1)[0]
         patient_out_dir = os.path.dirname(output_dir.rstrip(os.sep))
         patient_ref_mask = os.path.join(patient_out_dir, f"{patient_id_for_mask}_brainmask_ref.nii.gz")
         if not os.path.exists(patient_ref_mask):
-            shutil.copy(brainmask_temp, patient_ref_mask)
-            if verbose:
-                print(f"[Info] Saved per-patient reference-space brainmask for reuse: {patient_ref_mask}")
-        else:
-            if verbose:
-                print(f"[WARN] f{patient_ref_mask} already exists. Not saving new reference mask.")
+            try:
+                shutil.copy(brainmask_temp, patient_ref_mask)
+                if verbose:
+                    print(f"[Info] Saved per-patient reference-space brainmask for reuse: {patient_ref_mask}")
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] Failed to save per-patient reference-space brainmask: {e}")
 
     # ---- Step 4: apply mask to all scans ----
     if verbose:
@@ -744,8 +892,14 @@ def run_preprocessing_pipeline(
         mask_in_native = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brainmask_native_temp.nii.gz")
 
         try:
+            # Default: register against the (possibly preprocessed) anchor in coreg space.
+            # Special-case perfusion: register against skull-stripped anchor
+            # using background subtraction to stabilize the metric for partial-head / low-contrast perfusion series.
+            metric_focus = "none"
+            if _is_perfusion_family(lbl):
+                metric_focus = "background_subtracted"
             register_images(
-                fixed_path=coreg_anchor_path,
+                fixed_path=_fixed_for_registration(lbl),
                 moving_path=src_4d,
                 output_path=tmp_reg,
                 transform_path=tfm,
@@ -756,6 +910,8 @@ def run_preprocessing_pipeline(
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
                 save_dummy_ref=True,
+                metric_focus=metric_focus,
+                use_first_frame_only=True,
                 verbose=False,
                 debug=debug,
             )
@@ -1072,9 +1228,17 @@ def preprocess_single_brain_mri(
     enable_tta : bool, default=False
         If generating a brainmask with HD-BET, enable test-time augmentation (TTA) when True.
     brainmask_path : str | Path | None, default=None
-        Optional pre-existing brainmask (3D NIfTI). If provided, HD-BET is skipped. If the mask grid
-        does not match the (co-registered) anchor volume, it is resampled to the anchor grid using
-        nearest-neighbor interpolation.
+        Optional pre-existing brainmask (3D NIfTI). If provided, HD-BET is skipped.
+
+        **Space convention (IMPORTANT):**
+        - If `co_register_path` is provided, then `brainmask_path` is assumed to be in **co-registration space**
+          (i.e., on the voxel grid of `co_register_path`). It will be mapped back into anchor space for early
+          skull stripping / family registrations.
+        - If `co_register_path` is not provided, then `brainmask_path` is assumed to be in **anchor space**
+          (i.e., on the voxel grid of the anchor scan).
+
+        In all cases, masks are treated as binary and resampled with nearest-neighbor when grid matching is
+        required.
     family_parent_map : dict[str, str] | None, default=None
         Optional mapping {family -> parent_label}. When provided, registration to the anchor is estimated
         only for the parent scan in each family, and the parent transform is applied to compatible
@@ -1341,6 +1505,7 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose print logging.")
 
     args = parser.parse_args()
+    from .preprocessing_utils import _interp_to_scipy_order
     args.interp = _interp_to_scipy_order(args.interp)
 
     # Parse modalities
@@ -1353,8 +1518,11 @@ def main():
             )
 
     # Parse dims/voxels
-    dims = tuple(map(int, args.final_dims.split(",")))
-    voxels = tuple(map(float, args.final_voxels.split(",")))
+    # NOTE: final_dims/final_voxels are already accepted as repeatable triplets (action="append").
+    # Leave them as-is (None | list[str]) and let run_preprocessing_pipeline() normalize/validate via
+    # _normalize_final_targets() / _parse_triplet().
+    dims = args.final_dims
+    voxels = args.final_voxels
 
     # Build scans dict from scans_json and --scan entries
     scans = {}
