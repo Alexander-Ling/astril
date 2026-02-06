@@ -1350,8 +1350,6 @@ def register_images(
             # Best-effort only
             return
 
-    # Lightweight dimensionality check (nibabel is OK here; used elsewhere in the package)
-    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d
 
     # ------------------------------------------------------------------
     # Thread control
@@ -1369,21 +1367,89 @@ def register_images(
     )
     n_workers = normalize_n_workers(n_workers)
 
-    fixed_ndim, _ = get_nifti_ndim(fixed_path)
-    moving_ndim, moving_shape = get_nifti_ndim(moving_path)
+    # ------------------------------------------------------------------
+    # Image I/O: support NIfTI (.nii/.nii.gz) and NRRD (.nrrd)
+    # ------------------------------------------------------------------
+    # We use SimpleITK for I/O and dimensionality checks so we can support NRRD.
+    # NRRD 4D time-series are commonly stored as either:
+    #   (a) a true 4D image (dim=4), or
+    #   (b) a 3D VectorImage where components-per-pixel == n_frames.
+
+    def _is_nifti_path(p: str) -> bool:
+        s = str(p).lower()
+        return s.endswith(".nii") or s.endswith(".nii.gz")
+
+    def _is_nrrd_path(p: str) -> bool:
+        return str(p).lower().endswith(".nrrd")
+
+    def _read_image_any(path_like) -> sitk.Image:
+        p = str(path_like)
+
+        r = sitk.ImageFileReader()
+        r.SetFileName(p)
+        r.ReadImageInformation()
+
+        dim = int(r.GetDimension())
+        ncomp = int(r.GetNumberOfComponents())
+
+        # Preserve vector images (common for NRRD time-series: kinds[..., 'list'])
+        if dim == 3 and ncomp > 1:
+            r.SetOutputPixelType(sitk.sitkVectorFloat32)
+        else:
+            r.SetOutputPixelType(sitk.sitkFloat32)
+
+        return r.Execute()
+
+    def _infer_3d4d(img: sitk.Image):
+        dim = int(img.GetDimension())
+        comps = int(img.GetNumberOfComponentsPerPixel())
+        if dim == 4:
+            sx, sy, sz, st = img.GetSize()
+            return 4, (int(sx), int(sy), int(sz), int(st)), False
+        if dim == 3 and comps > 1:
+            sx, sy, sz = img.GetSize()
+            return 4, (int(sx), int(sy), int(sz), int(comps)), True
+        if dim == 3:
+            sx, sy, sz = img.GetSize()
+            return 3, (int(sx), int(sy), int(sz), 1), False
+        raise ValueError(f"Unsupported image dimensionality: dim={dim}, components={comps}")
+
+    def _extract_3d_frame(img: sitk.Image, t: int, *, is_vector_4d: bool) -> sitk.Image:
+        if is_vector_4d:
+            return sitk.VectorIndexSelectionCast(img, int(t), sitk.sitkFloat32)
+        size = list(img.GetSize())
+        if len(size) != 4:
+            raise ValueError(f"Expected 4D image for frame extraction; got dim={img.GetDimension()}")
+        size[3] = 0
+        idx = [0, 0, 0, int(t)]
+        return sitk.Extract(img, size, idx)
+
+    def _compose_vector_image(frames_3d: list[sitk.Image], spatial_reference: sitk.Image) -> sitk.Image:
+        v = sitk.Compose(frames_3d)
+        try:
+            v.CopyInformation(spatial_reference)
+        except Exception:
+            pass
+        return v
+
+    fixed_img = _read_image_any(fixed_path)
+    moving_img = _read_image_any(moving_path)
+
+    fixed_ndim, fixed_shape, fixed_is_vector4d = _infer_3d4d(fixed_img)
+    moving_ndim, moving_shape, moving_is_vector4d = _infer_3d4d(moving_img)
+    if verbose:
+        print(f"[register_images] fixed: dim={fixed_img.GetDimension()} comps={fixed_img.GetNumberOfComponentsPerPixel()} inferred={fixed_ndim} shape={fixed_shape} vector4d={fixed_is_vector4d}")
+        print(f"[register_images] moving: dim={moving_img.GetDimension()} comps={moving_img.GetNumberOfComponentsPerPixel()} inferred={moving_ndim} shape={moving_shape} vector4d={moving_is_vector4d}")
 
     if fixed_ndim not in (3, 4) or moving_ndim not in (3, 4):
         raise ValueError(
-            f"register_images supports only 3D/4D NIfTI inputs. "
+            f"register_images supports only 3D/4D inputs. "
             f"Got fixed_ndim={fixed_ndim} moving_ndim={moving_ndim}."
         )
 
-    fixed_img = sitk.ReadImage(str(fixed_path), sitk.sitkFloat32)
-    moving_img = sitk.ReadImage(str(moving_path), sitk.sitkFloat32)
-
     # For registration, pick 3D frames if needed.
-    fixed_for_reg = fixed_img if fixed_ndim == 3 else sitk_extract_3d_from_4d(fixed_img, int(fixed_frame_index))
-    moving_for_reg = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, int(moving_frame_index))
+    fixed_for_reg = fixed_img if fixed_ndim == 3 else _extract_3d_frame(fixed_img, int(fixed_frame_index), is_vector_4d=fixed_is_vector4d)
+    moving_for_reg = moving_img if moving_ndim == 3 else _extract_3d_frame(moving_img, int(moving_frame_index), is_vector_4d=moving_is_vector4d)
 
     # ------------------------------------------------------------------
     # Optionally treat 4D as 3D by taking a single frame
@@ -1537,7 +1603,11 @@ def register_images(
             tx_pre = sitk.TranslationTransform(3)
             reg_pre = sitk.ImageRegistrationMethod()
             reg_pre.SetInitialTransform(tx_pre, inPlace=False)
-            _maybe_set_metric_focus_masks(reg_pre, fixed_pre, moving_pre, stage="prepass")
+            
+            # If requested, zero background voxels for the *metric images* (no hard masks).
+            fixed_pre_use, moving_pre_use = _maybe_background_subtract_images(fixed_pre, moving_pre, stage="prepass")
+            _maybe_set_metric_focus_masks(reg_pre, fixed_pre_use, moving_pre_use, stage="prepass")
+
             set_sitk_object_threads(reg_pre, n_workers)
 
             # Metric (keep user's choice, but keep it light)
@@ -1700,11 +1770,19 @@ def register_images(
         # Sanitize header to avoid nibabel warnings / decompositions later.
         #_sanitize_nifti_header_inplace(str(output_path)) #skip for now
     else:
-        # Minimal 4D wrapper: resample each 3D frame onto the fixed grid and stack as (x,y,z,t).
-        import numpy as np
-        import nibabel as nib
-        from datetime import datetime
+        # 4D wrapper
+        # - If output is NIfTI, write a 4D NIfTI (xyzt) via nibabel (preserves fixed affine).
+        # - If output is NRRD, write a 3D VectorImage (n_frames components) via SimpleITK.
 
+        if _is_nrrd_path(output_path) and moving_ndim == 4 and verbose:
+            print(
+                "Saving 4D NRRD output is experimental. "
+                "Axis structure and metadata (e.g. time-series semantics) "
+                "may not be preserved, and some viewers may not recognize "
+                "the result as a time series. If using with 3D Slicer,"
+                "consider saving output as .seq.nrrd."
+            )
+        
         n_frames = int(moving_shape[3])
         spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
 
@@ -1717,69 +1795,92 @@ def register_images(
             interp=interp_spec,
         )
 
-        fixed_nii = nib.load(str(fixed_path))
-        fixed_affine = fixed_nii.affine
+        if _is_nrrd_path(output_path):
+            # Write as VectorImage so viewers (e.g., 3D Slicer MultiVolume) can treat it as a volume sequence.
+            if verbose:
+                print(f"Resampling {n_frames} frames for NRRD VectorImage output...")
+            out_frames = []
+            for t in range(n_frames):
+                frame3d = _extract_3d_frame(moving_img, t, is_vector_4d=moving_is_vector4d)
+                reg3d = resampler.Execute(frame3d)
+                out_frames.append(reg3d)
 
-        # Target grid size from the 3D reference (SimpleITK size is (x,y,z))
-        sx, sy, sz = spatial_ref.GetSize()
-        out_xyzt = np.zeros((sx, sy, sz, n_frames), dtype=np.float32)
+            vimg = _compose_vector_image(out_frames, spatial_reference=spatial_ref)
+            if verbose:
+                print("Saving 4D-as-VectorImage output via SimpleITK...")
+            sitk.WriteImage(vimg, str(output_path))
 
-        if verbose:
-            print(f"Resampling {n_frames} frames (4D wrapper) starting at {datetime.now()}")
-
-        for t in range(n_frames):
-            frame3d = sitk_extract_3d_from_4d(moving_img, t)
-            reg3d = resampler.Execute(frame3d)
-
-            # SITK -> numpy gives (z,y,x)
-            reg_zyx = sitk.GetArrayFromImage(reg3d).astype(np.float32, copy=False)
-            # Convert to (x,y,z)
-            reg_xyz = np.transpose(reg_zyx, (2, 1, 0))
-
-            # Safety check (optional but useful while debugging)
-            if reg_xyz.shape != (sx, sy, sz):
-                raise RuntimeError(
-                    f"Frame {t} resampled shape {reg_xyz.shape} != expected {(sx, sy, sz)}. "
-                    f"spatial_ref size={spatial_ref.GetSize()}"
+        else:
+            # NIfTI output path: preserve affine via nibabel.
+            if not (_is_nifti_path(fixed_path) and _is_nifti_path(moving_path) and _is_nifti_path(output_path)):
+                raise ValueError(
+                    "Writing 4D NIfTI output currently requires fixed/moving/output to all be NIfTI "
+                    "(.nii or .nii.gz). For NRRD inputs/outputs, write .nrrd instead."
                 )
 
-            out_xyzt[..., t] = reg_xyz
+            import numpy as np
+            import nibabel as nib
+            from datetime import datetime
 
-        if verbose:
-            print(f"4D stacking complete at {datetime.now()}")
+            fixed_nii = nib.load(str(fixed_path))
+            fixed_affine = fixed_nii.affine
 
-        out_nii = nib.Nifti1Image(out_xyzt, fixed_affine)
-        hdr = out_nii.header
-        hdr.set_data_dtype(np.float32)
+            # Target grid size from the 3D reference (SimpleITK size is (x,y,z))
+            sx, sy, sz = spatial_ref.GetSize()
+            out_xyzt = np.zeros((sx, sy, sz, n_frames), dtype=np.float32)
 
-        # Copy zooms: spatial from fixed; time from moving if present
-        fixed_zooms = fixed_nii.header.get_zooms()[:3]
-        moving_zooms = nib.load(str(moving_path)).header.get_zooms()
-        tzoom = float(moving_zooms[3]) if len(moving_zooms) > 3 else 1.0
-        hdr.set_zooms(tuple(list(fixed_zooms) + [tzoom]))
+            if verbose:
+                print(f"Resampling {n_frames} frames (4D wrapper) starting at {datetime.now()}")
 
-        # Make qform/sform explicit (helps viewers avoid "base affine" fallbacks)
-        try:
-            qcode = int(fixed_nii.header["qform_code"]) or 1
-            scode = int(fixed_nii.header["sform_code"]) or 1
-        except Exception:
-            qcode, scode = 1, 1
-        out_nii.set_qform(fixed_affine, code=qcode)
-        out_nii.set_sform(fixed_affine, code=scode)
+            for t in range(n_frames):
+                frame3d = _extract_3d_frame(moving_img, t, is_vector_4d=moving_is_vector4d)
+                reg3d = resampler.Execute(frame3d)
 
-        # Clear scaling
-        try:
-            hdr["scl_slope"] = 1.0
-            hdr["scl_inter"] = 0.0
-        except Exception:
-            pass
+                # SITK -> numpy gives (z,y,x)
+                reg_zyx = sitk.GetArrayFromImage(reg3d).astype(np.float32, copy=False)
+                # Convert to (x,y,z)
+                reg_xyz = np.transpose(reg_zyx, (2, 1, 0))
 
-        if verbose:
-            print(f"Saving 4D output via nibabel (xyzt) starting at {datetime.now()}")
-        nib.save(out_nii, str(output_path))
-        if verbose:
-            print(f"Save completed at {datetime.now()}")
+                if reg_xyz.shape != (sx, sy, sz):
+                    raise RuntimeError(
+                        f"Frame {t} resampled shape {reg_xyz.shape} != expected {(sx, sy, sz)}. "
+                        f"spatial_ref size={spatial_ref.GetSize()}"
+                    )
 
+                out_xyzt[..., t] = reg_xyz
+
+            if verbose:
+                print(f"4D stacking complete at {datetime.now()}")
+
+            out_nii = nib.Nifti1Image(out_xyzt, fixed_affine)
+            hdr = out_nii.header
+            hdr.set_data_dtype(np.float32)
+
+            # Copy zooms: spatial from fixed; time from moving if present
+            fixed_zooms = fixed_nii.header.get_zooms()[:3]
+            moving_zooms = nib.load(str(moving_path)).header.get_zooms()
+            tzoom = float(moving_zooms[3]) if len(moving_zooms) > 3 else 1.0
+            hdr.set_zooms(tuple(list(fixed_zooms) + [tzoom]))
+
+            try:
+                qcode = int(fixed_nii.header["qform_code"]) or 1
+                scode = int(fixed_nii.header["sform_code"]) or 1
+            except Exception:
+                qcode, scode = 1, 1
+            out_nii.set_qform(fixed_affine, code=qcode)
+            out_nii.set_sform(fixed_affine, code=scode)
+
+            try:
+                hdr["scl_slope"] = 1.0
+                hdr["scl_inter"] = 0.0
+            except Exception:
+                pass
+
+            if verbose:
+                print(f"Saving 4D output via nibabel (xyzt) starting at {datetime.now()}")
+            nib.save(out_nii, str(output_path))
+            if verbose:
+                print(f"Save completed at {datetime.now()}")
     # Optional dummy references
     if save_dummy_ref and transform_path:
         base = os.path.splitext(str(transform_path))[0]
