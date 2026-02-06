@@ -391,9 +391,7 @@ def preprocess_library(
     modalities: list[str] | None = None,
     anchor_label: str = "T1c",
     registration_metric: str = "mi",
-    interp=3,
     registration_strategy: str = "medium",
-    registration_voxel_mm: str = "2,2,2",
     family_parent_map: dict[str, str] | None = None,
     final_dims: tuple[int, int, int] = (240, 240, 155),
     final_voxels: tuple[float, float, float] = (1.0, 1.0, 1.0),
@@ -417,14 +415,6 @@ def preprocess_library(
 
     Returns (preprocess_log_path, coreg_log_path).
     """
-    # Normalize interpolation spec early so downstream calls see a consistent int order.
-    # (Argparse provides strings; users may pass numbers like "3".)
-    try:
-        from .preprocessing_utils import _interp_to_scipy_order as _norm_interp
-        interp = _norm_interp(interp)
-    except Exception as e:
-        raise ValueError(f"Invalid --interp / interp={interp!r}: {e}") from e
-
     in_dir = Path(in_dir).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -498,31 +488,10 @@ def preprocess_library(
         old_maps = _read_old_coreg_logs(old_paths)
 
     # Determine a reference for each patient (or None)
-    # NOTE: On large libraries this can take a while, especially when
-    # reference_selection='highest_quality' (we score multiple candidate
-    # anchor volumes per patient). We show a progress bar here so users
-    # know the job is still running before the main per-exam progress bar.
     patient_ref: dict[str, Path | None] = {}
     patient_ref_info: dict[str, dict] = {}
 
-    ref_pbar = None
-    if tqdm:
-        ref_pbar = tqdm(
-            total=len(patient_dirs),
-            desc="Selecting per-patient references",
-            unit="patient",
-            dynamic_ncols=True,
-            leave=False,
-            file=sys.stdout,
-        )
-    else:
-        if not quiet:
-            print(
-                f"[preprocess_brain_mris] Selecting per-patient references for {len(patient_dirs)} patients...",
-                flush=True,
-            )
-
-    for i, pd in enumerate(patient_dirs, start=1):
+    for pd in patient_dirs:
         if dont_coregister:
             patient_ref[pd.name] = None
             patient_ref_info[pd.name] = {
@@ -546,19 +515,6 @@ def preprocess_library(
             )
             patient_ref[pd.name] = ref
             patient_ref_info[pd.name] = info
-
-        if ref_pbar:
-            ref_pbar.update(1)
-        else:
-            # Light-weight fallback: show periodic updates without spamming stdout.
-            if (i == 1) or (i % 25 == 0) or (i == len(patient_dirs)):
-                print(
-                    f"[preprocess_brain_mris] Reference selection: {i}/{len(patient_dirs)} patients",
-                    flush=True,
-                )
-
-    if ref_pbar:
-        ref_pbar.close()
 
     # Write the coreg log up front (what we will try to use)
     with coreg_log.open("w", newline="", encoding="utf-8") as f:
@@ -610,7 +566,7 @@ def preprocess_library(
             "CoregisterRefUsed",
             "PatientBrainmaskUsed",
             "anchor_label", "modalities",
-            "registration_metric", "registration_strategy", "registration_voxel_mm", "interp",
+            "registration_metric", "registration_strategy",
             "final_dims", "final_voxels",
             "save_scans_with_skulls", "use_gpu", "enable_tta", "debug",
         ])
@@ -672,9 +628,7 @@ def preprocess_library(
                 modalities=modalities,
                 anchor_label=anchor_label,
                 registration_metric=registration_metric,
-                interp=interp,
                 registration_strategy=registration_strategy,
-                registration_voxel_mm=registration_voxel_mm,
                 co_register_path=None if dont_coregister else (str(coreg_ref_used_for_exam) if coreg_ref_used_for_exam else None),
                 save_scans_with_skulls=save_scans_with_skulls,
                 final_dims=final_dims,
@@ -777,7 +731,7 @@ def preprocess_library(
                 str(coreg_ref or "NONE") if not dont_coregister else "NONE",
                 str(patient_mask or "NONE") if reuse_patient_brainmask else "DISABLED",
                 anchor_label, ",".join(modalities) if modalities else "AUTO",
-                registration_metric, registration_strategy, registration_voxel_mm, interp,
+                registration_metric, registration_strategy,
                 final_dims, final_voxels,
                 save_scans_with_skulls, use_gpu, enable_tta, debug,
             ])
@@ -810,7 +764,7 @@ def preprocess_library(
                             str(patient_ref.get(patient) or "NONE"),
                             "UNKNOWN",
                             anchor_label, ",".join(modalities) if modalities else "AUTO",
-                            registration_metric, registration_strategy, registration_voxel_mm, interp,
+                            registration_metric, registration_strategy,
                             final_dims, final_voxels,
                             save_scans_with_skulls, use_gpu, enable_tta, debug,
                         ])
@@ -832,7 +786,7 @@ def preprocess_library(
                         str(patient_ref.get(patient) or "NONE"),
                         "UNKNOWN",
                         anchor_label, ",".join(modalities) if modalities else "AUTO",
-                        registration_metric, registration_strategy, registration_voxel_mm, interp,
+                        registration_metric, registration_strategy,
                         final_dims, final_voxels,
                         save_scans_with_skulls, use_gpu, enable_tta, debug,
                     ])
@@ -918,9 +872,7 @@ def main():
     )
     p.add_argument("--anchor_label", default="T1c", help="Anchor label for registration/skull stripping (default: T1c).")
     p.add_argument("--registration_metric", default="mi", help="Registration similarity metric (default: mi).")
-    p.add_argument("--interp", type=str, default="3", help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...). Accepts int 0-5 or strings like \'nearest\', \'linear\', \'cubic\'.")
     p.add_argument("--registration_strategy", default="medium", help="Registration preset: accurate|medium|fast (default: medium).")
-    p.add_argument("--registration_voxel_mm", default="2,2,2", help="Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
     p.add_argument(
         "--family_parent_map",
         default=None,
@@ -929,10 +881,10 @@ def main():
             "Example: '{\"DWI\":\"DWI\", \"SWI\":\"SWI\"}'."
         ),
     )
-    p.add_argument("--final_dims", action="append", default=None, metavar="NX,NY,NZ",
-                   help="Final data dimensions; repeatable. Provide like '240,240,155' (or '240x240x155'). If given multiple times, you must also provide --final_voxels the same number of times.")
-    p.add_argument("--final_voxels", action="append", default=None, metavar="SX,SY,SZ",
-                   help="Final voxel dimensions (mm); repeatable. Provide like '1,1,1' (or '0.5,0.5,0.5'). If omitted, defaults to 1,1,1 (or repeats it to match --final_dims).")
+    p.add_argument("--final_dims", type=int, nargs=3, default=(240, 240, 155), metavar=("NX", "NY", "NZ"),
+                   help="Final dimensions (default: 240 240 155).")
+    p.add_argument("--final_voxels", type=float, nargs=3, default=(1.0, 1.0, 1.0), metavar=("SX", "SY", "SZ"),
+                   help="Final voxel sizes in mm (default: 1.0 1.0 1.0).")
     p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
     p.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for hd-bet skull stripping.")
     p.add_argument("--enable_tta", action="store_true", help="Enable test-time augmentation (TTA) for hd-bet skull stripping.")
@@ -941,11 +893,6 @@ def main():
     p.add_argument("--verbose", action="store_true", help="Print logging from underlying preprocessing.")
 
     args = p.parse_args()
-
-    # Accept numeric strings (e.g. '3') or names (e.g. 'cubic') for --interp
-    from .preprocessing_utils import _interp_to_scipy_order
-    args.interp = _interp_to_scipy_order(args.interp)
-
 
     modalities = None
     if args.modalities:
@@ -969,12 +916,10 @@ def main():
         modalities=modalities,
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
-        interp=args.interp,
         registration_strategy=args.registration_strategy,
-        registration_voxel_mm=args.registration_voxel_mm,
         family_parent_map=family_parent_map,
-        final_dims=args.final_dims,
-        final_voxels=args.final_voxels,
+        final_dims=tuple(args.final_dims),
+        final_voxels=tuple(args.final_voxels),
         save_scans_with_skulls=args.save_scans_with_skulls,
         use_gpu=args.use_gpu,
         enable_tta=args.enable_tta,

@@ -588,7 +588,7 @@ def match_direction_matrices(input_path, donor_path, output_path, *, debug: bool
                 print(f"[match_direction_matrices][debug] Failed to print output header info: {_e}")
 
         nib.save(output_img, output_path)
-        _sanitize_nifti_header_inplace_local(output_path)
+        #_sanitize_nifti_header_inplace_local(output_path) #skip for now
         return
 
     except Exception as e:
@@ -614,7 +614,7 @@ def match_direction_matrices(input_path, donor_path, output_path, *, debug: bool
         out = resampler.Execute(inp)
         sitk.WriteImage(out, str(output_path))
 
-        _sanitize_nifti_header_inplace_local(output_path)
+        #_sanitize_nifti_header_inplace_local(output_path) #skip for now
 
         if debug:
             try:
@@ -690,6 +690,10 @@ def register_images(
     similarity_metric="mi",
     registration_strategy="medium",
     metric_sampling_seed=None,
+    metric_focus: str = "none",
+    metric_focus_percentile: float = 95.0,
+    metric_focus_sigma_mm: float = 1.0,
+    metric_focus_dilate_vox: int = 1,
     verbose=False,
     save_dummy_ref=False,
     interpolation="auto",
@@ -698,6 +702,7 @@ def register_images(
     *,
     fixed_frame_index: int = 0,
     moving_frame_index: int = 0,
+    use_first_frame_only=False,
     debug = False,
 ):
     """
@@ -740,6 +745,47 @@ def register_images(
         Preset controlling pyramid levels, sampling fraction, and iteration budget.
     metric_sampling_seed : int or None, default=None
         Seed for stochastic metric sampling used in "medium"/"fast" presets.
+    metric_focus : {"none", "background_subtracted", "foreground", "edges", "lowhigh", "highlow"}, default="none"
+        Controls whether the registration metric is restricted to a subset of voxels (via SimpleITK metric masks).
+        This is mainly intended to improve robustness when registering partial-FOV/low-coverage scans (e.g. perfusion)
+        to full-head structural images.
+
+        - "none": do not set metric mask
+        - "background_subtracted": do not set a metric mask; instead, compute a foreground mask for each image
+          and set voxels outside the foreground to 0.0 *before* registration. The metric still uses all sampled voxels,
+          but the background contributes less noise/spurious structure. This can help when moving scans have a lot of
+          background/air (partial head, perfusion) and the optimizer otherwise chases background patterns.s (default SimpleITK behavior). The metric uses all sampled voxels, which may
+          include background/air in partial-FOV scans and can lead to unstable optimization.
+        - "foreground": restrict the metric to a simple foreground mask (computed from an Otsu threshold on a robustly
+          normalized image, cleaned and reduced to the largest connected component). This removes background/air but does
+          not otherwise emphasize edges or intensities.
+        - "edges": restrict the metric to high-contrast voxels (large intensity gradients) within the foreground.
+          This emphasizes anatomical boundaries such as ventricles and tissue interfaces.
+        - "lowhigh": use different intensity tails for fixed vs moving.
+          The fixed mask selects **low-intensity** voxels, while the moving mask selects **high-intensity** voxels.
+          This can help when a structure of interest appears dark in the fixed image but bright in the moving image.
+        - "highlow": the inverse of "lowhigh": fixed uses **high-intensity** voxels and moving uses **low-intensity** voxels.
+
+    metric_focus_percentile : float, default=95.0
+        Percentile (0–100) controlling how selective the focus masks are.
+
+        - For metric_focus="edges": this is the percentile of the **gradient-magnitude** distribution (within the
+          foreground). Voxels with gradient magnitude >= this percentile are included.
+        - For metric_focus in {"lowhigh", "highlow"}: this controls the **intensity tails** (within foreground) taken from
+          each image:
+            * "high" tail uses >= Pth percentile (e.g., P=95 keeps the brightest 5%).
+            * "low" tail uses <= (100-P)th percentile (e.g., P=95 keeps the darkest 5%).
+          Higher values focus on more extreme tails; lower values include more voxels.
+
+    metric_focus_sigma_mm : float, default=1.0
+        Physical-space Gaussian smoothing (in millimeters) applied **before** computing gradient magnitude for
+        metric_focus="edges". Increasing this value suppresses fine-scale noise and thin skull edges while emphasizing
+        broader anatomical boundaries (e.g., ventricular walls). Typical values are in the range 0.5–2.0 mm.
+
+    metric_focus_dilate_vox : int, default=1
+        Number of voxels by which the focus mask is dilated after thresholding/selection. Dilation increases mask support
+        and can improve optimizer stability when the selected set is sparse. Set to 0 to disable dilation.
+
     verbose : bool, default=False
         Print additional details.
     save_dummy_ref : bool, default=False
@@ -764,6 +810,8 @@ def register_images(
         If fixed_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
     moving_frame_index : int, default=0
         If moving_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
+    use_first_frame_only : bool, default=False
+        If True, moving 4d volumes are returned as a 3d volume registered via the first frame of the input volume.
     debug : bool, default=False
         Print additional information for 4d image registration to debug affine matrice issues.
 
@@ -774,6 +822,50 @@ def register_images(
     import os
     import json
     import SimpleITK as sitk
+    import numpy as np
+    from datetime import datetime
+    from pathlib import Path
+
+    # ------------------------------------------------------------------
+    # Debug output directory (for masks, intermediate images, etc.)
+    # ------------------------------------------------------------------
+    _debug_mask_dir: Path | None = None
+
+    def _ensure_debug_mask_dir() -> Path:
+        """Create (once) a per-call directory to dump debug registration masks."""
+        nonlocal _debug_mask_dir
+        if _debug_mask_dir is not None:
+            return _debug_mask_dir
+
+        # Keep debug artifacts next to the final output by default.
+        out_dir = Path(str(output_path)).expanduser().resolve().parent
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        def _stem(p):
+            try:
+                return Path(str(p)).stem
+            except Exception:
+                return "img"
+
+        tag = f"register_debug_{_stem(fixed_path)}_to_{_stem(moving_path)}_{stamp}"
+        # Avoid pathological characters in filenames on Windows.
+        tag = "".join((c if (c.isalnum() or c in "._-") else "_") for c in tag)
+        _debug_mask_dir = out_dir / tag
+        _debug_mask_dir.mkdir(parents=True, exist_ok=True)
+        if verbose:
+            print(f"[register_images][debug] Saving metric masks to: {_debug_mask_dir}")
+        return _debug_mask_dir
+
+    def _debug_write_mask(mask: sitk.Image, *, stage: str, role: str, kind: str) -> None:
+        """Best-effort: write a (binary) mask for inspection."""
+        if not debug:
+            return
+        try:
+            d = _ensure_debug_mask_dir()
+            path = d / f"{stage}_{role}_{kind}.nii.gz"
+            sitk.WriteImage(sitk.Cast(mask, sitk.sitkUInt8), str(path))
+        except Exception:
+            return
 
     # ------------------------------------------------------------------
     # Interpolation handling
@@ -817,6 +909,386 @@ def register_images(
 
     sitk_interp, sitk_interp_name, scipy_order = _interp_to_sitk_interpolator(interp_spec)
 
+    def _transform_translation_vector(tfm) -> tuple[float, float, float]:
+        """Best-effort extraction of a translation-like vector from an ITK transform.
+
+        SimpleITK can return CompositeTransform even when you expect a TranslationTransform.
+        """
+        import numpy as np
+
+        if tfm is None:
+            return (0.0, 0.0, 0.0)
+        if hasattr(tfm, "GetOffset"):
+            o = tfm.GetOffset()
+            return (float(o[0]), float(o[1]), float(o[2]))
+        if hasattr(tfm, "GetTranslation"):
+            o = tfm.GetTranslation()
+            return (float(o[0]), float(o[1]), float(o[2]))
+        # CompositeTransform: sum any translation terms (best effort)
+        if hasattr(tfm, "GetNumberOfTransforms") and hasattr(tfm, "GetNthTransform"):
+            v = np.zeros(3, dtype=float)
+            try:
+                for i in range(int(tfm.GetNumberOfTransforms())):
+                    sub = tfm.GetNthTransform(i)
+                    if hasattr(sub, "GetOffset"):
+                        o = sub.GetOffset()
+                        v += np.array([float(o[0]), float(o[1]), float(o[2])], dtype=float)
+                    elif hasattr(sub, "GetTranslation"):
+                        o = sub.GetTranslation()
+                        v += np.array([float(o[0]), float(o[1]), float(o[2])], dtype=float)
+            except Exception:
+                pass
+            return (float(v[0]), float(v[1]), float(v[2]))
+        return (0.0, 0.0, 0.0)
+
+    # ------------------------------------------------------------------
+    # Helper functions for foreground masking and metric focus
+    # ------------------------------------------------------------------
+    def _robust_normalize_to_0_1(img: sitk.Image) -> sitk.Image:
+        """Robustly scale intensities to ~[0,1] using percentiles (registration-frame only)."""
+        arr = sitk.GetArrayViewFromImage(img).astype(np.float32, copy=False)
+        # Ignore exact zeros for percentile estimation (background-heavy volumes)
+        nz = arr[arr != 0]
+        if nz.size < 1000:
+            nz = arr.reshape(-1)
+        lo = float(np.percentile(nz, 1.0))
+        hi = float(np.percentile(nz, 99.0))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return sitk.Normalize(img)  # fallback
+        x = sitk.Clamp(img, lowerBound=lo, upperBound=hi)
+        x = (x - lo) / (hi - lo)
+        return sitk.Cast(x, sitk.sitkFloat32)
+
+    def _make_foreground_mask(norm01: sitk.Image) -> sitk.Image:
+        """Fast-ish foreground mask to remove background and air."""
+        # Otsu on normalized image works surprisingly well across modalities
+        m = sitk.OtsuThreshold(norm01, 0, 1, 128)  # uint8 0/1
+        m = sitk.BinaryFillhole(m)
+        m = sitk.BinaryMorphologicalClosing(m, [1, 1, 1])
+        # Keep largest component to avoid stray junk in partial FOV scans
+        cc = sitk.ConnectedComponent(m)
+        rel = sitk.RelabelComponent(cc, sortByObjectSize=True)
+        m = sitk.BinaryThreshold(rel, 1, 1, 1, 0)
+        return sitk.Cast(m, sitk.sitkUInt8)
+
+    def _make_focus_mask_edges(
+        img: sitk.Image,
+        *,
+        percentile: float,
+        sigma_mm: float,
+        dilate_vox: int,
+        stage: str,
+        role: str,
+    ) -> sitk.Image:
+        """
+        Make a binary mask selecting only strong edges (high gradient magnitude),
+        restricted to foreground.
+        """
+        norm01 = _robust_normalize_to_0_1(img)
+        fg = _make_foreground_mask(norm01)
+        _debug_write_mask(fg, stage=stage, role=role, kind="foreground")
+
+        # Gradient magnitude emphasizes boundaries like ventricles/skull/GM-WM
+        gm = sitk.GradientMagnitudeRecursiveGaussian(norm01, sigma=float(sigma_mm))
+        gm = sitk.Mask(gm, fg)  # kill background edges
+
+        garr = sitk.GetArrayViewFromImage(gm).astype(np.float32, copy=False)
+        vals = garr[garr > 0]
+        if vals.size < 1000:
+            # Too little signal -> fall back to just foreground
+            _debug_write_mask(fg, stage=stage, role=role, kind="edges_fallback_foreground")
+            return fg
+
+        thr = float(np.percentile(vals, float(percentile)))
+        mask = sitk.BinaryThreshold(gm, lowerThreshold=thr, upperThreshold=1e9, insideValue=1, outsideValue=0)
+
+        if dilate_vox and int(dilate_vox) > 0:
+            dx, dy, dz = img.GetSpacing()
+            rad = [int(dilate_vox), int(dilate_vox), int(dilate_vox)]
+            if dz > 2.5 * max(dx, dy):   # heuristic
+                rad[2] = 0
+            mask = sitk.BinaryDilate(mask, rad)
+
+        _debug_write_mask(mask, stage=stage, role=role, kind="edges")
+
+        # Ensure uint8 mask
+        return sitk.Cast(mask, sitk.sitkUInt8)
+
+    def _maybe_dilate_mask(mask: sitk.Image, *, img: sitk.Image, dilate_vox: int) -> sitk.Image:
+        """Dilate mask with a small heuristic to avoid dilating in very-thick-slice Z."""
+        if not dilate_vox or int(dilate_vox) <= 0:
+            return sitk.Cast(mask, sitk.sitkUInt8)
+        try:
+            dx, dy, dz = img.GetSpacing()
+            rad = [int(dilate_vox), int(dilate_vox), int(dilate_vox)]
+            # If Z spacing is much larger than in-plane, avoid Z dilation (thin stacks / perfusion).
+            if float(dz) > 2.5 * max(float(dx), float(dy)):
+                rad[2] = 0
+            return sitk.Cast(sitk.BinaryDilate(mask, rad), sitk.sitkUInt8)
+        except Exception:
+            return sitk.Cast(mask, sitk.sitkUInt8)
+
+    def _make_focus_mask_foreground(
+        img: sitk.Image,
+        *,
+        dilate_vox: int,
+        stage: str,
+        role: str,
+    ) -> sitk.Image:
+        """Foreground-only metric mask (removes background/air)."""
+        norm01 = _robust_normalize_to_0_1(img)
+        fg = _make_foreground_mask(norm01)
+        _debug_write_mask(fg, stage=stage, role=role, kind="foreground")
+        fg = _maybe_dilate_mask(fg, img=img, dilate_vox=dilate_vox)
+        _debug_write_mask(fg, stage=stage, role=role, kind="foreground_dilated" if dilate_vox else "foreground")
+        return sitk.Cast(fg, sitk.sitkUInt8)
+
+    def _make_focus_mask_intensity_tail(
+        img: sitk.Image,
+        *,
+        tail: str,
+        percentile: float,
+        dilate_vox: int,
+        stage: str,
+        role: str,
+        keep_largest_cc: bool = False,
+    ) -> sitk.Image:
+        """Intensity-tail mask within foreground: select low or high intensities in robust [0,1] space."""
+        tail = str(tail).strip().lower()
+        if tail not in ("low", "high"):
+            raise ValueError(f"tail must be 'low' or 'high' (got {tail!r})")
+
+        # Robust normalize + foreground restrict
+        norm01 = _robust_normalize_to_0_1(img)
+        fg = _make_foreground_mask(norm01)
+        _debug_write_mask(fg, stage=stage, role=role, kind="foreground")
+
+        arr = sitk.GetArrayViewFromImage(norm01).astype(np.float32, copy=False)
+        fgm = sitk.GetArrayViewFromImage(fg) > 0
+        vals = arr[fgm]
+        if vals.size < 1000:
+            _debug_write_mask(fg, stage=stage, role=role, kind=f"intensity_{tail}_fallback_foreground")
+            return sitk.Cast(fg, sitk.sitkUInt8)
+
+        P = float(percentile)
+        P = 50.0 if (not np.isfinite(P)) else max(0.0, min(100.0, P))
+
+        if tail == "high":
+            thr = float(np.percentile(vals, P))
+            mask = sitk.BinaryThreshold(norm01, lowerThreshold=thr, upperThreshold=1e9, insideValue=1, outsideValue=0)
+        else:
+            # Keep darkest (100-P)%  (e.g., P=95 -> <= 5th percentile)
+            thr = float(np.percentile(vals, 100.0 - P))
+            mask = sitk.BinaryThreshold(norm01, lowerThreshold=-1e9, upperThreshold=thr, insideValue=1, outsideValue=0)
+
+        mask = sitk.Mask(mask, fg)  # ensure we stay in foreground
+
+        # For intensity-tail modes, we optionally keep only contiguous components that are
+        # significant in physical size. This avoids the "single-largest-only" failure mode
+        # where thin structures (e.g., ventricles) fragment into multiple pieces.
+        #
+        # Heuristic default: keep components with volume >= 2.0 cc (2000 mm^3). If none meet
+        # the threshold, fall back to keeping the largest component (to avoid an empty mask).
+        if keep_largest_cc:
+            _debug_write_mask(mask, stage=stage, role=role, kind=f"intensity_{tail}_raw")
+            try:
+                min_cc = 2.0  # cubic centimeters
+                # Label connected components
+                cc_img = sitk.ConnectedComponent(sitk.Cast(mask, sitk.sitkUInt8))
+                rel = sitk.RelabelComponent(cc_img, sortByObjectSize=True)
+
+                # Compute physical volume threshold in mm^3
+                sx, sy, sz = (float(x) for x in img.GetSpacing())
+                voxel_mm3 = sx * sy * sz
+                thr_mm3 = float(min_cc) * 1000.0
+
+                # Use LabelShapeStatistics to get voxel counts per label
+                ls = sitk.LabelShapeStatisticsImageFilter()
+                ls.Execute(rel)
+
+                keep_labels = []
+                for lab in ls.GetLabels():
+                    nvox = float(ls.GetNumberOfPixels(int(lab)))
+                    if (nvox * voxel_mm3) >= thr_mm3:
+                        keep_labels.append(int(lab))
+
+                if not keep_labels:
+                    keep_labels = [1]  # fall back to largest
+
+                # Build mask from kept labels (numpy is simplest here)
+                lab_arr = sitk.GetArrayFromImage(rel)  # z,y,x
+                keep_arr = np.isin(lab_arr, keep_labels).astype(np.uint8, copy=False)
+                mask = sitk.GetImageFromArray(keep_arr)
+                mask.CopyInformation(rel)
+            except Exception:
+                # If CC filtering fails, fall back to the original mask.
+                pass
+            _debug_write_mask(mask, stage=stage, role=role, kind=f"intensity_{tail}_significant")
+        
+        mask = _maybe_dilate_mask(mask, img=img, dilate_vox=dilate_vox)
+
+        _debug_write_mask(mask, stage=stage, role=role, kind=f"intensity_{tail}")
+        return sitk.Cast(mask, sitk.sitkUInt8)
+
+
+    def _normalize_metric_focus_mode(value: str) -> str:
+        """Normalize metric_focus values (incl. aliases) to a canonical mode string."""
+        mf_raw = str(value).strip().lower()
+
+        # Accept a few convenience synonyms.
+        aliases = {
+            "": "none",
+            "off": "none",
+            "false": "none",
+            "0": "none",
+            "none": "none",
+            "fg": "foreground",
+            "fore": "foreground",
+            "foreground": "foreground",
+            "edges": "edges",
+            "edge": "edges",
+            "low-high": "lowhigh",
+            "low_high": "lowhigh",
+            "lowhigh": "lowhigh",
+            "high-low": "highlow",
+            "high_low": "highlow",
+            "highlow": "highlow",
+            # Background subtraction (use all voxels, but set background intensities to 0)
+            "background_subtracted": "background_subtracted",
+            "background-subtracted": "background_subtracted",
+            "backgroundsubtracted": "background_subtracted",
+            "bgsub": "background_subtracted",
+            "bg_sub": "background_subtracted",
+            "bgs": "background_subtracted",
+        }
+        return aliases.get(mf_raw, mf_raw)
+
+    def _background_subtract(img: sitk.Image, *, stage: str, role: str) -> sitk.Image:
+        """Zero background voxels (registration-frame only) while preserving geometry.
+
+        This is *not* a metric mask: the metric still sees all sampled voxels, but
+        background is set to 0 so it contributes less noise / fewer spurious edges.
+        """
+        # Foreground mask computed in robust [0,1] space.
+        norm01 = _robust_normalize_to_0_1(img)
+        fg = _make_foreground_mask(norm01)
+        _debug_write_mask(fg, stage=stage, role=role, kind="bgsub_foreground")
+
+        # IMPORTANT: apply to the *original* intensity image (not normalized),
+        # so the metric still sees the native modality contrast in the foreground.
+        out = sitk.Mask(img, fg, outsideValue=0.0)
+        return sitk.Cast(out, sitk.sitkFloat32)
+
+    def _maybe_background_subtract_images(
+        fixed_img: sitk.Image,
+        moving_img: sitk.Image,
+        *,
+        stage: str,
+    ) -> tuple[sitk.Image, sitk.Image]:
+        """Apply background subtraction if metric_focus requests it."""
+        mf = _normalize_metric_focus_mode(metric_focus)
+        if mf != "background_subtracted":
+            return fixed_img, moving_img
+
+        try:
+            f2 = _background_subtract(fixed_img, stage=stage, role="fixed")
+            m2 = _background_subtract(moving_img, stage=stage, role="moving")
+            return f2, m2
+        except Exception as e:
+            if verbose:
+                print(f"[register_images] WARNING: background_subtracted preprocessing failed at stage={stage}: {type(e).__name__}: {e}")
+            return fixed_img, moving_img
+    def _maybe_set_metric_focus_masks(
+        reg_method: sitk.ImageRegistrationMethod,
+        fixed_img: sitk.Image,
+        moving_img: sitk.Image,
+        stage: str,
+    ):
+        mf = _normalize_metric_focus_mode(metric_focus)
+
+        # background_subtracted is handled by preprocessing the images; it does not
+        # set metric masks (metric still uses all voxels).
+        if mf in ("none", "background_subtracted"):
+            return
+
+        supported = {"foreground", "edges", "lowhigh", "highlow"}
+        if mf not in supported:
+            raise ValueError(
+                f"Unknown metric_focus={metric_focus!r}. Supported: 'none', 'background_subtracted', 'foreground', 'edges', 'lowhigh', 'highlow'."
+            )
+
+        try:
+            if mf == "foreground":
+                fxm = _make_focus_mask_foreground(
+                    fixed_img,
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="fixed",
+                )
+                mvm = _make_focus_mask_foreground(
+                    moving_img,
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="moving",
+                )
+                extra = f"(dilate={int(metric_focus_dilate_vox)})"
+
+            elif mf == "edges":
+                fxm = _make_focus_mask_edges(
+                    fixed_img,
+                    percentile=float(metric_focus_percentile),
+                    sigma_mm=float(metric_focus_sigma_mm),
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="fixed",
+                )
+                mvm = _make_focus_mask_edges(
+                    moving_img,
+                    percentile=float(metric_focus_percentile),
+                    sigma_mm=float(metric_focus_sigma_mm),
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="moving",
+                )
+                extra = f"(pct={float(metric_focus_percentile)}, sigma_mm={float(metric_focus_sigma_mm)}, dilate={int(metric_focus_dilate_vox)})"
+
+            else:
+                # Intensity-tail modes:
+                # - lowhigh: fixed uses low tail, moving uses high tail
+                # - highlow: fixed uses high tail, moving uses low tail
+                fixed_tail = "low" if mf == "lowhigh" else "high"
+                moving_tail = "high" if mf == "lowhigh" else "low"
+
+                fxm = _make_focus_mask_intensity_tail(
+                    fixed_img,
+                    tail=fixed_tail,
+                    percentile=float(metric_focus_percentile),
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="fixed",
+                    keep_largest_cc=True,
+                )
+                mvm = _make_focus_mask_intensity_tail(
+                    moving_img,
+                    tail=moving_tail,
+                    percentile=float(metric_focus_percentile),
+                    dilate_vox=int(metric_focus_dilate_vox),
+                    stage=stage,
+                    role="moving",
+                    keep_largest_cc=True,
+                )
+                extra = f"(pct={float(metric_focus_percentile)}, dilate={int(metric_focus_dilate_vox)})"
+
+            reg_method.SetMetricFixedMask(fxm)
+            reg_method.SetMetricMovingMask(mvm)
+
+            if verbose:
+                fcnt = int(np.count_nonzero(sitk.GetArrayViewFromImage(fxm)))
+                mcnt = int(np.count_nonzero(sitk.GetArrayViewFromImage(mvm)))
+                print(f"[register_images] metric_focus='{mf}' ({stage}): fixed_mask_vox={fcnt} moving_mask_vox={mcnt} {extra}")
+        except Exception as e:
+            if verbose:
+                print(f"[register_images] WARNING: metric_focus masks failed at stage={stage}: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # Helper: sanitize NIfTI headers written by ITK/SimpleITK (can sometimes
@@ -877,10 +1349,9 @@ def register_images(
         except Exception:
             # Best-effort only
             return
-    import numpy as np
 
     # Lightweight dimensionality check (nibabel is OK here; used elsewhere in the package)
-    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
+    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d
 
     # ------------------------------------------------------------------
     # Thread control
@@ -915,6 +1386,19 @@ def register_images(
     moving_for_reg = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, int(moving_frame_index))
 
     # ------------------------------------------------------------------
+    # Optionally treat 4D as 3D by taking a single frame
+    # ------------------------------------------------------------------
+    if use_first_frame_only and moving_ndim == 4:
+        if verbose:
+            print(f"[register_images] treating moving 4D as 3D (frame {moving_frame_index})")
+        moving_img = moving_for_reg
+        moving_ndim = 3
+        moving_shape = None
+        # IMPORTANT: now that moving is effectively 3D, keep these aligned:
+        moving_for_reg = moving_img
+
+
+    # ------------------------------------------------------------------
     # Optional downsampling for transform estimation (registration-time only)
     # ------------------------------------------------------------------
     # User can request a target spacing (mm, mm, mm). This affects only the transform
@@ -925,6 +1409,8 @@ def register_images(
 
     req_spacing = _normalize_spacing_mm(registration_voxel_mm)
     if req_spacing is not None and not apply_only:
+        if verbose:
+            print(f"Using {req_spacing} mm voxel spacing for registration optimization.")
         fixed_sp = tuple(float(x) for x in fixed_for_reg.GetSpacing())
         moving_sp = tuple(float(x) for x in moving_for_reg.GetSpacing())
 
@@ -1049,12 +1535,9 @@ def register_images(
             )
 
             tx_pre = sitk.TranslationTransform(3)
-            init_pre = sitk.CenteredTransformInitializer(
-                fixed_pre, moving_pre, tx_pre, sitk.CenteredTransformInitializerFilter.GEOMETRY
-            )
-
             reg_pre = sitk.ImageRegistrationMethod()
-            reg_pre.SetInitialTransform(init_pre, inPlace=False)
+            reg_pre.SetInitialTransform(tx_pre, inPlace=False)
+            _maybe_set_metric_focus_masks(reg_pre, fixed_pre, moving_pre, stage="prepass")
             set_sitk_object_threads(reg_pre, n_workers)
 
             # Metric (keep user's choice, but keep it light)
@@ -1085,18 +1568,35 @@ def register_images(
 
             use_global_cap_pre = (n_workers is not None and not set_sitk_object_threads(reg_pre, n_workers))
             with global_sitk_thread_cap(n_workers, enabled=use_global_cap_pre, verbose=False):
-                tfm_pre = reg_pre.Execute(fixed_pre, moving_pre)
+                tfm_pre = reg_pre.Execute(fixed_pre_use, moving_pre_use)
 
-            prepass_offset = tuple(float(x) for x in tfm_pre.GetOffset())
+            # SimpleITK may return a CompositeTransform even for a pure translation stage
+            # (e.g., when an initial transform is provided with inPlace=False).
+            # CompositeTransform has no GetOffset, so unwrap carefully.
+            try:
+                tfm_use = tfm_pre
+                if hasattr(sitk, "CompositeTransform") and isinstance(tfm_use, sitk.CompositeTransform):
+                    n_t = int(tfm_use.GetNumberOfTransforms())
+                    if n_t > 0:
+                        tfm_use = tfm_use.GetNthTransform(n_t - 1)
+
+                prepass_offset = _transform_translation_vector(tfm_use)
+            except Exception as _e:
+                if verbose:
+                    print(f"[register_images] WARNING: could not read translation from pre-pass transform ({type(tfm_pre)}): {_e}")
+
             if verbose:
                 print(f"[register_images] translation pre-pass spacing={prepass_spacing} offset={prepass_offset}")
+
         except Exception as e:
             # Pre-pass is a performance/robustness optimization; failure should not abort registration.
             if verbose:
                 print(f"[register_images] WARNING: translation pre-pass failed: {type(e).__name__}: {e}")
 
+        fixed_main_use, moving_main_use = _maybe_background_subtract_images(fixed_reg_img, moving_reg_img, stage="main")
+
         initial_transform = sitk.CenteredTransformInitializer(
-            fixed_reg_img, moving_reg_img, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
+            fixed_main_use, moving_main_use, tx, sitk.CenteredTransformInitializerFilter.GEOMETRY
         )
 
         # Add pre-pass translation to the main initializer if supported.
@@ -1108,6 +1608,7 @@ def register_images(
             pass
 
         registration = sitk.ImageRegistrationMethod()
+        _maybe_set_metric_focus_masks(registration, fixed_main_use, moving_main_use, stage="main")
         registration.SetInitialTransform(initial_transform, inPlace=False)
 
         # Try to cap threads per-object for registration if supported.
@@ -1155,7 +1656,7 @@ def register_images(
         # optionally fall back to a global cap (LAST RESORT).
         use_global_cap = (n_workers is not None and not reg_threads_ok)
         with global_sitk_thread_cap(n_workers, enabled=use_global_cap, verbose=verbose):
-            transform = registration.Execute(fixed_reg_img, moving_reg_img)
+            transform = registration.Execute(fixed_main_use, moving_main_use)
 
         if verbose:
             print(f"Final {similarity_metric} = {registration.GetMetricValue():.4f}")
@@ -1177,6 +1678,8 @@ def register_images(
     # ------------------------------------------------------------------
     # Resample moving -> fixed space
     # ------------------------------------------------------------------
+    if verbose:
+        print(f"Resampling moving image...")
     # Spatial reference for resampling: always a 3D grid.
     spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
 
@@ -1191,16 +1694,20 @@ def register_images(
             interp=interp_spec,
         )
         registered = resampler.Execute(moving_img)
+        if verbose:
+            print(f"Saving resampled image...")
         sitk.WriteImage(registered, str(output_path))
         # Sanitize header to avoid nibabel warnings / decompositions later.
-        _sanitize_nifti_header_inplace(str(output_path))
+        #_sanitize_nifti_header_inplace(str(output_path)) #skip for now
     else:
-        # Apply transform to each 3D frame, in memory, then re-stack to 4D.
-        n_frames = moving_shape[3] if moving_ndim == 4 else 1
+        # Minimal 4D wrapper: resample each 3D frame onto the fixed grid and stack as (x,y,z,t).
+        import numpy as np
+        import nibabel as nib
+        from datetime import datetime
 
-        out_frames = []
+        n_frames = int(moving_shape[3])
+        spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
 
-        # Build resampler ONCE (same reference grid/transform/interpolator for every frame)
         resampler = make_sitk_resampler(
             reference_img=spatial_ref,
             transform=transform,
@@ -1210,91 +1717,68 @@ def register_images(
             interp=interp_spec,
         )
 
-        for t in range(int(n_frames)):
-            frame3d = moving_img if moving_ndim == 3 else sitk_extract_3d_from_4d(moving_img, t)
-            reg3d = resampler.Execute(frame3d)
-            out_frames.append(reg3d)
-
-        out4d = sitk_join_3d_frames_to_4d(
-            out_frames,
-            spatial_reference=spatial_ref,
-            time_reference=moving_img,
-        )
-
-        # NOTE (4D NIfTI header correctness):
-        # Some readers (including certain Slicer/ITK diffusion-related paths) may fall back to a
-        # "base affine" derived from pixdim/qfac if the header looks inconsistent (dtype/scale/offset),
-        # even when sform/qform are set. To reduce the chance of fallback, build a fresh NIfTI
-        # with a clean header and explicitly set qform/sform/codes/zooms/dtype.
-        import numpy as np
-        import nibabel as nib
-
         fixed_nii = nib.load(str(fixed_path))
-        moving_nii = nib.load(str(moving_path))
         fixed_affine = fixed_nii.affine
 
-        # SimpleITK returns 4D arrays as (t, z, y, x); nibabel expects (x, y, z, t).
-        arr_tzyx = sitk.GetArrayFromImage(out4d)
-        data_xyzt = np.transpose(arr_tzyx, (3, 2, 1, 0))
+        # Target grid size from the 3D reference (SimpleITK size is (x,y,z))
+        sx, sy, sz = spatial_ref.GetSize()
+        out_xyzt = np.zeros((sx, sy, sz, n_frames), dtype=np.float32)
 
-        # Use a concrete dtype and make header match it (avoid fixed header dtype/scale baggage).
-        data_xyzt = data_xyzt.astype(np.float32, copy=False)
+        if verbose:
+            print(f"Resampling {n_frames} frames (4D wrapper) starting at {datetime.now()}")
 
-        # Build a fresh NIfTI (nibabel will generate a sane vox_offset/magic/layout).
-        out_nii = nib.Nifti1Image(data_xyzt, fixed_affine)
+        for t in range(n_frames):
+            frame3d = sitk_extract_3d_from_4d(moving_img, t)
+            reg3d = resampler.Execute(frame3d)
+
+            # SITK -> numpy gives (z,y,x)
+            reg_zyx = sitk.GetArrayFromImage(reg3d).astype(np.float32, copy=False)
+            # Convert to (x,y,z)
+            reg_xyz = np.transpose(reg_zyx, (2, 1, 0))
+
+            # Safety check (optional but useful while debugging)
+            if reg_xyz.shape != (sx, sy, sz):
+                raise RuntimeError(
+                    f"Frame {t} resampled shape {reg_xyz.shape} != expected {(sx, sy, sz)}. "
+                    f"spatial_ref size={spatial_ref.GetSize()}"
+                )
+
+            out_xyzt[..., t] = reg_xyz
+
+        if verbose:
+            print(f"4D stacking complete at {datetime.now()}")
+
+        out_nii = nib.Nifti1Image(out_xyzt, fixed_affine)
         hdr = out_nii.header
-        hdr.set_data_dtype(data_xyzt.dtype)
+        hdr.set_data_dtype(np.float32)
 
-        # Copy spatial zooms from fixed; preserve time zoom from moving if present.
+        # Copy zooms: spatial from fixed; time from moving if present
         fixed_zooms = fixed_nii.header.get_zooms()[:3]
-        moving_zooms = moving_nii.header.get_zooms()
+        moving_zooms = nib.load(str(moving_path)).header.get_zooms()
         tzoom = float(moving_zooms[3]) if len(moving_zooms) > 3 else 1.0
         hdr.set_zooms(tuple(list(fixed_zooms) + [tzoom]))
 
-        # Match units (optional but helps some readers).
+        # Make qform/sform explicit (helps viewers avoid "base affine" fallbacks)
         try:
-            xyz_unit, t_unit = fixed_nii.header.get_xyzt_units()
-            hdr.set_xyzt_units(xyz=xyz_unit, t=t_unit)
-        except Exception:
-            pass
-
-        # Use fixed qform/sform codes if available; otherwise default to 1 ("scanner").
-        try:
-            qcode = int(fixed_nii.header["qform_code"])
-            scode = int(fixed_nii.header["sform_code"])
+            qcode = int(fixed_nii.header["qform_code"]) or 1
+            scode = int(fixed_nii.header["sform_code"]) or 1
         except Exception:
             qcode, scode = 1, 1
-        if qcode <= 0:
-            qcode = 1
-        if scode <= 0:
-            scode = 1
-
         out_nii.set_qform(fixed_affine, code=qcode)
         out_nii.set_sform(fixed_affine, code=scode)
 
-        # Clear any scaling fields that can confuse some readers.
+        # Clear scaling
         try:
             hdr["scl_slope"] = 1.0
             hdr["scl_inter"] = 0.0
         except Exception:
             pass
 
+        if verbose:
+            print(f"Saving 4D output via nibabel (xyzt) starting at {datetime.now()}")
         nib.save(out_nii, str(output_path))
-        _sanitize_nifti_header_inplace(str(output_path))
-
-        if debug:
-            a = fixed_nii.affine
-            loaded_4d_output = nib.load(str(output_path))
-            b = loaded_4d_output.affine
-            loaded_4d_header = loaded_4d_output.header
-            print(f"[Debug] For moving path: {str(moving_path)}")
-            print(f"[Debug] np.allclose(fixed_nii.affine, loaded_4d_output.affine) = {np.allclose(a, b)}")
-            print(f"[Debug] fixed_nii.affine = {a}")
-            print(f"[Debug] loaded_4d_output.affine = {b}")
-            print(f"[Debug] loaded_4d_output.header = {loaded_4d_header}")
-            print(f"[Debug] loaded_4d_header.get_sform(coded=True) = {loaded_4d_header.get_sform(coded=True)}")
-            print(f"[Debug] loaded_4d_header.get_qform(coded=True) = {loaded_4d_header.get_qform(coded=True)}")
-            print(f"[Debug] loaded_4d_header.get_base_affine() = {loaded_4d_header.get_base_affine()}")
+        if verbose:
+            print(f"Save completed at {datetime.now()}")
 
     # Optional dummy references
     if save_dummy_ref and transform_path:
@@ -1376,7 +1860,7 @@ def inverse_transform_image(
       It applies the inverse to map: transformed -> original_reference_grid.
     """
     import SimpleITK as sitk
-    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
+    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d
 
     orig_ndim, orig_shape = get_nifti_ndim(original_image_path)
     tr_ndim, tr_shape = get_nifti_ndim(transformed_image_path)
@@ -1444,7 +1928,7 @@ def inverse_transform_image(
             )
             frames_out.append(recovered3d)
 
-        out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img)
+        out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img) #This will error and needs to be fixed
         sitk.WriteImage(out4d, str(output_path))
 
     # If diffusion sidecars exist next to the transformed image, rotate/copy them
@@ -3316,6 +3800,7 @@ def convert_dicom_to_nifti(
     dicom_series_dir: str,
     output_path: str,
     verbose: bool | None = None,
+    debug: bool = False,
 ) -> str:
     import os
     from pathlib import Path
@@ -3338,6 +3823,7 @@ def convert_dicom_to_nifti(
         input_path_or_dir=str(series),
         verbose=verbose,
         output_path=str(out),
+        debug=debug,
     )
     _dbg("final NIfTI:", Path(final_path).name)
     return final_path
@@ -3353,6 +3839,7 @@ def convert_dicom_plan(
     log_out: str | None = None,
     show_progress: bool = True,
     unexpected_multiframe_policy: str = "keep_first",
+    debug=False,
 ):
     """Read a plan produced by `plan_dicom_to_nifti_conversion` and run conversions
     for rows with a non-empty, non-"-" `proposed_nifti_path`.
@@ -3683,6 +4170,7 @@ def convert_dicom_plan(
                 written = convert_dicom_to_nifti(
                     dicom_series_dir=series_dir,
                     output_path=out_path,
+                    debug=debug,
                 )
 
                 # For certain *primary* sequences (e.g., DWI/Perfusion), the converted file must be 4D.
@@ -3747,7 +4235,7 @@ def convert_dicom_plan(
                         else:
                             stem = os.path.splitext(out_path)[0]
                         nrrd_path = stem + ".nrrd"
-                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False, debug=debug)
                 except Exception as e:
                     rec["nrrd_path"] = ""
                     rec["nrrd_error"] = f"{type(e).__name__}: {e}"
@@ -3815,6 +4303,7 @@ def convert_dicom_plan(
                                     generator_key="swi_composite",
                                     primary_label=comp_base,
                                     derived_label=comp_base,
+                                    debug=debug,
                                 )
                                 src_input = comp_path
                             else:
@@ -3831,6 +4320,7 @@ def convert_dicom_plan(
                     generator_key=generator_key,
                     primary_label=primary_label,
                     derived_label=derived_label,
+                    debug=debug,
                 )
 
                 # Derived outputs are expected to be single-frame/3D.
@@ -3855,7 +4345,7 @@ def convert_dicom_plan(
                         from .preprocessing_utils import export_dwi_nrrd_from_dicoms
                         stem = out_path[:-7] if out_path.lower().endswith(".nii.gz") else os.path.splitext(out_path)[0]
                         nrrd_path = stem + ".nrrd"
-                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False, debug=debug)
                 except Exception as e:
                     rec["nrrd_path"] = ""
                     rec["nrrd_error"] = f"{type(e).__name__}: {e}"
@@ -4296,8 +4786,14 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             "Optional integer seed for deterministic random metric sampling (only relevant for 'medium'/'fast')."
         ),
     )
+    basic.add_argument("--metric_focus", default="none",
+                       help="{'none', 'background_subtracted', 'foreground', 'edges', 'lowhigh', 'highlow'} Restrict the registration metric to a subset of voxels. 'foreground' masks background/air; 'edges' keeps strong edges; 'lowhigh' uses fixed low-intensity + moving high-intensity tails; 'highlow' uses fixed high-intensity + moving low-intensity tails.")
+    basic.add_argument("--metric_focus_percentile", default = 95, help="Percentile (0-100) of the high-contrast voxels to use for edge detection.")
+    basic.add_argument("--metric_focus_sigma_mm", default = 1, help="Physical-space Gaussian smoothing (in millimeters) applied before computing gradient magnitude for edge selection.")
+    basic.add_argument("--metric_focus_dilate_vox", default=1, help="Number of voxels by which the edge-based metric mask is dilated isotropically after thresholding.")
     basic.add_argument("--interp", default="cubic", help="Interpolation for registration+resampling. Accepts int 0-5 or strings like linear/cubic; use 'auto' to reuse recorded interpolation when --apply_only.")
     basic.add_argument("--registration_voxel_mm", default="1,1,1", help="Optional spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
+    basic.add_argument("--use_first_frame_only", action="store_true", help="For 4d moving volumes, return registered volume as a 3d volume registered only using the first frame of the input volume.")
 
     io = p.add_argument_group("Transforms I/O")
     io.add_argument("--transform",
@@ -4306,6 +4802,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
                     help="Skip optimization and only apply the transform given by --transform.")
     perf = p.add_argument_group("Performance & logging")
     perf.add_argument("--verbose", action="store_true", help="Print metric values and detailed status messages.")
+    perf.add_argument("--debug", action="store_true", help="Print/save debug outputs.")
     perf.add_argument("--save_dummy_ref", action="store_true",
                       help="Save zeroed fixed/moving reference images next to the transform for later reversal.")
     def _run_register(a):
@@ -4315,10 +4812,16 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             registration_type=a.registration_type, similarity_metric=a.similarity_metric,
             registration_strategy=a.registration_strategy,
             metric_sampling_seed=a.metric_sampling_seed,
+            metric_focus=a.metric_focus,
+            metric_focus_percentile=a.metric_focus_percentile,
+            metric_focus_sigma_mm=a.metric_focus_sigma_mm,
+            metric_focus_dilate_vox=a.metric_focus_dilate_vox,
             save_dummy_ref=a.save_dummy_ref,
             interpolation=a.interp,
             registration_voxel_mm=a.registration_voxel_mm,
+            use_first_frame_only=a.use_first_frame_only,
             verbose=a.verbose,
+            debug=a.debug,
         )
     p.set_defaults(func=_run_register)
 
@@ -4557,10 +5060,12 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
         help="Convert one DICOM series directory to NIfTI (dicom2nifti).", formatter_class=_SmartFormatter)
     p.add_argument("--dicom_dir", required=True, help="Directory containing one DICOM series")
     p.add_argument("--output_path", required=True, help="Output NIfTI path (.nii or .nii.gz)")
+    p.add_argument("--debug", action="store_true", help="Print debug statements.")
     def _run_c2n(a):
         convert_dicom_to_nifti(
             dicom_series_dir=a.dicom_dir,
             output_path=a.output_path,
+            debug=a.debug,
         )
         print(f"Saved: {a.output_path}")
     p.set_defaults(func=_run_c2n)
@@ -4582,6 +5087,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             "keep_first = keep frame 0 (warn); skip = skip conversion (warn)."
         ),
     )
+    p.add_argument("--debug", action="store_true", help="Print debug statements.")
     def _run_convert(a):
         convert_dicom_plan(
             plan_path=a.plan,
@@ -4590,6 +5096,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             log_out=a.logOut,
             show_progress=True,
             unexpected_multiframe_policy=getattr(a, "unexpectedMultiframePolicy", "keep_first"),
+            debug=a.debug,
         )
     p.set_defaults(func=_run_convert)
 
