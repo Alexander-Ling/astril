@@ -3949,7 +3949,6 @@ def convert_dicom_to_nifti(
         input_path_or_dir=str(series),
         verbose=verbose,
         output_path=str(out),
-        debug=debug,
     )
     _dbg("final NIfTI:", Path(final_path).name)
     return final_path
