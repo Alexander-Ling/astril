@@ -10,6 +10,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import subprocess
+import tempfile
+
+from .preprocessing_utils import ensure_hd_bet_installed  # type: ignore
 
 # We import and call your existing function directly (no subprocess).
 # If your package layout differs (e.g., installed as astril), adjust the import:
@@ -30,6 +35,19 @@ except Exception:  # pragma: no cover
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def _find_most_recent_coreg_log(out_dir: Path) -> Path | None:
+    """
+    Find the most recent coreg log in out_dir based on filename.
+    Expected format: coreg_log_YYYYMMDD_HHMMSS.csv (lexicographic sort works).
+    """
+    try:
+        candidates = sorted(out_dir.glob("coreg_log_*.csv"))
+        if not candidates:
+            return None
+        # Most recent by filename (YYYYMMDD_HHMMSS) == last in lexicographic sort
+        return candidates[-1]
+    except Exception:
+        return None
 
 def _parse_patient_exam(exam_dir: Path) -> tuple[str, str]:
     """
@@ -482,20 +500,83 @@ def preprocess_library(
         preprocess_log = Path(preprocess_log)
         preprocess_log.parent.mkdir(parents=True, exist_ok=True)
 
-    if coreg_log is None:
-        coreg_log = out_dir / f"coreg_log_{_now_stamp()}.csv"
-    else:
+    # NOTE: coreg_log selection has special behavior:
+    # - If user provides --coreg_log, always write to that path (legacy behavior).
+    # - If user provides --old_coreg_log, we may reuse references from it, but we still write a fresh coreg_log
+    #   unless the user explicitly gave --coreg_log.
+    # - If neither is provided, we will auto-discover the most recent coreg_log_*.csv in out_dir and reuse it
+    #   if it fully covers all current input patients. Otherwise we compute only missing patients and write
+    #   a new coreg_log_{timestamp}.csv.
+    user_provided_coreg_log = coreg_log is not None
+    if coreg_log is not None:
         coreg_log = Path(coreg_log)
         coreg_log.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        coreg_log = None  # determine later based on auto-reuse/update logic
 
     # Build patient list
     patient_dirs = [p for p in in_dir.iterdir() if p.is_dir()]
 
-    # Read previous reference logs (optional)
+    # Read previous reference logs (optional), with auto-discovery if not provided
+    # NOTE: we always store relative paths (to in_dir) in logs; we resolve to absolute paths when using them.
     old_maps: dict[str, Path] | None = None
+    auto_old_coreg_log: Path | None = None
+
     if old_coreg_log:
         old_paths = [Path(p) for p in old_coreg_log]
         old_maps = _read_old_coreg_logs(old_paths)
+    else:
+        # Auto-discover the most recent coreg log in out_dir.
+        auto_old_coreg_log = _find_most_recent_coreg_log(out_dir)
+        if auto_old_coreg_log is not None and auto_old_coreg_log.exists():
+            old_maps = _read_old_coreg_logs([auto_old_coreg_log])
+
+    # Determine whether we can fully reuse an auto-discovered coreg log
+    # (only applies when user did NOT provide coreg_log and did NOT provide old_coreg_log).
+    can_fully_reuse_auto = False
+    missing_patients: set[str] = set()
+    if (not user_provided_coreg_log) and (not old_coreg_log) and (not dont_coregister) and (old_maps is not None) and (auto_old_coreg_log is not None):
+        # A patient is "covered" only if:
+        # - patient exists in mapping, and
+        # - referenced file exists under in_dir
+        for pd in patient_dirs:
+            pat = pd.name
+            rel = old_maps.get(pat)
+            if rel is None:
+                missing_patients.add(pat)
+                continue
+            candidate = (in_dir / rel)
+            if not candidate.exists():
+                missing_patients.add(pat)
+        can_fully_reuse_auto = (len(missing_patients) == 0)
+
+        if can_fully_reuse_auto:
+            # Reuse the existing coreg log as-is
+            coreg_log = auto_old_coreg_log
+            print(f"[preprocess_brain_mris] Reusing existing coreg log: {coreg_log}", flush=True)
+        else:
+            missing_list = sorted(missing_patients)
+            print(
+                f"[preprocess_brain_mris] WARNING: Found existing coreg log "
+                f"({auto_old_coreg_log.name}) but missing/invalid entries for "
+                f"{len(missing_list)} patient(s).",
+                flush=True,
+            )
+            print(
+                "[preprocess_brain_mris] New reference volumes will be computed for:\n  - "
+                + "\n  - ".join(missing_list),
+                flush=True,
+            )
+            print(
+                "[preprocess_brain_mris] A new coreg_log with updated timestamp will be written.",
+                flush=True,
+            )
+
+    # If coreg_log still not set, choose a fresh default path (timestamped).
+    if coreg_log is None:
+        coreg_log = out_dir / f"coreg_log_{_now_stamp()}.csv"
+        coreg_log = Path(coreg_log)
+        coreg_log.parent.mkdir(parents=True, exist_ok=True)
 
     # Determine a reference for each patient (or None)
     # NOTE: On large libraries this can take a while, especially when
@@ -537,15 +618,50 @@ def preprocess_library(
                 "Error": "",
             }
         else:
-            ref, info = _choose_reference_for_patient(
-                patient_dir=pd,
-                in_dir=in_dir,
-                old_coreg_maps=old_maps,
-                anchor_label=anchor_label,
-                reference_selection=reference_selection,
-            )
-            patient_ref[pd.name] = ref
-            patient_ref_info[pd.name] = info
+            # If we are reusing an auto coreg log but it is incomplete, only compute new references for missing patients.
+            if (not user_provided_coreg_log) and (not old_coreg_log) and (auto_old_coreg_log is not None) and (old_maps is not None) and (len(missing_patients) > 0) and (pd.name not in missing_patients):
+                # Reuse the old mapping for this patient (avoid rescoring)
+                rel = old_maps.get(pd.name)
+                ref_path = (in_dir / rel).resolve() if rel is not None else None
+                patient_ref[pd.name] = ref_path
+                patient_ref_info[pd.name] = {
+                    "SelectionMethod": "old_coreg_log",
+                    "QualityScore": "",
+                    "Shape": "",
+                    "ZoomsMM": "",
+                    "VoxelVolumeMM3": "",
+                    "Anisotropy": "",
+                    "SampleStd": "",
+                    "SampleNonzeroFrac": "",
+                    "Error": "",
+                }
+            elif (not user_provided_coreg_log) and (not old_coreg_log) and (auto_old_coreg_log is not None) and (old_maps is not None) and can_fully_reuse_auto:
+                # Full reuse case: set from old mapping for all patients (avoid rescoring)
+                rel = old_maps.get(pd.name)
+                ref_path = (in_dir / rel).resolve() if rel is not None else None
+                patient_ref[pd.name] = ref_path
+                patient_ref_info[pd.name] = {
+                    "SelectionMethod": "old_coreg_log",
+                    "QualityScore": "",
+                    "Shape": "",
+                    "ZoomsMM": "",
+                    "VoxelVolumeMM3": "",
+                    "Anisotropy": "",
+                    "SampleStd": "",
+                    "SampleNonzeroFrac": "",
+                    "Error": "",
+                }
+            else:
+                # Normal behavior (includes user-provided --old_coreg_log reuse, plus scoring fallback)
+                ref, info = _choose_reference_for_patient(
+                    patient_dir=pd,
+                    in_dir=in_dir,
+                    old_coreg_maps=old_maps,
+                    anchor_label=anchor_label,
+                    reference_selection=reference_selection,
+                )
+                patient_ref[pd.name] = ref
+                patient_ref_info[pd.name] = info
 
         if ref_pbar:
             ref_pbar.update(1)
@@ -560,44 +676,188 @@ def preprocess_library(
     if ref_pbar:
         ref_pbar.close()
 
-    # Write the coreg log up front (what we will try to use)
-    with coreg_log.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "Patient",
-            "ReferenceRelativePath",
-            "SelectionMethod",
-            "QualityScore",
-            "Shape",
-            "ZoomsMM",
-            "VoxelVolumeMM3",
-            "Anisotropy",
-            "SampleStd",
-            "SampleNonzeroFrac",
-            "Error",
-        ])
-        for pat in sorted(patient_ref.keys()):
-            ref = patient_ref.get(pat)
-            info = patient_ref_info.get(pat, {})
-            rel = ""
-            if ref is not None:
-                try:
-                    rel = str(ref.resolve().relative_to(in_dir))
-                except Exception:
-                    rel = str(ref)
+    # Write coreg log (unless we're fully reusing an existing one and not updating anything)
+    # - If can_fully_reuse_auto: keep existing file untouched.
+    # - Otherwise: write a new coreg log to `coreg_log` (timestamped by earlier selection).
+    should_write_coreg_log = True
+    if (not user_provided_coreg_log) and (not old_coreg_log) and (auto_old_coreg_log is not None) and can_fully_reuse_auto:
+        should_write_coreg_log = False
+
+    if should_write_coreg_log:
+        with coreg_log.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
             w.writerow([
-                pat,
-                rel,
-                info.get("SelectionMethod", ""),
-                info.get("QualityScore", ""),
-                info.get("Shape", ""),
-                info.get("ZoomsMM", ""),
-                info.get("VoxelVolumeMM3", ""),
-                info.get("Anisotropy", ""),
-                info.get("SampleStd", ""),
-                info.get("SampleNonzeroFrac", ""),
-                info.get("Error", ""),
+                "Patient",
+                "ReferenceRelativePath",
+                "SelectionMethod",
+                "QualityScore",
+                "Shape",
+                "ZoomsMM",
+                "VoxelVolumeMM3",
+                "Anisotropy",
+                "SampleStd",
+                "SampleNonzeroFrac",
+                "Error",
             ])
+            for pat in sorted(patient_ref.keys()):
+                ref = patient_ref.get(pat)
+                info = patient_ref_info.get(pat, {})
+                rel = ""
+                if ref is not None:
+                    try:
+                        rel = str(ref.resolve().relative_to(in_dir))
+                    except Exception:
+                        rel = str(ref)
+                w.writerow([
+                    pat,
+                    rel,
+                    info.get("SelectionMethod", ""),
+                    info.get("QualityScore", ""),
+                    info.get("Shape", ""),
+                    info.get("ZoomsMM", ""),
+                    info.get("VoxelVolumeMM3", ""),
+                    info.get("Anisotropy", ""),
+                    info.get("SampleStd", ""),
+                    info.get("SampleNonzeroFrac", ""),
+                    info.get("Error", ""),
+                ])
+        print(f"[preprocess_brain_mris] Wrote coreg log: {coreg_log}", flush=True)
+
+    # ---------------------------------------------------------------------
+    # Precompute per-patient global brainmasks in ONE hd-bet folder call
+    # ---------------------------------------------------------------------
+    # Rationale:
+    # - preprocess_single_brain_mri can generate a reusable {patient}_brainmask_ref.nii.gz,
+    #   but doing so one exam at a time is slow because hd-bet/model init is repeated.
+    # - HD-BET supports folder mode (loads model once, processes all *.nii.gz in a folder).
+    #
+    # We only do this when:
+    #   - reuse_patient_brainmask is enabled, and
+    #   - coregistration is enabled (we have a patient_ref that defines the shared space)
+    #   - and a reusable mask does not already exist for that patient.
+    if not quiet:
+        print(f"Generating brainmasks for per-patient reference volumes...")
+    if reuse_patient_brainmask and (not dont_coregister):
+        patients_needing_mask: list[tuple[str, Path]] = []
+        for pd in patient_dirs:
+            pat = pd.name
+            ref = patient_ref.get(pat)
+            if ref is None:
+                continue
+            patient_out_dir = out_dir / pat
+            patient_out_dir.mkdir(parents=True, exist_ok=True)
+            existing = _find_existing_patient_brainmask(patient_out_dir, pat)
+            if existing is None:
+                patients_needing_mask.append((pat, ref))
+
+        if patients_needing_mask:
+            # Ensure hd-bet is available before we do any file prep work.
+            ensure_hd_bet_installed()
+
+            if not quiet:
+                print(
+                    f"[preprocess_brain_mris] Precomputing global brainmasks for {len(patients_needing_mask)} patients via one hd-bet folder call...",
+                    flush=True,
+                )
+
+            with tempfile.TemporaryDirectory(prefix="astril_hd_bet_refs_") as td:
+                tmp_in = Path(td) / "in"
+                tmp_out = Path(td) / "out"
+                tmp_in.mkdir(parents=True, exist_ok=True)
+                tmp_out.mkdir(parents=True, exist_ok=True)
+
+                # Map patient -> temp filename for robust lookup after hd-bet completes
+                pat_to_fname: dict[str, str] = {}
+
+                # Prepare input folder of reference scans (prefer hardlinks; fallback to copy).
+                skipped: list[str] = []
+                for pat, ref in patients_needing_mask:
+                    ref = Path(ref)
+
+                    # HD-BET folder mode (per README) looks for *.nii.gz.
+                    if not ref.name.lower().endswith(".nii.gz"):
+                        skipped.append(f"{pat} (ref not .nii.gz: {ref})")
+                        continue
+
+                    fname = f"{pat}.nii.gz"
+                    dst = tmp_in / fname
+                    try:
+                        # Hardlink is fastest (no duplicate bytes) if same filesystem.
+                        if dst.exists():
+                            dst.unlink()
+                        os.link(ref, dst)
+                    except Exception:
+                        shutil.copy2(ref, dst)
+
+                    pat_to_fname[pat] = fname
+
+                if skipped and (not quiet):
+                    print(
+                        "[preprocess_brain_mris] NOTE: Skipping HD-BET batch mask generation for:\n  - "
+                        + "\n  - ".join(skipped),
+                        flush=True,
+                    )
+
+                if pat_to_fname:
+                    # Run hd-bet once on the folder. In folder mode, HD-BET writes the brain masks
+                    # to OUTPUT_FOLDER under the same base filename.
+                    cmd = [
+                       "hd-bet",
+                        "-i", str(tmp_in),
+                        "-o", str(tmp_out),
+                        "-device", ("cuda" if use_gpu else "cpu"),
+                    ]
+                    if not enable_tta:
+                        cmd.append("--disable_tta")
+                    if debug:
+                        cmd.append("--verbose")
+
+                    # Per-subprocess CPU thread caps (avoid oversubscription).
+                    env = os.environ.copy()
+                    if (not use_gpu) and (n_workers_per_hd_bet_process is not None):
+                        env.update(
+                            {
+                                "OMP_NUM_THREADS": str(int(n_workers_per_hd_bet_process)),
+                                "MKL_NUM_THREADS": str(int(n_workers_per_hd_bet_process)),
+                                "OPENBLAS_NUM_THREADS": str(int(n_workers_per_hd_bet_process)),
+                                "NUMEXPR_NUM_THREADS": str(int(n_workers_per_hd_bet_process)),
+                                "TORCH_NUM_THREADS": str(int(n_workers_per_hd_bet_process)),
+                            }
+                        )
+
+                    if debug:
+                       print("[preprocess_brain_mris] Running:", " ".join(cmd), flush=True)
+
+                    try:
+                        subprocess.run(cmd, check=True, env=env)
+                    except Exception as e:
+                        # If batch HD-BET fails, fall back to the existing per-exam mask generation.
+                        if not quiet:
+                            print(
+                                f"[preprocess_brain_mris] WARNING: Batch hd-bet call failed; falling back to per-exam mask generation. ({e.__class__.__name__}: {e})",
+                                flush=True,
+                            )
+                    else:
+                        # Copy outputs into the canonical per-patient path that _find_existing_patient_brainmask expects.
+                        for pat, fname in pat_to_fname.items():
+                            src = tmp_out / fname
+                            if not src.exists():
+                                # HD-BET may have skipped / failed this case; fall back per-exam later.
+                                if not quiet:
+                                    print(
+                                        f"[preprocess_brain_mris] WARNING: hd-bet did not produce a mask for {pat} (expected {src}). Will fall back to per-exam mask generation.",
+                                        flush=True,
+                                    )
+                                continue
+
+                            patient_out_dir = out_dir / pat
+                            patient_out_dir.mkdir(parents=True, exist_ok=True)
+                            dst = patient_out_dir / f"{pat}_brainmask_ref.nii.gz"
+                            shutil.copy2(src, dst)
+
+                        if not quiet:
+                            print("[preprocess_brain_mris] Batch brainmask precompute done.", flush=True)
+
 
     # Prepare the preprocess log (delimiter from extension; line-buffered)
     delim = "\t" if str(preprocess_log).lower().endswith(".tsv") else ","
