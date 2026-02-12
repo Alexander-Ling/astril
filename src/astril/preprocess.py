@@ -3139,14 +3139,37 @@ def plan_dicom_to_nifti_conversion(
         except Exception: return default
 
     def _discover_exams(patient_abs: str) -> list[tuple[str, str]]:
-        """Return de-duplicated (exam_dir_abs, mr_subdir_name) based on .dcm leaves."""
+        """Return de-duplicated (exam_dir_abs, mr_subdir_name) based on .dcm leaves.
+
+        Enforced expected layout under patient_abs:
+          {patient_abs}/{Exam}/{RadiologyType}/{Series}/.../*.dcm
+
+        We infer:
+          - exam_dir_abs = {patient_abs}/{Exam}
+          - mr_subdir_name = {RadiologyType}
+
+        If a .dcm leaf is found but it does not have at least two path components
+        beneath patient_abs (Exam/RadiologyType), it is ignored.
+        """
+        patient_abs = os.path.normpath(os.path.abspath(patient_abs))
         seen = set()
+
+        patient_abs = os.path.normpath(patient_abs)
+
         for curr, _dirs, files in os.walk(patient_abs):
-            if any(f.lower().endswith(".dcm") for f in files):
-                mr_dir = os.path.dirname(curr)
-                exam_dir = os.path.dirname(mr_dir)
-                mr_name = os.path.basename(mr_dir)
-                seen.add((os.path.normpath(exam_dir), mr_name))
+            if not any(f.lower().endswith(".dcm") for f in files):
+                continue
+            try:
+                rel = os.path.relpath(curr, patient_abs)
+            except Exception:
+                continue
+            parts = [p for p in rel.split(os.sep) if p not in ("", ".")]
+            if len(parts) < 2:
+                # Not enough depth to contain Exam/RadiologyType
+                continue
+            exam_dir = os.path.normpath(os.path.join(patient_abs, parts[0]))
+            mr_name = parts[1]
+            seen.add((exam_dir, mr_name))
         return sorted(seen)
 
     # Classifier columns (stable) + our metadata columns.

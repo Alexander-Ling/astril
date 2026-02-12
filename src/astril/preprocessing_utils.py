@@ -653,12 +653,43 @@ def _parse_dt(ds):
     return None, None
 
 def _first_dcm_in(folder):
+    """Return the first .dcm found under folder (searches recursively)."""
     for root, _, files in os.walk(folder):
         for f in sorted(files):
             if f.lower().endswith(".dcm"):
                 return os.path.join(root, f)
-        break
     return None
+
+def _resolve_dicom_series_dir(series_root: str, max_depth: int = 6) -> str | None:
+    """Resolve the directory that actually contains .dcm files for a series.
+
+    Supports layouts like:
+      - {series_root}/*.dcm
+      - {series_root}/DICOM/*.dcm   (single non-branching intermediate folder)
+      - {series_root}/<one child>/<one child>/.../*.dcm (up to max_depth)
+
+    Returns the directory path that directly contains .dcm files, or None if not found.
+    """
+    try:
+        cur = os.path.normpath(series_root)
+        for _ in range(int(max_depth)):
+            if not os.path.isdir(cur):
+                return None
+            # Direct .dcm files?
+            try:
+                names = os.listdir(cur)
+            except Exception:
+                return None
+            if any(n.lower().endswith(".dcm") for n in names):
+                return cur
+            # Descend only if there is exactly one subdirectory (non-branching)
+            subdirs = [os.path.join(cur, n) for n in names if os.path.isdir(os.path.join(cur, n))]
+            if len(subdirs) != 1:
+                return None
+            cur = os.path.normpath(subdirs[0])
+        return None
+    except Exception:
+        return None
 
 def _norm_text(*vals):
     parts = []
@@ -1244,10 +1275,15 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
     rows = []
     # 1) Read minimal metadata for EVERY series (1 file per series)
-    for series_folder in sorted([os.path.join(mr_dir, d) for d in os.listdir(mr_dir) if os.path.isdir(os.path.join(mr_dir, d))]):
-        dcm_path = _first_dcm_in(series_folder)
+    for series_root in sorted([os.path.join(mr_dir, d) for d in os.listdir(mr_dir) if os.path.isdir(os.path.join(mr_dir, d))]):
+        series_folder = series_root
+        dicom_dir = _resolve_dicom_series_dir(series_folder)
+        if not dicom_dir:
+            if verbose: print(f"[skip] no DICOM in {series_root}")
+            continue
+        dcm_path = _first_dcm_in(dicom_dir)
         if not dcm_path:
-            if verbose: print(f"[skip] no DICOM in {series_folder}")
+            if verbose: print(f"[skip] no DICOM in {series_root}")
             continue
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True, force=True)
@@ -1384,7 +1420,8 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             plane = _plane_from_iop(ds)
 
         rows.append(dict(
-            folder=series_folder,
+            folder=dicom_dir,
+            series_root=series_root,
             series_number=series_number,
             acq_dt=acq_dt, acq_dt_iso=acq_iso,
             manufacturer=manufacturer, modality=modality,
@@ -2561,7 +2598,7 @@ def _sanitize_label(lbl: str) -> str:
 # Minimal generator functions
 # ----------------------------
 
-def run_derived_generator(input_path_or_dicom_dir, output_path: str, generator_key: str, primary_label: str = "", derived_label: str = "") -> str:
+def run_derived_generator(input_path_or_dicom_dir, output_path: str, generator_key: str, primary_label: str = "", derived_label: str = "", debug: bool = False) -> str:
     """
     Convert DICOM->NIfTI if needed, then run the requested generator and save output_path.
     Accepts either a single path/dir (str) or a dict of inputs (e.g., {"MAG": <path>, "PHASE": <path>}).
