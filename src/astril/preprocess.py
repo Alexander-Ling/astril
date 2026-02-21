@@ -187,13 +187,18 @@ def resize_mri(
 
     padding_record["center_padding"] = center_padding.tolist()
 
+    # Update affine origin to account for the voxel-index shift introduced by center padding/cropping.
+    # IMPORTANT: This must happen even when translation_only=True, otherwise physical coordinates
+    # will be inconsistent after we shift the data array.
+    affine_after_center = update_origin_for_padding(img.affine.copy(), center_padding, original_voxel_dims)
+
     # ---------------------------------------------------------------------
     # If translation_only: skip interpolation + target shape adjustment
     # ---------------------------------------------------------------------
     if translation_only:
         padding_record["shape_padding"] = np.zeros((3, 2), dtype=int).tolist()
         final_data = data
-        new_affine = img.affine
+        new_affine = affine_after_center
 
     else:
         # For 4D, compute shape_padding once using the reference frame, then reuse for all frames
@@ -246,7 +251,8 @@ def resize_mri(
         # NOTE: Do NOT rely on np.diag(...) here; many valid affines have zeros on the diagonal
         # (e.g., axis permutations), and using diag-signs can create a singular affine that nibabel
         # cannot decompose into qform/sform.
-        new_affine = img.affine.copy()
+        # Start from the affine that already includes the center-padding origin update.
+        new_affine = affine_after_center.copy()
         R = new_affine[:3, :3].astype(np.float64, copy=True)
         eps = 1e-8
 
@@ -262,10 +268,15 @@ def resize_mri(
             else:
                 D[:, ax] = col / n
 
-        # Orthonormalize to protect against numerical drift
-        Q, _ = np.linalg.qr(D)
-        if np.linalg.det(Q) < 0:
-            Q[:, 0] *= -1.0
+        # IMPORTANT:
+        # Do NOT orthonormalize (QR/SVD) and do NOT force det(Q)>0 here.
+        # Many valid NIfTI affines are left-handed in sform (det<0), especially with
+        # a negative X column (common RAS/LPS conventions). Forcing a "proper rotation"
+        # can introduce axis flips/rotations that make axial no longer axial.
+        #
+        # We only need to preserve the *direction* of each axis while changing the
+        # voxel sizes. Using normalized columns preserves orientation and obliqueness.
+        Q = D
 
         tvd = np.asarray(target_voxel_dims, dtype=np.float64)
         if tvd.shape != (3,):
@@ -281,7 +292,55 @@ def resize_mri(
     # ---------------------------------------------------------------------
     # Save output
     # ---------------------------------------------------------------------
-    out_img = nib.Nifti1Image(final_data.astype(np.float32), new_affine)
+    out_hdr = img.header.copy()
+    out_img = nib.Nifti1Image(final_data.astype(np.float32), new_affine, header=out_hdr)
+
+    # Always set sform to the new affine (this is what most tools should trust).
+    try:
+        scode = int(out_hdr.get("sform_code", 0))
+    except Exception:
+        scode = 0
+    try:
+        out_img.set_sform(new_affine, code=(scode if scode else 1))
+    except Exception:
+        # If set_sform fails for any reason, we still at least have the base affine.
+        pass
+
+    # Only set qform if the affine is representable as a proper quaternion rotation:
+    # - top-left 3x3 must be (approximately) orthonormal
+    # - determinant must be +1 (proper rotation)
+    #
+    # Otherwise, set qform_code=0 to avoid viewers/tools applying an inconsistent qform.
+    try:
+        import numpy as np
+        R = np.asarray(new_affine[:3, :3], dtype=float)
+        # normalize columns to remove scaling (should already be scaled by tvd)
+        # Check orthogonality up to tolerance
+        RtR = (R / np.linalg.norm(R, axis=0, keepdims=True)).T @ (R / np.linalg.norm(R, axis=0, keepdims=True))
+        detR = float(np.linalg.det(R / np.linalg.norm(R, axis=0, keepdims=True)))
+        is_ortho = np.allclose(RtR, np.eye(3), atol=1e-3, rtol=1e-3)
+        is_proper = abs(detR - 1.0) < 1e-3
+    except Exception:
+        is_ortho = False
+        is_proper = False
+
+    if is_ortho and is_proper:
+        try:
+            qcode = int(out_hdr.get("qform_code", 0))
+        except Exception:
+            qcode = 0
+        try:
+            out_img.set_qform(new_affine, code=(qcode if qcode else 1))
+        except Exception:
+            try:
+                out_img.header["qform_code"] = 0
+            except Exception:
+                pass
+    else:
+        try:
+            out_img.header["qform_code"] = 0
+        except Exception:
+            pass
 
     # Preserve 4th zoom (time spacing) if present
     if ndim == 4:
@@ -703,6 +762,7 @@ def register_images(
     fixed_frame_index: int = 0,
     moving_frame_index: int = 0,
     use_first_frame_only=False,
+    keep_moving_grid: bool = False,
     debug = False,
 ):
     """
@@ -812,6 +872,16 @@ def register_images(
         If moving_path is 4D and apply_only=False, the 3D frame index used to estimate the transform.
     use_first_frame_only : bool, default=False
         If True, moving 4d volumes are returned as a 3d volume registered via the first frame of the input volume.
+    keep_moving_grid : bool, default=False
+        If True, the moving image is resampled onto its **own** original 3D grid (same size/spacing/origin/direction),
+        rather than onto the fixed image grid. This can be useful when you want to preserve the moving image's
+        native voxel lattice while still applying the estimated transform.
+
+        Notes:
+        - The estimated transform is still written (when transform_path is provided) and maps moving->fixed.
+        - When keep_moving_grid=True, the output image will not share the fixed grid; downstream consumers should
+          use the saved transform (or its inverse) to relate the output back to fixed space.
+
     debug : bool, default=False
         Print additional information for 4d image registration to debug affine matrice issues.
 
@@ -1764,6 +1834,11 @@ def register_images(
                     "interp": interp_spec if interp_spec is not None else "linear",
                     "sitk_interpolator": sitk_interp_name,
                     "scipy_order": int(scipy_order),
+                    "output_grid": "moving" if keep_moving_grid else "fixed",
+                    "keep_moving_grid": bool(keep_moving_grid),
+                    "fixed_frame_index": int(fixed_frame_index),
+                    "moving_frame_index": int(moving_frame_index),
+                    "use_first_frame_only": bool(use_first_frame_only),
                     "registration_type": str(registration_type),
                     "similarity_metric": str(similarity_metric),
                     "registration_strategy": str(registration_strategy),
@@ -1776,7 +1851,12 @@ def register_images(
     if verbose:
         print(f"Resampling moving image...")
     # Spatial reference for resampling: always a 3D grid.
-    spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
+    # Default behavior: resample onto the fixed grid.
+    # Optional behavior (keep_moving_grid=True): resample onto the moving grid instead.
+    if keep_moving_grid:
+        spatial_ref = moving_img if moving_ndim == 3 else moving_for_reg
+    else:
+        spatial_ref = (moving_img if moving_ndim == 3 else moving_for_reg) if keep_moving_grid else (fixed_img if fixed_ndim == 3 else fixed_for_reg)
 
     if moving_ndim == 3:
         # Use ResampleImageFilter so we can cap threads per-object.
@@ -1809,7 +1889,7 @@ def register_images(
             )
         
         n_frames = int(moving_shape[3])
-        spatial_ref = fixed_img if fixed_ndim == 3 else fixed_for_reg
+        spatial_ref = (moving_img if moving_ndim == 3 else moving_for_reg) if keep_moving_grid else (fixed_img if fixed_ndim == 3 else fixed_for_reg)
 
         resampler = make_sitk_resampler(
             reference_img=spatial_ref,
@@ -1847,8 +1927,8 @@ def register_images(
             import nibabel as nib
             from datetime import datetime
 
-            fixed_nii = nib.load(str(fixed_path))
-            fixed_affine = fixed_nii.affine
+            ref_nii = nib.load(str(moving_path if keep_moving_grid else fixed_path))
+            ref_affine = ref_nii.affine
 
             # Target grid size from the 3D reference (SimpleITK size is (x,y,z))
             sx, sy, sz = spatial_ref.GetSize()
@@ -1877,23 +1957,23 @@ def register_images(
             if verbose:
                 print(f"4D stacking complete at {datetime.now()}")
 
-            out_nii = nib.Nifti1Image(out_xyzt, fixed_affine)
+            out_nii = nib.Nifti1Image(out_xyzt, ref_affine)
             hdr = out_nii.header
             hdr.set_data_dtype(np.float32)
 
             # Copy zooms: spatial from fixed; time from moving if present
-            fixed_zooms = fixed_nii.header.get_zooms()[:3]
+            fixed_zooms = ref_nii.header.get_zooms()[:3]
             moving_zooms = nib.load(str(moving_path)).header.get_zooms()
             tzoom = float(moving_zooms[3]) if len(moving_zooms) > 3 else 1.0
             hdr.set_zooms(tuple(list(fixed_zooms) + [tzoom]))
 
             try:
-                qcode = int(fixed_nii.header["qform_code"]) or 1
-                scode = int(fixed_nii.header["sform_code"]) or 1
+                qcode = int(ref_nii.header["qform_code"]) or 1
+                scode = int(ref_nii.header["sform_code"]) or 1
             except Exception:
                 qcode, scode = 1, 1
-            out_nii.set_qform(fixed_affine, code=qcode)
-            out_nii.set_sform(fixed_affine, code=scode)
+            out_nii.set_qform(ref_affine, code=qcode)
+            out_nii.set_sform(ref_affine, code=scode)
 
             try:
                 hdr["scl_slope"] = 1.0
@@ -1985,8 +2065,10 @@ def inverse_transform_image(
     - This function assumes the forward transform maps: original -> transformed_reference_space.
       It applies the inverse to map: transformed -> original_reference_grid.
     """
+    import os
+    import json
     import SimpleITK as sitk
-    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d
+    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
 
     orig_ndim, orig_shape = get_nifti_ndim(original_image_path)
     tr_ndim, tr_shape = get_nifti_ndim(transformed_image_path)
@@ -2054,7 +2136,7 @@ def inverse_transform_image(
             )
             frames_out.append(recovered3d)
 
-        out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img) #This will error and needs to be fixed
+        out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img)
         sitk.WriteImage(out4d, str(output_path))
 
     # If diffusion sidecars exist next to the transformed image, rotate/copy them
@@ -2065,7 +2147,7 @@ def inverse_transform_image(
             str(transformed_image_path),
             str(output_path),
             inverse_transform,
-            inverse=False,
+            inverse=True,
             verbose=verbose,
         )
     except Exception:
@@ -4942,6 +5024,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     basic.add_argument("--interp", default="cubic", help="Interpolation for registration+resampling. Accepts int 0-5 or strings like linear/cubic; use 'auto' to reuse recorded interpolation when --apply_only.")
     basic.add_argument("--registration_voxel_mm", default="1,1,1", help="Optional spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
     basic.add_argument("--use_first_frame_only", action="store_true", help="For 4d moving volumes, return registered volume as a 3d volume registered only using the first frame of the input volume.")
+    basic.add_argument("--keep_moving_grid", action="store_true", help="Retain voxel dimensions/spacing from the original moving image instead of resampling to match dimensions/spacing of the fixed image.")
 
     io = p.add_argument_group("Transforms I/O")
     io.add_argument("--transform",
@@ -4968,6 +5051,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             interpolation=a.interp,
             registration_voxel_mm=a.registration_voxel_mm,
             use_first_frame_only=a.use_first_frame_only,
+            keep_moving_grid=a.keep_moving_grid,
             verbose=a.verbose,
             debug=a.debug,
         )

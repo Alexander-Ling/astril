@@ -416,6 +416,7 @@ def preprocess_library(
     final_dims: tuple[int, int, int] = (240, 240, 155),
     final_voxels: tuple[float, float, float] = (1.0, 1.0, 1.0),
     save_scans_with_skulls: bool = False,
+    save_native_space: bool = False,
     use_gpu: bool = False,
     enable_tta: bool = False,
     debug: bool = False,
@@ -805,6 +806,8 @@ def preprocess_library(
                        "hd-bet",
                         "-i", str(tmp_in),
                         "-o", str(tmp_out),
+                        "--save_bet_mask",
+                        "--no_bet_image",
                         "-device", ("cuda" if use_gpu else "cpu"),
                     ]
                     if not enable_tta:
@@ -840,7 +843,9 @@ def preprocess_library(
                     else:
                         # Copy outputs into the canonical per-patient path that _find_existing_patient_brainmask expects.
                         for pat, fname in pat_to_fname.items():
-                            src = tmp_out / fname
+                            src = tmp_out / fname.replace(".nii.gz", "_bet.nii.gz")
+                            if not quiet:
+                                print(f"Looking for hd-bet mask: {src}")
                             if not src.exists():
                                 # HD-BET may have skipped / failed this case; fall back per-exam later.
                                 if not quiet:
@@ -882,7 +887,7 @@ def preprocess_library(
     for pd in patient_dirs:
         all_exam_dirs.extend([p for p in pd.iterdir() if p.is_dir()])
     total_exams = len(all_exam_dirs)
-
+    
     done_count_box = [0]
 
     if tqdm:
@@ -937,6 +942,7 @@ def preprocess_library(
                 registration_voxel_mm=registration_voxel_mm,
                 co_register_path=None if dont_coregister else (str(coreg_ref_used_for_exam) if coreg_ref_used_for_exam else None),
                 save_scans_with_skulls=save_scans_with_skulls,
+                save_native_space=save_native_space,
                 final_dims=final_dims,
                 final_voxels=final_voxels,
                 debug=debug,
@@ -1194,6 +1200,7 @@ def main():
     p.add_argument("--final_voxels", action="append", default=None, metavar="SX,SY,SZ",
                    help="Final voxel dimensions (mm); repeatable. Provide like '1,1,1' (or '0.5,0.5,0.5'). If omitted, defaults to 1,1,1 (or repeats it to match --final_dims).")
     p.add_argument("--save_scans_with_skulls", action="store_true", help="Also save skull-on registered scans (PHI risk).")
+    p.add_argument("--save_native_space", action="store_true", help="Also save native-grid (original spacing/dims) copies of the non-normalized brain outputs under output_dir/native_space/.")
     p.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration for hd-bet skull stripping.")
     p.add_argument("--enable_tta", action="store_true", help="Enable test-time augmentation (TTA) for hd-bet skull stripping.")
     p.add_argument("--skip_qc", action="store_true", help="Skip creation of PDF QC files showing the center axial slice from each preprocessed volume.")
@@ -1236,6 +1243,7 @@ def main():
         final_dims=args.final_dims,
         final_voxels=args.final_voxels,
         save_scans_with_skulls=args.save_scans_with_skulls,
+        save_native_space=args.save_native_space,
         use_gpu=args.use_gpu,
         enable_tta=args.enable_tta,
         debug=args.debug,

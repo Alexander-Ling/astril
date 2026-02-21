@@ -1,4 +1,4 @@
-"""
+﻿"""
 preprocess_single_brain_mri.py
 Author: Alex Ling
 E. Antonio Chiocca Group, BWH
@@ -97,6 +97,7 @@ def run_preprocessing_pipeline(
     n_workers_per_registration_process=None,
     n_workers_per_hd_bet_process=None,
     save_scans_with_skulls=False,
+    save_native_space=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
     patientID=None,
@@ -1055,6 +1056,135 @@ def run_preprocessing_pipeline(
     # Only output labels that survived all prior steps (registration -> masking -> normalization)
     output_3d_labels = sorted(set(brain_paths.keys()).intersection(norm_paths.keys()))
 
+    # Native-space saving is intended for the non-normalized outputs (_brain.nii.gz),
+    # so it must NOT depend on normalization succeeding.
+    output_3d_labels_brain_only = sorted(set(brain_paths.keys()))
+
+    # --------------------------------------------------------------
+    # Optional: save native-grid (original spacing/dims) copies of the
+    # non-normalized brain outputs.
+    #
+    # These are still registered into the working reference space
+    # (anchor or co-registration reference), but are sampled onto the
+    # original moving grid.
+    # --------------------------------------------------------------
+    if save_native_space:
+        import SimpleITK as sitk
+        import numpy as _np
+        import nibabel as _nib
+
+        from .preprocessing_utils import (
+            get_nifti_ndim,
+            sitk_transform_to_affine_4x4_any,
+        )
+
+        native_dir = os.path.join(output_dir, "native_space")
+        os.makedirs(native_dir, exist_ok=True)
+
+        def _abs_record_path(rel_path: str) -> str:
+            rel = str(rel_path).strip()
+            rel = rel[2:] if rel.startswith("./") else rel
+            return os.path.normpath(os.path.join(output_dir, rel))
+
+        # Working reference space for masks
+        ref_fixed_path = co_register_path if co_register_path else anchor_path
+
+        # Brainmask in working reference space (anchor or co-reg)
+        bm_ref = sitk.ReadImage(str(brainmask_temp), sitk.sitkFloat32)
+
+        for lbl in output_3d_labels_brain_only:
+            src_native = scans.get(lbl, None)
+            if not src_native:
+                continue
+
+            # Skip 4D scans (native-space saving currently targets the 3D "_brain" outputs)
+            try:
+                src_ndim, _ = get_nifti_ndim(src_native)
+                if int(src_ndim) != 3:
+                    continue
+            except Exception:
+                continue
+
+            # Build lbl(native) -> reference-space transform
+            #  - initial-registration: lbl -> anchor (for lbl != anchor)
+            #  - optional: anchor -> co-register reference
+            tfm_chain = []
+
+            if lbl != anchor_label:
+                rec = transform_records.get(lbl, {}).get("initial-registration", {})
+                rel_tfm = rec.get("transform", None)
+                if rel_tfm:
+                    tfm_chain.append(sitk.ReadTransform(_abs_record_path(rel_tfm)))
+
+            if co_register_path:
+                # anchor -> co-reg (already moved into transform_dir)
+                if coreg_tfm_dest is None:
+                    raise RuntimeError("Internal error: co_register_path set but coreg_tfm_dest is None")
+                tfm_chain.append(sitk.ReadTransform(str(coreg_tfm_dest)))
+
+            if tfm_chain:
+                # Compose transforms so points map: lbl_native -> reference
+                try:
+                    comp = sitk.CompositeTransform(3)
+                    # Note: SimpleITK/ITK applies CompositeTransform transforms in reverse order of addition.
+                    # We therefore add them in reverse so the *mathematical* composition is (last ∘ ... ∘ first).
+                    for t in reversed(tfm_chain):
+                        comp.AddTransform(t)
+                    tfm_use = comp
+                except Exception:
+                    # Fall back: use the last transform only (best-effort)
+                    tfm_use = tfm_chain[-1]
+            else:
+                # Anchor label with no co-registration: identity
+                tfm_use = sitk.Transform(3, sitk.sitkIdentity)
+
+            # 1) Resample the reference-space brainmask onto the native moving grid
+            mv_ref = sitk.ReadImage(str(src_native), sitk.sitkFloat32)
+            bm_native = sitk.Resample(
+                bm_ref,
+                mv_ref,
+                tfm_use,
+                sitk.sitkNearestNeighbor,
+                0.0,
+                sitk.sitkFloat32,
+            )
+
+            # 2) Apply mask in native voxel space WITHOUT warping intensities.
+            #    This avoids interpolation artifacts ("holes") that can appear if we
+            #    resample an image onto its own grid with a non-identity transform.
+            try:
+                nii = _nib.load(str(src_native))
+            except Exception:
+                continue
+
+            data = _np.asanyarray(nii.dataobj).astype(_np.float32, copy=False)
+            bm_zyx = sitk.GetArrayFromImage(bm_native)
+            bm_xyz = _np.transpose(bm_zyx, (2, 1, 0))
+            if bm_xyz.shape != data.shape[:3]:
+                if verbose:
+                    print(f"[WARN] Native mask shape mismatch for {lbl}: mask={bm_xyz.shape} data={data.shape[:3]} -- skipping")
+                continue
+
+            masked = data.copy()
+            masked[bm_xyz <= 0] = 0.0
+
+            # 3) Header-only geometry update: place the native grid into the
+            #    working reference space (anchor or co-reg).
+            M = sitk_transform_to_affine_4x4_any(tfm_use)
+            A_out = M @ _np.asarray(nii.affine, dtype=float)
+            out = _nib.Nifti1Image(masked, A_out, header=nii.header.copy())
+            try:
+                out.set_qform(A_out, code=int(nii.header.get("qform_code", 1)) or 1)
+                out.set_sform(A_out, code=int(nii.header.get("sform_code", 1)) or 1)
+            except Exception:
+                pass
+
+            native_out = os.path.join(native_dir, f"{basename_prefix}_{lbl}_native_brain.nii.gz")
+            _nib.save(out, str(native_out))
+
+            if verbose:
+                print(f"[native_space] Saved native-grid brain: {native_out}")
+
     # Iterate over all requested output target grids
     for i, (dims_i, vox_i) in enumerate(zip(final_dims_list, final_voxels_list)):
         dims_tag = _fmt_dims(dims_i)
@@ -1165,6 +1295,7 @@ def preprocess_single_brain_mri(
     n_workers_per_registration_process=None,
     n_workers_per_hd_bet_process: int | None = None,
     save_scans_with_skulls=False,
+    save_native_space=False,
     final_dims=(240, 240, 155),
     final_voxels=(1.0, 1.0, 1.0),
     debug=False,
@@ -1215,6 +1346,12 @@ def preprocess_single_brain_mri(
     save_scans_with_skulls : bool, default=False
         If True, also save the registered/coregistered full-head scans (before masking) under
         output_dir/with_skulls/.
+    save_native_space : bool, default=False
+        If True, save an additional copy of each *non-normalized* output scan (brain-masked, pre-final-resize)
+        in the scan's native voxel spacing / data dimensions (i.e., the original acquisition grid). The native-space
+        outputs are still spatially registered into the pipeline's working reference space (anchor or co-registration
+        reference), but are sampled onto the original moving grid.
+        Files are written under output_dir/native_space/ with a '_native_brain.nii.gz' suffix.
     final_dims : tuple[int,int,int], default=(240,240,155)
         Final target data dimensions (X,Y,Z) for outputs (and brainmask).
     final_voxels : tuple[float,float,float], default=(1.0,1.0,1.0)
@@ -1325,6 +1462,7 @@ def preprocess_single_brain_mri(
             n_workers_per_registration_process=n_workers_per_registration_process,
             n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
             save_scans_with_skulls=save_scans_with_skulls,
+            save_native_space=save_native_space,
             final_dims=final_dims,
             final_voxels=final_voxels,
             patientID=patientID,
@@ -1352,6 +1490,7 @@ def preprocess_single_brain_mri(
                 n_workers_per_registration_process=n_workers_per_registration_process,
                 n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
                 save_scans_with_skulls=save_scans_with_skulls,
+                save_native_space=save_native_space,
                 final_dims=final_dims,
                 final_voxels=final_voxels,
                 patientID=patientID,
@@ -1477,6 +1616,16 @@ def main():
             "Save intermediate full-head scans (with skulls) in addition to brain-extracted outputs. "
             "Use caution if scans contain PHI."
         ),
+    )   
+    parser.add_argument(
+        "--save_native_space",
+        action="store_true",
+        help=(
+            "Also save native-grid (original spacing/dims) copies of the non-normalized brain outputs. "
+            "Native outputs are still registered into the working reference space (anchor or co-registration "
+            "reference), but are sampled onto the original moving grid. Outputs are written under "
+            "output_dir/native_space/."
+        ),
     )
     parser.add_argument("--final_dims", action="append", default=None, help="Final data dimensions; repeatable. Provide like '240,240,155' (or '240x240x155'). If given multiple times, you must also provide --final_voxels the same number of times.")
     parser.add_argument("--final_voxels", action="append", default=None, help="Final voxel dimensions (mm); repeatable. Provide like '1,1,1' (or '0.5,0.5,0.5'). If omitted, defaults to 1,1,1 (or repeats it to match --final_dims).")
@@ -1592,6 +1741,7 @@ def main():
         n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         co_register_path=args.co_register,
         save_scans_with_skulls=args.save_scans_with_skulls,
+        save_native_space=args.save_native_space,
         final_dims=dims,
         final_voxels=voxels,
         debug=args.debug,

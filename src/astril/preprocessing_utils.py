@@ -456,11 +456,51 @@ def interpolate_to_voxel_dims(data, original_voxel_dims, target_voxel_dims, inte
     zoom_factors, order = prepare_zoom(original_voxel_dims, target_voxel_dims, interp)
     return interpolate_to_voxel_dims_precomputed(data, zoom_factors, order)
 
+def update_affine_for_padding_vox(affine_matrix, padding):
+    """Update a NIfTI affine for padding/cropping applied in voxel units.
+
+    Parameters
+    ----------
+    affine_matrix : (4,4) array-like
+        Input affine mapping voxel indices (i,j,k) to world coordinates.
+    padding : (3,2) array-like of int
+        Padding/cropping applied on the *data array* for the first 3 axes.
+        For each axis: [pad_before, pad_after].
+        * Positive values mean padding with zeros.
+        * Negative values mean cropping.
+
+    Notes
+    -----
+    Padding/cropping changes which original voxel becomes index (0,0,0).
+    The correct origin update in world space is:
+
+        new_origin = old_origin - A[:3,:3] @ [pad_before_x, pad_before_y, pad_before_z]
+
+    where the columns of A[:3,:3] already encode direction *and* mm/voxel.
+    This works for diagonal, rotated, and axis-permuted affines.
+    """
+    import numpy as np
+
+    A = np.asarray(affine_matrix, dtype=float).copy()
+    pad = np.asarray(padding, dtype=int)
+    if pad.shape != (3, 2):
+        raise ValueError(f"padding must be shape (3,2), got {pad.shape}")
+
+    shift_vox = pad[:, 0].astype(float)
+    shift_mm = A[:3, :3] @ shift_vox
+    A[:3, 3] -= shift_mm
+    return A
 
 def update_origin_for_padding(affine_matrix, padding, voxel_dims):
-    shifts = np.array([pad[0] * voxel_dim for pad, voxel_dim in zip(padding, voxel_dims)])
-    affine_matrix[:3, 3] -= shifts
-    return affine_matrix
+    """Backward-compatible wrapper for updating affines after padding/cropping.
+
+    Historically this function assumed a diagonal affine and used voxel_dims to
+    compute mm shifts. That breaks for rotated/permuted affines.
+
+    The updated implementation ignores voxel_dims and uses the affine columns
+    directly, preserving correct physical space.
+    """
+    return update_affine_for_padding_vox(affine_matrix, padding)
 
 
 def adjust_to_target_shape(data, target_shape, padding_record=None, shape_padding=None):
@@ -3569,3 +3609,77 @@ def generate_patient_qc_pdfs(
     _write('brain', out_brain)
     _write('brain_norm', out_norm)
     return out_brain, out_norm
+
+
+# -------------------------------------------------------------------------
+# SimpleITK transform -> 4x4 affine (physical space)
+# -------------------------------------------------------------------------
+
+def sitk_transform_to_affine_4x4(tfm):
+    """Convert a (linear) SimpleITK transform to a 4x4 affine matrix.
+
+    The returned matrix maps physical points as:
+        p_out = A * p_in + b
+
+    Notes
+    -----
+    - Intended for linear transforms: Translation, Euler3D (rigid), Affine.
+    - Center handling is applied when the transform exposes GetCenter().
+    - For CompositeTransform, use sitk_transform_to_affine_4x4_any().
+    """
+    import numpy as np
+
+    if tfm is None:
+        return np.eye(4, dtype=float)
+
+    A = np.eye(3, dtype=float)
+    t = np.zeros(3, dtype=float)
+    c = np.zeros(3, dtype=float)
+
+    if hasattr(tfm, "GetMatrix"):
+        m = np.array(list(tfm.GetMatrix()), dtype=float)
+        if m.size == 9:
+            A = m.reshape(3, 3)
+
+    if hasattr(tfm, "GetTranslation"):
+        t = np.array(list(tfm.GetTranslation()), dtype=float)
+    elif hasattr(tfm, "GetOffset"):
+        t = np.array(list(tfm.GetOffset()), dtype=float)
+
+    if hasattr(tfm, "GetCenter"):
+        c = np.array(list(tfm.GetCenter()), dtype=float)
+
+    b = (c - A @ c + t)
+
+    M = np.eye(4, dtype=float)
+    M[:3, :3] = A
+    M[:3, 3] = b
+    return M
+
+
+def sitk_transform_to_affine_4x4_any(tfm):
+    """Best-effort conversion of a SimpleITK transform (incl. CompositeTransform) to 4x4 affine.
+
+    This is only valid when all component transforms are linear.
+    """
+    import numpy as np
+    try:
+        import SimpleITK as sitk
+    except Exception:
+        sitk = None
+
+    if tfm is None:
+        return np.eye(4, dtype=float)
+
+    if sitk is not None and hasattr(sitk, "CompositeTransform") and isinstance(tfm, sitk.CompositeTransform):
+        M = np.eye(4, dtype=float)
+        try:
+            n = int(tfm.GetNumberOfTransforms())
+        except Exception:
+            n = 0
+        for i in range(n):
+            Mi = sitk_transform_to_affine_4x4(tfm.GetNthTransform(i))
+            M = Mi @ M
+        return M
+
+    return sitk_transform_to_affine_4x4(tfm)
