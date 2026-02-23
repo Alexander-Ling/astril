@@ -962,147 +962,135 @@ def preprocess_library(
             msg = f"ERROR: {e.__class__.__name__}: {e}"
             return "ERROR", msg, None
 
-    def _process_patient(pd: Path) -> int:
-        """
-        Process all exams for a patient sequentially (so we can create/reuse a single patient brainmask).
-        Returns number of exams processed (including skipped/errored).
-        """
+    # ---------------------------------------------------------------------
+    # Execute: parallelize across EXAMS (threaded)
+    # ---------------------------------------------------------------------
+    # We previously parallelized across patients because we sometimes needed to *create* a single reusable
+    # brainmask per patient (and then process that patient's exams sequentially).
+    #
+    # With the reference-mask pre-staging step above (batch HD-BET folder call), we no longer need
+    # patient-serialization to guarantee mask availability. We therefore parallelize per exam, which
+    # balances load better when patients have differing numbers of exams.
+
+    # Precompute per-patient helpers used by each exam worker.
+    patient_ref_exam_dir: dict[str, Path | None] = {}
+    patient_mask_cache: dict[str, Path | None] = {}
+
+    for pd in patient_dirs:
         patient = pd.name
-        patient_out_dir = out_dir / patient
-        patient_out_dir.mkdir(parents=True, exist_ok=True)
+        coreg_ref = patient_ref.get(patient)
+        if coreg_ref is not None:
+            patient_ref_exam_dir[patient] = _find_exam_dir_for_file(pd, coreg_ref)
+        else:
+            patient_ref_exam_dir[patient] = None
+
+        if reuse_patient_brainmask:
+            patient_out_dir = out_dir / patient
+            patient_out_dir.mkdir(parents=True, exist_ok=True)
+            bm = _find_existing_patient_brainmask(patient_out_dir, patient)
+            patient_mask_cache[patient] = bm
+            if debug:
+                print(f"[Debug] patient={patient} reuse_patient_brainmask={reuse_patient_brainmask} bm={bm}")
+        else:
+            patient_mask_cache[patient] = None
+
+    warned_missing_patient_masks = False
+
+    def _process_exam_dir(exam_dir: Path) -> None:
+        nonlocal warned_missing_patient_masks
+        patient, exam = _parse_patient_exam(exam_dir)
+        out_exam = out_dir / patient / exam
+        (out_dir / patient).mkdir(parents=True, exist_ok=True)
 
         coreg_ref = patient_ref.get(patient)
-        ref_exam_dir: Path | None = None
-        if coreg_ref is not None:
-            ref_exam_dir = _find_exam_dir_for_file(pd, coreg_ref)
+        ref_exam_dir = patient_ref_exam_dir.get(patient)
+        patient_mask = patient_mask_cache.get(patient)
 
-        # Determine existing patient brainmask (from prior runs)
-        patient_mask: Path | None = None
-        if debug:
-            print(f"reuse_patient_brainmask = {reuse_patient_brainmask}")
-        if reuse_patient_brainmask:
-            patient_mask = _find_existing_patient_brainmask(patient_out_dir, patient)
-            if debug:
-                print(f"[Debug] For {patient_out_dir} reusing brainmask {patient_mask}")
-                if patient_mask is not None:
-                    import nibabel as nib
-                    import os as os
-                    mask_file = nib.load(os.fspath(patient_mask))
-                    temp_data = mask_file.get_fdata()
-                    print(f"[Debug] brainmask shape = {temp_data.shape}")
+        if reuse_patient_brainmask and (patient_mask is None) and (not warned_missing_patient_masks) and (not quiet):
+            # Warn once to avoid spamming when multiple patients are missing staged masks.
+            print(
+                "[preprocess_brain_mris] WARNING: reuse_patient_brainmask is enabled but one or more "
+                "patients are missing a staged {patient}_brainmask_ref.* under the output tree. "
+                "Those exams will run without a reused patient mask.",
+                flush=True,
+            )
+            warned_missing_patient_masks = True
 
-        # Determine exam processing order:
-        #   1) If we need to create a patient mask and we have a reference exam dir, do that first.
-        #   2) Otherwise, do timepoint-sorted order (earliest day first).
-        exam_dirs = [p for p in pd.iterdir() if p.is_dir()]
-        exam_dirs_sorted = sorted(
-            exam_dirs,
-            key=lambda p: (
-                _parse_timepoint_from_exam_name(p.name)[1] is False,
-                _parse_timepoint_from_exam_name(p.name)[0],
-                p.name,
-            ),
+        # Decide co-registration reference to use for this exam:
+        # - If dont_coregister: None
+        # - If this is the reference exam itself: skip coregistration (None), since it is already in that space.
+        # - Otherwise: use the patient-level reference file.
+        coreg_ref_used = None
+        if not dont_coregister:
+            if (coreg_ref is not None) and (ref_exam_dir is not None) and (exam_dir == ref_exam_dir):
+                coreg_ref_used = None
+            else:
+                coreg_ref_used = coreg_ref
+
+        status, msg, _exam_bm = _process_single_exam(
+            patient=patient,
+            exam_dir=exam_dir,
+            out_exam=out_exam,
+            coreg_ref=coreg_ref,
+            brainmask_path=patient_mask,
+            coreg_ref_used_for_exam=coreg_ref_used,
         )
 
-        ordered: list[Path] = []
-        if reuse_patient_brainmask and (patient_mask is None) and (ref_exam_dir is not None) and (ref_exam_dir in exam_dirs_sorted):
-            ordered.append(ref_exam_dir)
-            ordered.extend([e for e in exam_dirs_sorted if e != ref_exam_dir])
-        else:
-            ordered = exam_dirs_sorted
+        _log_row([
+            patient, exam, status, msg,
+            str(exam_dir), str(out_exam),
+            str(coreg_ref or "NONE") if not dont_coregister else "NONE",
+            str(patient_mask or "NONE") if reuse_patient_brainmask else "DISABLED",
+            anchor_label, ",".join(modalities) if modalities else "AUTO",
+            registration_metric, registration_strategy, registration_voxel_mm, interp,
+            final_dims, final_voxels,
+            save_scans_with_skulls, use_gpu, enable_tta, debug,
+        ])
 
-        processed_count = 0
+        _advance(1)
 
-        for ex in ordered:
-            _, exam = _parse_patient_exam(ex)
-            out_exam = patient_out_dir / exam
-
-            # Decide co-registration reference to use for this exam:
-            # - If dont_coregister: None
-            # - If this is the reference exam itself: skip coregistration (None), since it is already in that space.
-            # - Otherwise: use the patient-level reference file.
-            coreg_ref_used = None
-            if not dont_coregister:
-                if (coreg_ref is not None) and (ref_exam_dir is not None) and (ex == ref_exam_dir):
-                    coreg_ref_used = None
-                else:
-                    coreg_ref_used = coreg_ref
-
-            status, msg, exam_bm = _process_single_exam(
-                patient=patient,
-                exam_dir=ex,
-                out_exam=out_exam,
-                coreg_ref=coreg_ref,
-                brainmask_path=patient_mask,
-                coreg_ref_used_for_exam=coreg_ref_used,
-            )
-
-            _log_row([
-                patient, exam, status, msg,
-                str(ex), str(out_exam),
-                str(coreg_ref or "NONE") if not dont_coregister else "NONE",
-                str(patient_mask or "NONE") if reuse_patient_brainmask else "DISABLED",
-                anchor_label, ",".join(modalities) if modalities else "AUTO",
-                registration_metric, registration_strategy, registration_voxel_mm, interp,
-                final_dims, final_voxels,
-                save_scans_with_skulls, use_gpu, enable_tta, debug,
-            ])
-
-            processed_count += 1
-            _advance(1)
-
-        return processed_count
-
-    # Execute: parallelize across patients (safe for patient-level brainmask creation/reuse)
     if n_workers and n_workers > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(_process_patient, pd): pd for pd in patient_dirs}
+            futs = {pool.submit(_process_exam_dir, ex): ex for ex in all_exam_dirs}
             for fut in as_completed(futs):
-                # Ensure exceptions don't kill the whole run without being logged
-                pd = futs[fut]
+                ex = futs[fut]
                 try:
                     fut.result()
                 except Exception as e:
-                    # Log a patient-level failure (one row per exam dir to keep progress consistent)
-                    patient = pd.name
-                    exam_dirs = [p for p in pd.iterdir() if p.is_dir()]
-                    for ex in exam_dirs:
-                        _, exam = _parse_patient_exam(ex)
-                        out_exam = out_dir / patient / exam
-                        _log_row([
-                            patient, exam, "ERROR",
-                            f"Patient worker failed: {e.__class__.__name__}: {e}",
-                            str(ex), str(out_exam),
-                            str(patient_ref.get(patient) or "NONE"),
-                            "UNKNOWN",
-                            anchor_label, ",".join(modalities) if modalities else "AUTO",
-                            registration_metric, registration_strategy, registration_voxel_mm, interp,
-                            final_dims, final_voxels,
-                            save_scans_with_skulls, use_gpu, enable_tta, debug,
-                        ])
-                        _advance(1)
-    else:
-        for pd in patient_dirs:
-            try:
-                _process_patient(pd)
-            except Exception as e:
-                patient = pd.name
-                exam_dirs = [p for p in pd.iterdir() if p.is_dir()]
-                for ex in exam_dirs:
-                    _, exam = _parse_patient_exam(ex)
+                    # Log an exam-level failure so progress stays consistent.
+                    patient, exam = _parse_patient_exam(ex)
                     out_exam = out_dir / patient / exam
                     _log_row([
                         patient, exam, "ERROR",
-                        f"Patient worker failed: {e.__class__.__name__}: {e}",
+                        f"Exam worker failed: {e.__class__.__name__}: {e}",
                         str(ex), str(out_exam),
-                        str(patient_ref.get(patient) or "NONE"),
-                        "UNKNOWN",
+                        str(patient_ref.get(patient) or "NONE") if not dont_coregister else "NONE",
+                        str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
                         anchor_label, ",".join(modalities) if modalities else "AUTO",
                         registration_metric, registration_strategy, registration_voxel_mm, interp,
                         final_dims, final_voxels,
                         save_scans_with_skulls, use_gpu, enable_tta, debug,
                     ])
                     _advance(1)
+    else:
+        for ex in all_exam_dirs:
+            try:
+                _process_exam_dir(ex)
+            except Exception as e:
+                patient, exam = _parse_patient_exam(ex)
+                out_exam = out_dir / patient / exam
+                _log_row([
+                    patient, exam, "ERROR",
+                    f"Exam worker failed: {e.__class__.__name__}: {e}",
+                    str(ex), str(out_exam),
+                    str(patient_ref.get(patient) or "NONE") if not dont_coregister else "NONE",
+                    str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
+                    anchor_label, ",".join(modalities) if modalities else "AUTO",
+                    registration_metric, registration_strategy, registration_voxel_mm, interp,
+                    final_dims, final_voxels,
+                    save_scans_with_skulls, use_gpu, enable_tta, debug,
+                ])
+                _advance(1)
 
     if pbar:
         pbar.close()
@@ -1144,7 +1132,7 @@ def main():
     p.add_argument("--coreg_log", default=None, help="CSV path for chosen per-patient reference. Auto-generated if omitted.")
     p.add_argument("--old_coreg_log", nargs="*", default=None, help="One or more prior coreg logs to reuse references.")
     p.add_argument("--dont_coregister", action="store_true", help="Disable co-registration; run each exam independently.")
-    p.add_argument("--n_workers", type=int, default=1, help="Parallel workers across patients (threaded). Use 1 to run serially.")
+    p.add_argument("--n_workers", type=int, default=1, help="Parallel workers across exams (threaded). Use 1 to run serially.")
     p.add_argument(
     "--reference_selection",
     default="highest_quality",
