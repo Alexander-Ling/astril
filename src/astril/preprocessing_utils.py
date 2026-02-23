@@ -3671,7 +3671,47 @@ def sitk_transform_to_affine_4x4_any(tfm):
     if tfm is None:
         return np.eye(4, dtype=float)
 
-    if sitk is not None and hasattr(sitk, "CompositeTransform") and isinstance(tfm, sitk.CompositeTransform):
+    # Preferred: derive the affine by sampling TransformPoint().
+    # This works for CompositeTransform and for linear transforms that might not
+    # expose GetMatrix/GetTranslation in Python as expected.
+    #
+    # For a linear transform T:
+    #   T(p) = A p + b
+    # we can recover A and b exactly by evaluating T at the origin and unit axes.
+    try:
+        if hasattr(tfm, "TransformPoint") and callable(tfm.TransformPoint):
+            p0 = (0.0, 0.0, 0.0)
+            ex = (1.0, 0.0, 0.0)
+            ey = (0.0, 1.0, 0.0)
+            ez = (0.0, 0.0, 1.0)
+            t0 = np.asarray(tfm.TransformPoint(p0), dtype=float)
+            tx = np.asarray(tfm.TransformPoint(ex), dtype=float)
+            ty = np.asarray(tfm.TransformPoint(ey), dtype=float)
+            tz = np.asarray(tfm.TransformPoint(ez), dtype=float)
+
+            A = np.stack([tx - t0, ty - t0, tz - t0], axis=1)  # columns
+            M = np.eye(4, dtype=float)
+            M[:3, :3] = A
+            M[:3, 3] = t0
+            return M
+    except Exception:
+        # Fall through to analytic methods below
+        pass
+
+    # Robust CompositeTransform detection:
+    # In SimpleITK Python, composites are often exposed as base Transform types,
+    # so isinstance(tfm, sitk.CompositeTransform) can be False even when the object
+    # is a composite. Prefer capability-based detection.
+    is_composite = False
+    try:
+        if hasattr(tfm, "GetNumberOfTransforms") and callable(tfm.GetNumberOfTransforms):
+            _n = int(tfm.GetNumberOfTransforms())
+            if _n > 0 and hasattr(tfm, "GetNthTransform") and callable(tfm.GetNthTransform):
+                is_composite = True
+    except Exception:
+        is_composite = False
+
+    if is_composite:
         M = np.eye(4, dtype=float)
         try:
             n = int(tfm.GetNumberOfTransforms())

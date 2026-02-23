@@ -1086,6 +1086,60 @@ def run_preprocessing_pipeline(
             rel = rel[2:] if rel.startswith("./") else rel
             return os.path.normpath(os.path.join(output_dir, rel))
 
+        def _read_tfm(path: str, *, invert: bool) -> "sitk.Transform":
+            """Read a SimpleITK transform from disk, optionally inverting it.
+
+            NOTE: register_images() writes transforms in the direction expected by
+            SimpleITK Resample(), i.e. mapping points from the *output/fixed* space
+            to the *input/moving* space.
+
+            For native-space header updates we want transforms that map:
+                native (moving) -> reference (fixed)
+            therefore we typically invert transforms on load.
+            """
+            t = sitk.ReadTransform(str(path))
+            if invert:
+                try:
+                    t = t.GetInverse()
+                except Exception as e:
+                    raise RuntimeError(f"Transform is not invertible: {path}") from e
+            return t
+
+        def _compose_transforms_3d(ts: list) -> "sitk.Transform":
+            """Create a CompositeTransform whose TransformPoint() matches sequential application.
+
+            SimpleITK's CompositeTransform order can be confusing; rather than assume,
+            validate using a probe point and fall back to reverse order if needed.
+            """
+            if not ts:
+                return sitk.Transform(3, sitk.sitkIdentity)
+            if len(ts) == 1:
+                return ts[0]
+
+            def _seq(p):
+                q = p
+                for t in ts:
+                    q = t.TransformPoint(q)
+                return q
+
+            p = (13.37, -8.25, 4.125)
+            target = _seq(p)
+
+            comp = sitk.CompositeTransform(3)
+            for t in ts:
+                comp.AddTransform(t)
+            try:
+                got = comp.TransformPoint(p)
+                if _np.allclose(_np.asarray(got), _np.asarray(target), atol=1e-5, rtol=1e-5):
+                    return comp
+            except Exception:
+                pass
+
+            comp2 = sitk.CompositeTransform(3)
+            for t in reversed(ts):
+                comp2.AddTransform(t)
+            return comp2
+
         # Working reference space for masks
         ref_fixed_path = co_register_path if co_register_path else anchor_path
 
@@ -1114,29 +1168,51 @@ def run_preprocessing_pipeline(
                 rec = transform_records.get(lbl, {}).get("initial-registration", {})
                 rel_tfm = rec.get("transform", None)
                 if rel_tfm:
-                    tfm_chain.append(sitk.ReadTransform(_abs_record_path(rel_tfm)))
+                    # Saved initial-registration tfm is typically anchor->lbl; invert to get lbl->anchor.
+                    tfm_chain.append(_read_tfm(_abs_record_path(rel_tfm), invert=True))
+                    if verbose:
+                        print(f"[native_space][{lbl}] initial-registration tfm: {rel_tfm}")
 
             if co_register_path:
                 # anchor -> co-reg (already moved into transform_dir)
                 if coreg_tfm_dest is None:
                     raise RuntimeError("Internal error: co_register_path set but coreg_tfm_dest is None")
-                tfm_chain.append(sitk.ReadTransform(str(coreg_tfm_dest)))
+                # Saved coreg tfm is typically ref->anchor; invert to get anchor->ref.
+                tfm_chain.append(_read_tfm(str(coreg_tfm_dest), invert=True))
+                if verbose:
+                    print(f"[native_space][{lbl}] coreg tfm (anchor->ref): {coreg_tfm_dest}")
 
             if tfm_chain:
                 # Compose transforms so points map: lbl_native -> reference
                 try:
-                    comp = sitk.CompositeTransform(3)
-                    # Note: SimpleITK/ITK applies CompositeTransform transforms in reverse order of addition.
-                    # We therefore add them in reverse so the *mathematical* composition is (last ∘ ... ∘ first).
-                    for t in reversed(tfm_chain):
-                        comp.AddTransform(t)
-                    tfm_use = comp
+                    tfm_use = _compose_transforms_3d(tfm_chain)
                 except Exception:
                     # Fall back: use the last transform only (best-effort)
                     tfm_use = tfm_chain[-1]
             else:
                 # Anchor label with no co-registration: identity
                 tfm_use = sitk.Transform(3, sitk.sitkIdentity)
+
+            if debug:
+                p = (0.0, 0.0, 0.0)
+                try:
+                    q = tfm_use.TransformPoint(p)
+                    print(f"[native_space][{lbl}] tfm_use.TransformPoint((0,0,0)) = {q}")
+                except Exception as e:
+                    print(f"[native_space][{lbl}] TransformPoint probe failed: {e}")
+
+            if debug:
+                try:
+                    name = tfm_use.GetName()
+                except Exception:
+                    name = type(tfm_use).__name__
+                ncomp = 0
+                try:
+                    if hasattr(tfm_use, "GetNumberOfTransforms"):
+                        ncomp = int(tfm_use.GetNumberOfTransforms())
+                except Exception:
+                    ncomp = 0
+                print(f"[native_space][{lbl}] tfm_use: {name}  n_components={ncomp}")
 
             # 1) Resample the reference-space brainmask onto the native moving grid
             mv_ref = sitk.ReadImage(str(src_native), sitk.sitkFloat32)
@@ -1148,6 +1224,15 @@ def run_preprocessing_pipeline(
                 0.0,
                 sitk.sitkFloat32,
             )
+
+            if debug:
+                try:
+                    # Save the native-grid mask for inspection
+                    bm_native_out = os.path.join(native_dir, f"{basename_prefix}_{lbl}_native_mask.nii.gz")
+                    sitk.WriteImage(bm_native, bm_native_out)
+                    print(f"[native_space][{lbl}] Saved native-grid mask: {bm_native_out}")
+                except Exception as e:
+                    print(f"[native_space][{lbl}][WARN] Failed to save native mask: {e}")
 
             # 2) Apply mask in native voxel space WITHOUT warping intensities.
             #    This avoids interpolation artifacts ("holes") that can appear if we
@@ -1161,7 +1246,7 @@ def run_preprocessing_pipeline(
             bm_zyx = sitk.GetArrayFromImage(bm_native)
             bm_xyz = _np.transpose(bm_zyx, (2, 1, 0))
             if bm_xyz.shape != data.shape[:3]:
-                if verbose:
+                if debug:
                     print(f"[WARN] Native mask shape mismatch for {lbl}: mask={bm_xyz.shape} data={data.shape[:3]} -- skipping")
                 continue
 
@@ -1170,7 +1255,34 @@ def run_preprocessing_pipeline(
 
             # 3) Header-only geometry update: place the native grid into the
             #    working reference space (anchor or co-reg).
-            M = sitk_transform_to_affine_4x4_any(tfm_use)
+            #
+            # NOTE ON COORDINATE CONVENTIONS:
+            # - SimpleITK uses an LPS physical coordinate convention.
+            # - NIfTI (and nibabel affines) are effectively RAS+.
+            #
+            # The transform we estimated/applied via SimpleITK therefore lives in LPS.
+            # When we update the NIfTI header (RAS), we must convert the 4x4 matrix
+            # from LPS->RAS, otherwise we will see systematic left/right + anterior/posterior
+            # shifts/rotations relative to the co-registered outputs.
+            M_lps = sitk_transform_to_affine_4x4_any(tfm_use)
+
+            # Convert a homogeneous matrix between LPS and RAS:
+            #   [x_ras, y_ras, z_ras, 1]^T = C * [x_lps, y_lps, z_lps, 1]^T
+            # where C flips x and y.
+            C = _np.eye(4, dtype=float)
+            C[0, 0] = -1.0
+            C[1, 1] = -1.0
+            # C^{-1} == C for this diagonal matrix
+            M = C @ M_lps @ C
+            if debug:
+                try:
+                    import numpy as __np
+                    is_I = bool(__np.allclose(M, __np.eye(4), atol=1e-6, rtol=1e-6))
+                except Exception:
+                    is_I = False
+                print(f"[native_space][{lbl}] M (native->ref) close_to_identity={is_I}")
+                print(f"[native_space][{lbl}] M=\n{M}")
+
             A_out = M @ _np.asarray(nii.affine, dtype=float)
             out = _nib.Nifti1Image(masked, A_out, header=nii.header.copy())
             try:
