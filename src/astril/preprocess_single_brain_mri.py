@@ -1170,7 +1170,7 @@ def run_preprocessing_pipeline(
                 if rel_tfm:
                     # Saved initial-registration tfm is typically anchor->lbl; invert to get lbl->anchor.
                     tfm_chain.append(_read_tfm(_abs_record_path(rel_tfm), invert=True))
-                    if verbose:
+                    if debug:
                         print(f"[native_space][{lbl}] initial-registration tfm: {rel_tfm}")
 
             if co_register_path:
@@ -1179,7 +1179,7 @@ def run_preprocessing_pipeline(
                     raise RuntimeError("Internal error: co_register_path set but coreg_tfm_dest is None")
                 # Saved coreg tfm is typically ref->anchor; invert to get anchor->ref.
                 tfm_chain.append(_read_tfm(str(coreg_tfm_dest), invert=True))
-                if verbose:
+                if debug:
                     print(f"[native_space][{lbl}] coreg tfm (anchor->ref): {coreg_tfm_dest}")
 
             if tfm_chain:
@@ -1294,7 +1294,7 @@ def run_preprocessing_pipeline(
             native_out = os.path.join(native_dir, f"{basename_prefix}_{lbl}_native_brain.nii.gz")
             _nib.save(out, str(native_out))
 
-            if verbose:
+            if debug:
                 print(f"[native_space] Saved native-grid brain: {native_out}")
 
     # Iterate over all requested output target grids
