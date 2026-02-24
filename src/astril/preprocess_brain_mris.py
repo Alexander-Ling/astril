@@ -362,20 +362,6 @@ def _find_exam_dir_for_file(patient_dir: Path, file_path: Path) -> Path | None:
     return None
 
 
-def _is_exam_already_processed(out_exam: Path, prefix: str) -> bool:
-    """
-    Heuristic "done" check for the new preprocessing pipeline:
-      - brainmask exists OR at least one transform record exists OR at least one *_brain.nii.gz exists.
-    This is intentionally loose (better to skip than to re-run unintentionally).
-    Use --overwrite to force reruns.
-    """
-    if (out_exam / f"{prefix}_brainmask.nii.gz").exists():
-        return True
-    if list(out_exam.glob(f"{prefix}_*_transform_record.json")):
-        return True
-    if list(out_exam.glob(f"{prefix}_*_brain.nii.gz")):
-        return True
-    return False
 
 def _find_existing_patient_brainmask(patient_out_dir: Path, patient: str) -> Path | None:
     """
@@ -924,14 +910,12 @@ def preprocess_library(
         """
         prefix = _exam_prefix_from_dir(exam_dir)
 
-        if (not overwrite) and _is_exam_already_processed(out_exam, prefix):
-            return "SKIPPED", "Already processed (outputs present); skipped.", (out_exam / f"{prefix}_brainmask.nii.gz" if (out_exam / f"{prefix}_brainmask.nii.gz").exists() else None)
 
         out_exam.mkdir(parents=True, exist_ok=True)
 
         started = time.time()
         try:
-            preprocess_single_brain_mri(
+            status, msg = preprocess_single_brain_mri(
                 output_dir=str(out_exam),
                 scan_dir=str(exam_dir),
                 modalities=modalities,
@@ -952,12 +936,16 @@ def preprocess_library(
                 enable_tta=enable_tta,
                 n_workers_per_registration_process=n_workers_per_registration_process,
                 n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
+                overwrite=overwrite,
                 verbose=not quiet,
             )
             dur = f"{time.time() - started:.1f}s"
 
+            # Include timing for easier batch debugging.
+            msg = f"{msg} ({dur})"
+
             bm = out_exam / f"{prefix}_brainmask.nii.gz"
-            return "OK", dur, (bm if bm.exists() else None)
+            return status, msg, (bm if bm.exists() else None)
         except Exception as e:
             msg = f"ERROR: {e.__class__.__name__}: {e}"
             return "ERROR", msg, None

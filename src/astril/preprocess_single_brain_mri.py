@@ -78,6 +78,120 @@ def _fmt_vox(vox):
         return s.replace(".", "p") if "." in s else s
     return "x".join(_one(x) for x in vox)
 
+
+def _derive_ids_and_basename_prefix(anchor_path: str, patientID=None, timepoint=None, scanID=None):
+    """
+    Derive patientID/timepoint/scanID from an anchor filename when not provided, and return basename_prefix.
+
+    Expected common naming: {patientID}_{timepoint}_{scanID}_{label}.nii[.gz]
+    Falls back gracefully if structure differs.
+    """
+    base = os.path.basename(os.fspath(anchor_path))
+    stem = base
+    if stem.endswith(".nii.gz"):
+        stem = stem[:-7]
+    elif stem.endswith(".nii"):
+        stem = stem[:-4]
+    parts = stem.split("_")
+    if patientID is None and len(parts) >= 1:
+        patientID = parts[0]
+    if timepoint is None and len(parts) >= 2:
+        timepoint = parts[1]
+    if scanID is None and len(parts) >= 3:
+        scanID = parts[2]
+
+    patientID = patientID or "UNKNOWN"
+    timepoint = timepoint or "UNKNOWN"
+    scanID = scanID or "UNKNOWN"
+    basename_prefix = f"{patientID}_{timepoint}"
+    return patientID, timepoint, scanID, basename_prefix
+
+
+def expected_preprocessing_outputs(
+    *,
+    scans: dict,
+    output_dir: str,
+    anchor_label: str = "T1c",
+    save_scans_with_skulls: bool = False,
+    save_native_space: bool = False,
+    final_dims=(240, 240, 155),
+    final_voxels=(1.0, 1.0, 1.0),
+    patientID=None,
+    timepoint=None,
+    scanID=None,
+):
+    """
+    Compute the list of *expected* output paths for a run, based only on inputs and parameters.
+
+    This is used to decide whether an exam is complete and can be safely skipped when overwrite=False.
+    """
+    from astril.preprocessing_utils import get_nifti_ndim
+
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    anchor_path = os.fspath(scans[anchor_label])
+    patientID, timepoint, scanID, basename_prefix = _derive_ids_and_basename_prefix(
+        anchor_path, patientID=patientID, timepoint=timepoint, scanID=scanID
+    )
+
+    final_dims_list, final_voxels_list = _normalize_final_targets(final_dims, final_voxels)
+
+    # Determine which labels are 3D vs 4D
+    ndim_by_label: dict[str, int] = {}
+    for lbl, p in (scans or {}).items():
+        nd, _ = get_nifti_ndim(os.fspath(p))
+        ndim_by_label[str(lbl)] = int(nd)
+
+    threed_labels = sorted([l for l, nd in ndim_by_label.items() if nd == 3])
+    fourd_labels = sorted([l for l, nd in ndim_by_label.items() if nd == 4])
+
+    def _suffix(i: int) -> str:
+        if i == 0:
+            return ""
+        return f"_{_fmt_dims(final_dims_list[i])}_{_fmt_vox(final_voxels_list[i])}"
+
+    expected: list[str] = []
+
+    # Brainmask outputs (one per target grid)
+    for i in range(len(final_dims_list)):
+        suf = _suffix(i)
+        expected.append(os.path.join(output_dir, f"{basename_prefix}_brainmask{suf}.nii.gz"))
+
+    # 3D outputs (one brain + brain-norm per label per target grid)
+    for lbl in threed_labels:
+        for i in range(len(final_dims_list)):
+            suf = _suffix(i)
+            expected.append(os.path.join(output_dir, f"{basename_prefix}_{lbl}{suf}_brain.nii.gz"))
+            expected.append(os.path.join(output_dir, f"{basename_prefix}_{lbl}{suf}_brain-norm.nii.gz"))
+
+        # Per-label transform provenance record (written once per label)
+        expected.append(os.path.join(output_dir, f"{basename_prefix}_{lbl}_transform-record.json"))
+
+        if save_scans_with_skulls:
+            expected.append(os.path.join(output_dir, "with-skulls", f"{basename_prefix}_{lbl}_with-skull.nii.gz"))
+
+        if save_native_space:
+            expected.append(os.path.join(output_dir, "native_space", f"{basename_prefix}_{lbl}_native_brain.nii.gz"))
+
+    # 4D outputs (native space; skull-strip only)
+    # Expected behavior in this pipeline: write *_unregistered outputs for each 4D label.
+    for lbl in fourd_labels:
+        expected.append(os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nii.gz"))
+        # If input has an nrrd sibling, pipeline mirrors it too.
+        in_path = os.fspath(scans[lbl])
+        in_base = in_path[:-7] if in_path.lower().endswith(".nii.gz") else os.path.splitext(in_path)[0]
+        if os.path.exists(in_base + ".nrrd"):
+            expected.append(os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nrrd"))
+
+    return expected
+
+
+def missing_preprocessing_outputs(**kwargs) -> list[str]:
+    """Return a sorted list of expected outputs that are missing on disk."""
+    expected = expected_preprocessing_outputs(**kwargs)
+    missing = [p for p in expected if not os.path.exists(p)]
+    return sorted(missing)
+
+
 def _is_perfusion_family(label: str) -> bool:
     fam = label.split("-", 1)[0] if "-" in label else (label.split("_", 1)[0] if "_" in label else label)
     f = fam.strip().lower()
@@ -1419,6 +1533,7 @@ def preprocess_single_brain_mri(
     use_gpu=False,
     enable_tta=False,
     verbose=True,
+    overwrite: bool = False,
 ):
     """
     Preprocess a single exam's MRI scans using an anchor volume (default: T1c).
@@ -1546,7 +1661,64 @@ def preprocess_single_brain_mri(
             f"Anchor label '{anchor_label}' not found in scans. Got: {sorted(scans.keys())}"
         )
 
-    # Normalize to strings/paths and validate existence
+    # ------------------------------------------------------------------
+    # Robust "skip if complete" behavior:
+    # Only skip when *all* expected outputs for this run configuration exist.
+    # This prevents partially-completed exams (e.g., interrupted runs) from being
+    # incorrectly treated as finished.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Completion / skip logic
+    # ------------------------------------------------------------------
+    run_status: str = "RAN"
+    run_message: str = "Processed."
+
+    if overwrite:
+        run_status = "RAN_OVERWRITE"
+        run_message = "Overwrite requested; reprocessing."
+    else:
+        # Determine whether all outputs expected for *this invocation* already exist.
+        expected = expected_preprocessing_outputs(
+            scans=scans,
+            output_dir=output_dir,
+            anchor_label=anchor_label,
+            save_scans_with_skulls=save_scans_with_skulls,
+            save_native_space=save_native_space,
+            final_dims=final_dims,
+            final_voxels=final_voxels,
+            patientID=patientID,
+            timepoint=timepoint,
+            scanID=scanID,
+        )
+        missing = [p for p in expected if not os.path.exists(p)]
+        preexisting = len(expected) - len(missing)
+
+        if not missing:
+            if verbose:
+                print(
+                    f"[preprocess_single_brain_mri] All {len(expected)} expected outputs already exist; "
+                    "skipping (use --overwrite to re-run)."
+                )
+            return "SKIPPED_COMPLETE", f"All {len(expected)} expected outputs already exist."
+
+        if preexisting > 0:
+            run_status = "RESUMED_PARTIAL"
+            run_message = f"Resuming: {len(missing)}/{len(expected)} expected outputs missing."
+            if verbose:
+                print(
+                    f"[preprocess_single_brain_mri] Found existing outputs but missing {len(missing)}/{len(expected)} "
+                    "expected file(s); will resume."
+                )
+                # Keep output readable; show a small sample.
+                for p in missing[:15]:
+                    print("  missing:", p)
+                if len(missing) > 15:
+                    print(f"  ... and {len(missing) - 15} more missing outputs.")
+        else:
+            run_status = "RAN"
+            run_message = f"Running fresh: {len(expected)} expected outputs."
+
+# Normalize to strings/paths and validate existence
     for lbl, p in list(scans.items()):
 
         if p is None:
@@ -1615,6 +1787,8 @@ def preprocess_single_brain_mri(
                 debug=False,
                 verbose=verbose,
             )
+    # If we reach here without raising, the run completed.
+    return run_status, run_message
 
 
 def main():
@@ -1631,6 +1805,8 @@ def main():
     )
 
     parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--overwrite", action="store_true", help="Re-run even if all expected outputs already exist.")
+
     parser.add_argument(
         "--scan_dir",
         default=None,
@@ -1839,7 +2015,7 @@ def main():
         except Exception as e:
             raise SystemExit(f"Failed to parse --family_parent_map: {e}")
 
-    preprocess_single_brain_mri(
+    status, msg = preprocess_single_brain_mri(
         output_dir=args.output,
         scans=scans if scans else None,
         modalities=modalities,
@@ -1865,7 +2041,11 @@ def main():
         brainmask_path=args.brainmask,
         family_parent_map=family_parent_map,
         verbose=not args.quiet,
+        overwrite=bool(args.overwrite),
     )
+    if not args.quiet:
+        print(f"[preprocess_single_brain_mri] Status: {status} | {msg}")
+
 
 
 if __name__ == "__main__":
