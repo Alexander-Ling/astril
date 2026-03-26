@@ -1610,7 +1610,10 @@ def preprocess_single_brain_mri(
         the parent scan, it falls back to individual transform estimation.
         Family is inferred as the label prefix before the first underscore (e.g. "DWI_TRACE" -> "DWI").
     debug : bool, default=False
-        If True, keep intermediate files in the temp workspace.
+        If True, keep intermediate files in an output-local temp workspace.
+        Even when debug is False, the temporary workspace is created under
+        `output_dir` rather than the system temp directory so large intermediate
+        files use the same destination volume as the final outputs.
     verbose : bool, default=True
         If True, print progress messages.
     """
@@ -1729,7 +1732,8 @@ def preprocess_single_brain_mri(
             raise FileNotFoundError(f"Scan not found for label '{lbl}': {scans[lbl]}")
 
     if debug:
-        # Debug mode keeps temp dir for inspection
+        # Keep debug workspaces inside output_dir so large intermediate files land on
+        # the same volume the user selected for outputs rather than the system temp dir.
         temp_dir = os.path.join(output_dir, "temp_preprocessing")
         os.makedirs(temp_dir, exist_ok=True)
         print(f"[Debug] Retaining temporary directory: {temp_dir}")
@@ -1760,7 +1764,10 @@ def preprocess_single_brain_mri(
             verbose=verbose,
         )
     else:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Use an output-local temp workspace so large intermediates are written to
+        # the destination volume the user chose, avoiding failures from a full
+        # system temp directory on a different drive.
+        with tempfile.TemporaryDirectory(dir=output_dir, prefix=".astril_tmp_") as temp_dir:
             run_preprocessing_pipeline(
                 scans=scans,
                 output_dir=output_dir,

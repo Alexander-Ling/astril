@@ -1309,12 +1309,19 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
        'te','tr','ti','flip_angle','b_value','primary_secondary','is_derived','is_fspgr',
        'base_type','final_label','is_postcontrast','is_flair','reason','confidence']
     """
-    mr_dir = os.path.join(exam_dir, mr_subdir)
+    if mr_subdir in (None, "", "."):
+        # Support institutions that store series directly beneath the exam folder
+        # rather than under an intermediate radiology-type folder such as "MR".
+        mr_dir = exam_dir
+    else:
+        mr_dir = os.path.join(exam_dir, mr_subdir)
     if not os.path.isdir(mr_dir):
-        raise FileNotFoundError(f"MR folder not found: {mr_dir}")
+        raise FileNotFoundError(f"Series parent folder not found: {mr_dir}")
 
     rows = []
-    # 1) Read minimal metadata for EVERY series (1 file per series)
+    # IMPORTANT: Keep this as a shallow directory listing. Each immediate child of the
+    # chosen series parent is treated as one candidate series root. This supports both
+    # Exam/MR/Series/... and Exam/Series/... layouts without scanning the entire tree.
     for series_root in sorted([os.path.join(mr_dir, d) for d in os.listdir(mr_dir) if os.path.isdir(os.path.join(mr_dir, d))]):
         series_folder = series_root
         dicom_dir = _resolve_dicom_series_dir(series_folder)

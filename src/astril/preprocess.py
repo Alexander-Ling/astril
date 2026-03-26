@@ -3313,38 +3313,104 @@ def plan_dicom_to_nifti_conversion(
         try: return int(x)
         except Exception: return default
 
-    def _discover_exams(patient_abs: str) -> list[tuple[str, str]]:
-        """Return de-duplicated (exam_dir_abs, mr_subdir_name) based on .dcm leaves.
+    def _discover_exams(patient_abs: str) -> list[tuple[str, str | None]]:
+        """Return de-duplicated (exam_dir_abs, mr_subdir_name) for supported layouts.
 
-        Enforced expected layout under patient_abs:
-          {patient_abs}/{Exam}/{RadiologyType}/{Series}/.../*.dcm
+        Supported layouts under ``patient_abs``:
+          1) {patient_abs}/{Exam}/{RadiologyType}/{Series}/.../*.dcm
+          2) {patient_abs}/{Exam}/{Series}/.../*.dcm
 
-        We infer:
-          - exam_dir_abs = {patient_abs}/{Exam}
-          - mr_subdir_name = {RadiologyType}
+        For layout (1), ``mr_subdir_name`` is the radiology-type folder (for example
+        ``MR``). For layout (2), ``mr_subdir_name`` is ``None`` so all series directly
+       beneath the exam are grouped into a single ExamAlias.
 
-        If a .dcm leaf is found but it does not have at least two path components
-        beneath patient_abs (Exam/RadiologyType), it is ignored.
+        Notes
+        -----
+        We intentionally detect layout from the *immediate* children of each exam
+        directory rather than inferring it from every DICOM leaf path. This prevents
+        a direct-series layout like ``Exam/T1n/DICOM/*.dcm`` from being misread as
+        ``Exam/{RadiologyType}/{Series}``, which would incorrectly split each series
+        into its own ExamAlias.
         """
         patient_abs = os.path.normpath(os.path.abspath(patient_abs))
-        seen = set()
 
-        patient_abs = os.path.normpath(patient_abs)
+        def _subtree_has_dicom(folder: str, max_depth: int = 6) -> bool:
+            """Return True if ``folder`` or a shallow descendant contains any .dcm file."""
+            try:
+                folder = os.path.normpath(folder)
+                base_depth = folder.count(os.sep)
+                for curr, dirs, files in os.walk(folder):
+                    if any(f.lower().endswith('.dcm') for f in files):
+                        return True
+                    depth = curr.count(os.sep) - base_depth
+                    if depth >= max_depth:
+                        dirs[:] = []
+                return False
+            except Exception:
+                return False
 
-        for curr, _dirs, files in os.walk(patient_abs):
-            if not any(f.lower().endswith(".dcm") for f in files):
+        def _count_series_like_children(folder: str) -> int:
+            """Count immediate child directories whose subtree contains DICOM files."""
+            try:
+                names = sorted(os.listdir(folder))
+            except Exception:
+                return 0
+            n = 0
+            for name in names:
+                child = os.path.join(folder, name)
+                if os.path.isdir(child) and _subtree_has_dicom(child):
+                    n += 1
+            return n
+
+        # Common radiology/modality container names seen in DICOM exports.
+        known_radiology_names = {
+            'mr', 'mri', 'ct', 'pt', 'pet', 'nm', 'us', 'xa', 'mg', 'cr', 'dx'
+        }
+
+        seen: set[tuple[str, str | None]] = set()
+        try:
+            exam_names = sorted(os.listdir(patient_abs))
+        except Exception:
+            return []
+
+        for exam_name in exam_names:
+            exam_dir = os.path.normpath(os.path.join(patient_abs, exam_name))
+            if not os.path.isdir(exam_dir):
                 continue
             try:
-                rel = os.path.relpath(curr, patient_abs)
+                child_names = sorted(os.listdir(exam_dir))
             except Exception:
                 continue
-            parts = [p for p in rel.split(os.sep) if p not in ("", ".")]
-            if len(parts) < 2:
-                # Not enough depth to contain Exam/RadiologyType
-                continue
-            exam_dir = os.path.normpath(os.path.join(patient_abs, parts[0]))
-            mr_name = parts[1]
-            seen.add((exam_dir, mr_name))
+
+            radiology_children: list[str] = []
+            has_direct_series = False
+
+            for child_name in child_names:
+                child_dir = os.path.join(exam_dir, child_name)
+                if not os.path.isdir(child_dir):
+                    continue
+                if not _subtree_has_dicom(child_dir):
+                    continue
+
+                n_series_children = _count_series_like_children(child_dir)
+                child_key = str(child_name).strip().lower()
+
+                # Treat folders like MR/CT/PET as explicit radiology containers even if
+                # they currently hold only one series. Also treat folders with multiple
+                # series-like children as radiology containers.
+                if child_key in known_radiology_names or n_series_children >= 2:
+                    radiology_children.append(child_name)
+                else:
+                    # Use the direct-series path when the exam contains series folders
+                    # directly (for example Exam/T1n/*.dcm or Exam/T1n/DICOM/*.dcm).
+                    has_direct_series = True
+
+            if radiology_children:
+                for mr_name in sorted(set(radiology_children)):
+                    seen.add((exam_dir, mr_name))
+            elif has_direct_series:
+                seen.add((exam_dir, None))
+
         return sorted(seen)
 
     # Classifier columns (stable) + our metadata columns.
