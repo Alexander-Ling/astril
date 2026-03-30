@@ -747,6 +747,21 @@ def _name_tokens(text):
 def _is_after(a, b):
     return (a is not None and b is not None and a > b)
 
+def _clean_str_field(v):
+    """Normalize optional metadata fields so pandas NaN does not behave like a real value."""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
+
+def _has_isolated_token(text: str, token: str) -> bool:
+    """Match token only when isolated by whitespace or punctuation, not inside longer words."""
+    s = str(text or "")
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", s, flags=re.IGNORECASE) is not None
+
 def _detect_fspgr(name_tokens, seq, prot):
     s = " ".join([name_tokens, str(seq or "").lower(), str(prot or "").lower()])
     flags = ["fspgr", "spgr", "bravo", "mprage", "mp rage", "vibe", "spoiled", "t1 cube", "t1cube", "tfl3d", "tfl"]
@@ -1453,6 +1468,12 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
         name_combo = _norm_text(series_desc, protocol_name, sequence_name)
         tokens = _name_tokens(name_combo)
+        # IMPORTANT: keep a second token stream that excludes ProtocolName for
+        # contrast timing/cue inference. Protocol names often describe the full
+        # exam (e.g., "with contrast" / "gad") and can therefore contaminate
+        # both pre- and post-contrast series.
+        contrast_name_combo = _norm_text(series_desc, sequence_name)
+        contrast_tokens = _name_tokens(contrast_name_combo)
 
         # Vendor hints + robust B-value parsing
         vh = _vendor_hints(ds)
@@ -1496,7 +1517,8 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             contrast_agent      = vh.get("contrast_agent"),
             contrast_volume     = vh.get("contrast_volume"),
             acquisition_contrast= vh.get("acquisition_contrast"),
-            _tokens=tokens
+            _tokens=tokens,
+            _contrast_tokens=contrast_tokens,
         ))
 
     if not rows:
@@ -1505,13 +1527,23 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
     df = pd.DataFrame(rows)
 
     # 2) Compute exam-level context ONCE (e.g., inferred contrast time & non-contrast flag)
+    def _has_isolated_token(tok: str, token: str) -> bool:
+        if not tok or not token:
+            return False
+        return re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", tok, flags=re.IGNORECASE) is not None
+
     def _looks_noncontrast(tok: str) -> bool:
-        # conservative but inclusive: capture common "no contrast" and "pre-contrast" phrasing
-        return any(k in tok for k in [
-            "w/o contrast","wo contrast","without contrast","no contrast",
-            "non-contrast","noncontrast","precontrast","pre contrast","pre-contrast",
-            "without gad","no gad","no gado"
-        ])
+        # Conservative but inclusive: capture common "no contrast" and
+        # pre-contrast phrasing. Bare "pre" must be isolated by punctuation or
+        # whitespace so we do not match longer words incidentally.
+        return (
+            any(k in tok for k in [
+                "w/o contrast","wo contrast","without contrast","no contrast",
+                "non-contrast","noncontrast","precontrast","pre contrast","pre-contrast",
+                "without gad","no gad","no gado"
+            ])
+            or _has_isolated_token(tok, "pre")
+        )
 
     # Build an exam-level non-contrast hint from Study/Procedure descriptions
     exam_noncontrast = False
@@ -1528,19 +1560,38 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
     # Perfusion or explicit post-contrast cues are our best proxy.
     def _looks_perfusion(tok):
         return any(k in tok for k in ["perfusion","pwi","dsc","dce","asl","pcasl"])
-    # Ignore generic "with contrast" tokens when the exam is explicitly non-contrast
-    _allow_generic_with = not exam_noncontrast
+
     def _looks_post(tok):
-        base = any(k in tok for k in ["post","c+","gad","gadolinium","t1c"])
-        if _allow_generic_with:
-            base = base or any(k in tok for k in ["with contrast","w/ contrast"])
-        return base
+        # IMPORTANT: do not use generic "with contrast" / "gad" hits from
+        # ProtocolName for timing inference. Callers should pass cue tokens that
+        # exclude ProtocolName when deciding whether a series is explicitly post.
+        # Also use isolated-token detection for short GD/GADO abbreviations so
+        # strings like "+GD", "GD+", "T1_GD", or "T1-GADO" are recognized
+        # without matching unrelated longer words incidentally.
+        return (
+            _has_isolated_token(tok, "post")
+            or any(k in tok for k in ["c+","gadolinium","t1c"])
+            or _has_isolated_token(tok, "gad")
+            or _has_isolated_token(tok, "gd")
+            or _has_isolated_token(tok, "+gd")
+            or _has_isolated_token(tok, "gado")
+            or _has_isolated_token(tok, "gad+")
+        )
+
     def _looks_t1(tok):
         return ("t1" in tok) or ("mprage" in tok) or ("bravo" in tok) or ("spgr" in tok) or ("vibe" in tok)
-    # earliest perfusion OR earliest explicit post-contrast cue OR earliest T1 with post-y tokens
-    perf_times = [r["acq_dt"] for r in rows if r["acq_dt"] and _looks_perfusion(r["_tokens"])]
-    explicit_post_times = [r["acq_dt"] for r in rows if r["acq_dt"] and _looks_post(r["_tokens"])]
-    # (Optional) consider earliest 'T1c' guess—but we're single-pass; keep signal minimal here.
+
+    # earliest perfusion OR earliest explicit post-contrast cue. Use cue tokens
+    # that exclude ProtocolName so exam/protocol labels do not force a false
+    # contrast anchor for otherwise pre-contrast series.
+    perf_times = [
+        r["acq_dt"] for r in rows
+        if r["acq_dt"] and _looks_perfusion(r.get("_contrast_tokens", r["_tokens"]))
+    ]
+    explicit_post_times = [
+        r["acq_dt"] for r in rows
+        if r["acq_dt"] and _looks_post(r.get("_contrast_tokens", r["_tokens"]))
+    ]
     inferred_contrast_time = None
     for pool in [perf_times, explicit_post_times]:
         if pool:
@@ -1567,8 +1618,14 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         acq_dt = r["acq_dt"]
 
         # vendor/context fields
-        contrast_agent = (r.get("contrast_agent") or "") or ""
-        acquisition_contrast = (r.get("acquisition_contrast") or "") or ""
+        contrast_agent = r.get("contrast_agent")
+        acquisition_contrast = r.get("acquisition_contrast")
+        if pd.isna(contrast_agent):
+            contrast_agent = ""
+        if pd.isna(acquisition_contrast):
+            acquisition_contrast = ""
+        contrast_agent = str(contrast_agent)
+        acquisition_contrast = str(acquisition_contrast)
         b_value = r.get("b_value", None)
 
         reason = []
@@ -1665,7 +1722,10 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             conf = 0.85 if dcat is None else 0.9
 
         # --- FLAIR ---
-        elif "flair" in t:
+        # Keep mixed T1+FLAIR names in the T1 family. Some vendors use names
+        # like "T1 Flair Cube" for inversion-prepared 3D T1 acquisitions, and
+        # we do not want FLAIR tokens to absorb those series into T2f.
+        elif "flair" in t and (not _looks_t1(t)):
             base = "T2f"
             label = "T2f"
             is_flair = True
@@ -1699,11 +1759,14 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
             elif ("t1" in t) or any(k in t for k in ["mprage","bravo","spgr","vibe"]):
                 base = "T1"
-                # decide pre/post from explicit vendor/contrast cues or timing
-                post_hint = _looks_post(t)
-                noncontrast_hint = _looks_noncontrast(t)
-                vendor_post = bool(contrast_agent) or ("CONTRAST" in str(acquisition_contrast).upper())
-                # explicit non-contrast on the series overrides generic post tokens
+                # decide pre/post from explicit vendor/contrast cues or timing.
+                # Use cue tokens that exclude ProtocolName so protocol-level exam
+                # labels do not flip clearly pre-contrast series.
+                cue_t = r.get("_contrast_tokens", t)
+                post_hint = _looks_post(cue_t)
+                noncontrast_hint = _looks_noncontrast(cue_t)
+                vendor_post = bool(contrast_agent.strip()) or ("CONTRAST" in acquisition_contrast.upper())
+                # explicit non-contrast on the series overrides post/timing cues
                 if noncontrast_hint:
                     is_post = False
                     reason.append("explicit non-contrast tokens")
@@ -1726,6 +1789,8 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
                 if r["is_fspgr"]:
                     reason.append("FSPGR-like sequence")
                     conf = max(conf, 0.85)
+                if "flair" in t:
+                    reason.append("mixed T1+FLAIR tokens; retained in T1 family")
                 conf = max(conf, 0.8 if is_post else 0.7)
 
             else:
@@ -1766,8 +1831,10 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
                     reason.append("No strong name/physics cues")
                     conf = 0.3
 
-        # Upgrade T1n -> T1c when timing strongly indicates post-contrast
-        if base == "T1" and label.startswith("T1n") and inferred_contrast_time and _is_after(acq_dt, inferred_contrast_time):
+        # Upgrade T1n -> T1c when timing strongly indicates post-contrast,
+        # but never override explicit non-contrast evidence from the series name.
+        explicit_noncontrast_cue = _looks_noncontrast(r.get("_contrast_tokens", t))
+        if base == "T1" and label.startswith("T1n") and (not explicit_noncontrast_cue) and inferred_contrast_time and _is_after(acq_dt, inferred_contrast_time):
             label = label.replace("T1n", "T1c")
             is_post = True
             reason.append("timing upgrade to post-contrast")
@@ -1795,6 +1862,37 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
 
     # Normalize Unknown + derived
     df.loc[df["final_label"].eq("Unknown") & df["is_derived"], "final_label"] = "Unknown-derived"
+
+    # Derived T1 reformats should inherit T1n/T1c from the nearest (in acquisition time) non-derived
+    # T1 parent rather than falling back to generic T1n via physics.
+    try:
+        t1_parent_mask = (
+            (df['base_type'] == 'T1')
+            & (df['is_derived'] == False)
+            & df['final_label'].astype(str).str.match(r'^T1[cn](\(|$)', na=False)
+        )
+        derived_t1_mask = (df['base_type'] == 'T1') & (df['is_derived'] == True)
+        if t1_parent_mask.any() and derived_t1_mask.any():
+            parents = df.loc[t1_parent_mask].copy()
+            for idx, r in df.loc[derived_t1_mask].iterrows():
+                candidates = parents
+                if r.get('acq_dt') is not None and candidates['acq_dt'].notna().any():
+                    candidates = candidates.copy()
+                    candidates['tdiff'] = (candidates['acq_dt'] - r['acq_dt']).abs()
+                    parent = candidates.sort_values(['tdiff', 'series_number'], na_position='last').iloc[0]
+                else:
+                    parent = candidates.sort_values(['series_number'], na_position='last').iloc[0]
+                parent_label = str(parent.get('final_label') or '')
+                inherited_core = 'T1c' if parent_label.startswith('T1c') else ('T1n' if parent_label.startswith('T1n') else '')
+                if inherited_core:
+                    dcat = _t1_derived_category(str(r.get('_tokens') or ''), set())
+                    df.at[idx, 'final_label'] = inherited_core if dcat is None else f"{inherited_core}({dcat})"
+                    df.at[idx, 'is_postcontrast'] = (inherited_core == 'T1c')
+                    prior_reason = str(df.at[idx, 'reason'] or '')
+                    inherited_msg = f"inherited {inherited_core} from nearest non-derived T1 parent"
+                    df.at[idx, 'reason'] = f"{prior_reason}; {inherited_msg}" if prior_reason else inherited_msg
+    except Exception:
+        pass
 
     # Pretty fields for quick sorting/reading
     df["matrix"] = df.apply(lambda r: f"{_safe_int(r.cols_px) or '?'}x{_safe_int(r.rows_px) or '?'}", axis=1)
