@@ -4624,7 +4624,7 @@ def convert_dicom_plan(
                         else:
                             stem = os.path.splitext(out_path)[0]
                         nrrd_path = stem + ".nrrd"
-                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False, debug=debug)
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
                 except Exception as e:
                     rec["nrrd_path"] = ""
                     rec["nrrd_error"] = f"{type(e).__name__}: {e}"
@@ -4734,7 +4734,7 @@ def convert_dicom_plan(
                         from .preprocessing_utils import export_dwi_nrrd_from_dicoms
                         stem = out_path[:-7] if out_path.lower().endswith(".nii.gz") else os.path.splitext(out_path)[0]
                         nrrd_path = stem + ".nrrd"
-                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False, debug=debug)
+                        rec["nrrd_path"] = export_dwi_nrrd_from_dicoms(series_dir, nrrd_path, verbose=False)
                 except Exception as e:
                     rec["nrrd_path"] = ""
                     rec["nrrd_error"] = f"{type(e).__name__}: {e}"

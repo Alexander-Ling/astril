@@ -2526,7 +2526,7 @@ def export_dwi_nrrd_from_dicoms(
     dicom_series_dir: str,
     output_nrrd_path: str,
     *,
-    verbose: Optional[bool] = None,
+    verbose: Optional[bool] = None
 ) -> str:
     """Export a diffusion NRRD (with embedded gradients) using dcm2niix.
 
