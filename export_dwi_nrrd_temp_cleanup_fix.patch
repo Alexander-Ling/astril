@@ -1,0 +1,79 @@
+--- a/src/astril/preprocessing_utils.py
++++ b/src/astril/preprocessing_utils.py
+@@ -2550,13 +2550,16 @@ def export_dwi_nrrd_from_dicoms(
+             break
+ 
+     tmpdirs_to_cleanup: list[str] = []
++    temp_root = os.path.join(out_dir, "temp")
++    os.makedirs(temp_root, exist_ok=True)
++    tmpdirs_to_cleanup.append(temp_root)
+ 
+     def _mk_tmp(prefix: str) -> str:
+-        # Keep all retry/temp work under the requested output directory so users
+-        # do not unexpectedly write to a system temp location with different
+-        # permissions or limited space.
+-        d = tempfile.mkdtemp(prefix=prefix, dir=out_dir)
+-        tmpdirs_to_cleanup.append(d)
++        # Keep all retry/temp work under a dedicated temp directory inside the
++        # requested output directory so users do not unexpectedly write to a
++        # system temp location with different permissions or limited space.
++        d = tempfile.mkdtemp(prefix=prefix, dir=temp_root)
+         return d
+ 
+     def _short_output(proc: subprocess.CompletedProcess, limit: int = 400) -> str:
+@@ -2596,13 +2599,10 @@ def export_dwi_nrrd_from_dicoms(
+             decoded = _transcode_dicom_dir_to_explicit_le(
+                 dicom_series_dir,
+                 verbose=verbose,
+-                temp_root_dir=out_dir,
++                temp_root_dir=temp_root,
+             )
+             if decoded:
+-                if decoded not in tmpdirs_to_cleanup:
+-                    tmpdirs_to_cleanup.append(decoded)
+                 tmpdir_retry = _mk_tmp(prefix="dwi_nrrd_retry_")
+                 cmd_retry = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir_retry, decoded]
+                 _dbg(verbose, "[export_dwi_nrrd] retry:", " ".join(cmd_retry))
+                 proc_retry = subprocess.run(cmd_retry, capture_output=True, text=True)
+@@ -2624,27 +2624,21 @@ def export_dwi_nrrd_from_dicoms(
+ 
+         # Move the header/data pair if needed
+         if produced.lower().endswith(".nhdr"):
+-            # Move header and associated data file(s)
++            # Move the header and only the associated output payload files from
++            # the dcm2niix output directory. Do not move decoded retry DICOMs.
+             dest_hdr = output_nrrd_path if output_nrrd_path.lower().endswith(".nhdr") else (os.path.splitext(output_nrrd_path)[0] + ".nhdr")
++            produced_dir = os.path.dirname(produced)
+             shutil.move(produced, dest_hdr)
+-            for d in list(tmpdirs_to_cleanup):
+-                if not os.path.isdir(d):
++            for p in glob.glob(os.path.join(produced_dir, "*")):
++                if os.path.abspath(p) == os.path.abspath(produced):
+                     continue
+-                for p in glob.glob(os.path.join(d, "*")):
+-                    if os.path.abspath(p) == os.path.abspath(produced):
+-                        continue
+-                    shutil.move(p, os.path.join(os.path.dirname(dest_hdr), os.path.basename(p)))
++                if os.path.isdir(p):
++                    continue
++                if os.path.splitext(p)[1].lower() == ".dcm":
++                    continue
++                dstp = os.path.join(os.path.dirname(dest_hdr), os.path.basename(p))
++                if not os.path.exists(dstp):
++                    shutil.move(p, dstp)
+             return dest_hdr
+         else:
+             dest = output_nrrd_path if output_nrrd_path.lower().endswith(".nrrd") else (os.path.splitext(output_nrrd_path)[0] + ".nrrd")
+             shutil.move(produced, dest)
+-            for d in list(tmpdirs_to_cleanup):
+-                if not os.path.isdir(d):
+-                    continue
+-                for p in glob.glob(os.path.join(d, "*")):
+-                    if os.path.abspath(p) == os.path.abspath(produced):
+-                        continue
+-                    dstp = os.path.join(os.path.dirname(dest), os.path.basename(p))
+-                    if not os.path.exists(dstp):
+-                        shutil.move(p, dstp)
+             return dest
+     finally:
+         for d in reversed(tmpdirs_to_cleanup):

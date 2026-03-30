@@ -2254,12 +2254,15 @@ def _log_nifti_shape(nifti_path: str, orig_path: str | None, verbose=None):
 def _which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
-def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None) -> str | None:
+def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None, temp_root_dir: str | None = None) -> str | None:
     """Return path to a temp dir with decoded DICOMs (Explicit VR Little Endian), or None if no tool is available."""
     src = Path(src_dir)
     if not src.is_dir():
         return None
-    dst = Path(tempfile.mkdtemp(prefix="decoded_"))
+    mkdtemp_kwargs = {"prefix": "decoded_"}
+    if temp_root_dir:
+        mkdtemp_kwargs["dir"] = temp_root_dir
+    dst = Path(tempfile.mkdtemp(**mkdtemp_kwargs))
     use_gdcm = _which("gdcmconv")
     use_dcmd = _which("dcmdjpeg")
     if not (use_gdcm or use_dcmd):
@@ -2547,16 +2550,23 @@ def export_dwi_nrrd_from_dicoms(
             base = base[: -len(ext)]
             break
 
-    # Write into a temp dir first (avoid clobbering / partial outputs on failure)
-    tmpdir = tempfile.mkdtemp(prefix="dwi_nrrd_", dir=out_dir)
-    try:
-        cmd = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir, dicom_series_dir]
-        _dbg(verbose, "[export_dwi_nrrd] running:", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip()
-            raise RuntimeError(f"dcm2niix NRRD export failed:\n{err[:400]}")
-        # dcm2niix may emit .nrrd or .nhdr (with separate .raw.gz/.raw)
+    tmpdirs_to_cleanup: list[str] = []
+    temp_root = os.path.join(out_dir, "temp")
+    os.makedirs(temp_root, exist_ok=True)
+    tmpdirs_to_cleanup.append(temp_root)
+
+    def _mk_tmp(prefix: str) -> str:
+        # Keep all retry/temp work under a dedicated temp directory inside the
+        # requested output directory so users do not unexpectedly write to a
+        # system temp location with different permissions or limited space.
+        d = tempfile.mkdtemp(prefix=prefix, dir=temp_root)
+        return d
+
+    def _short_output(proc: subprocess.CompletedProcess, limit: int = 400) -> str:
+        txt = ((proc.stderr or "") + ("" if proc.stderr and proc.stdout else "") + (proc.stdout or "")).strip()
+        return txt[:limit]
+
+    def _find_nrrd_output(tmpdir: str) -> str:
         candidates = (
             glob.glob(os.path.join(tmpdir, base + ".nrrd")) +
             glob.glob(os.path.join(tmpdir, base + ".nhdr")) +
@@ -2565,34 +2575,81 @@ def export_dwi_nrrd_from_dicoms(
         )
         if not candidates:
             raise RuntimeError("dcm2niix NRRD export produced no .nrrd/.nhdr output")
-        produced = candidates[0]
+        return candidates[0]
+
+
+    produced = None
+    initial_err = None
+    retry_err = None
+
+    try:
+        tmpdir = _mk_tmp(prefix="dwi_nrrd_")
+        cmd = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir, dicom_series_dir]
+        _dbg(verbose, "[export_dwi_nrrd] running:", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        _dbg(verbose, f"[export_dwi_nrrd] dcm2niix returncode={proc.returncode}")
+
+        if proc.returncode == 0:
+            produced = _find_nrrd_output(tmpdir)
+        else:
+            initial_err = _short_output(proc)
+            _dbg(verbose, f"[export_dwi_nrrd] initial export failed: {initial_err}")
+            _dbg(verbose, "[export_dwi_nrrd] attempting JPEG-lossless transcode and retry.")
+            decoded = _transcode_dicom_dir_to_explicit_le(
+                dicom_series_dir,
+                verbose=verbose,
+                temp_root_dir=temp_root,
+            )
+            if decoded:
+                tmpdir_retry = _mk_tmp(prefix="dwi_nrrd_retry_")
+                cmd_retry = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir_retry, decoded]
+                _dbg(verbose, "[export_dwi_nrrd] retry:", " ".join(cmd_retry))
+                proc_retry = subprocess.run(cmd_retry, capture_output=True, text=True)
+                _dbg(verbose, f"[export_dwi_nrrd] retry returncode={proc_retry.returncode}")
+                if proc_retry.returncode == 0:
+                    produced = _find_nrrd_output(tmpdir_retry)
+                else:
+                    retry_err = _short_output(proc_retry)
+                    _dbg(verbose, f"[export_dwi_nrrd] retry failed: {retry_err}")
+            else:
+                _dbg(verbose, "[export_dwi_nrrd] transcode step unavailable or produced no decoded directory.")
+
+        if produced is None:
+            msg = "dcm2niix NRRD export failed"
+            if initial_err:
+                msg += f":Initial attempt: {initial_err}"
+            if retry_err:
+                msg += f"Retry after transcode: {retry_err}"
+            raise RuntimeError(msg)
 
         # Move the header/data pair if needed
         if produced.lower().endswith(".nhdr"):
-            # Move header and associated data file(s)
+            # Move the header and only the associated output payload files from
+            # the dcm2niix output directory. Do not move decoded retry DICOMs.
             dest_hdr = output_nrrd_path if output_nrrd_path.lower().endswith(".nhdr") else (os.path.splitext(output_nrrd_path)[0] + ".nhdr")
+            produced_dir = os.path.dirname(produced)
             shutil.move(produced, dest_hdr)
-            for p in glob.glob(os.path.join(tmpdir, "*")):
+            for p in glob.glob(os.path.join(produced_dir, "*")):
                 if os.path.abspath(p) == os.path.abspath(produced):
                     continue
-                shutil.move(p, os.path.join(os.path.dirname(dest_hdr), os.path.basename(p)))
+                if os.path.isdir(p):
+                    continue
+                if os.path.splitext(p)[1].lower() == ".dcm":
+                    continue
+                dstp = os.path.join(os.path.dirname(dest_hdr), os.path.basename(p))
+                if not os.path.exists(dstp):
+                    shutil.move(p, dstp)
             return dest_hdr
         else:
             dest = output_nrrd_path if output_nrrd_path.lower().endswith(".nrrd") else (os.path.splitext(output_nrrd_path)[0] + ".nrrd")
             shutil.move(produced, dest)
-            for p in glob.glob(os.path.join(tmpdir, "*")):
-                if os.path.abspath(p) == os.path.abspath(produced):
-                    continue
-                dstp = os.path.join(os.path.dirname(dest), os.path.basename(p))
-                if not os.path.exists(dstp):
-                    shutil.move(p, dstp)
             return dest
     finally:
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-
+        for d in reversed(tmpdirs_to_cleanup):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
 def _fsl_sidecar_paths(nifti_path: str) -> tuple[str, str]:
     """Return (.bval_path, .bvec_path) for a NIfTI path."""
