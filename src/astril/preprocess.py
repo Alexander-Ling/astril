@@ -1037,7 +1037,7 @@ def register_images(
                 print(f"[register_images] Using recorded interpolation from sidecar: {interp_spec!r}")
     
     # If saving integer labelmaps (e.g., segmentations), enforce nearest-neighbor
-    if integer and interp_spec not in ("nearest", 0):
+    if integer and interp_spec not in ("nearest", 0, "0"):
         print(f"[WARNING] You are registering images with {interp_spec!r} interpolation but saving integer volumes. This is probably wrong. For integer volumes, you should use 'nearest' interpolation.")
 
     sitk_interp, sitk_interp_name, scipy_order = _interp_to_sitk_interpolator(interp_spec)
