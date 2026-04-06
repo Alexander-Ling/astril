@@ -395,6 +395,7 @@ def preprocess_library(
     modalities: list[str] | None = None,
     anchor_label: str = "T1c",
     registration_metric: str = "mi",
+    anchor_to_coreg_metric: str = None,
     interp=3,
     registration_strategy: str = "medium",
     registration_voxel_mm: str = "2,2,2",
@@ -861,7 +862,7 @@ def preprocess_library(
             "CoregisterRefUsed",
             "PatientBrainmaskUsed",
             "anchor_label", "modalities",
-            "registration_metric", "registration_strategy", "registration_voxel_mm", "interp",
+            "registration_metric", "anchor_to_coreg_metric", "registration_strategy", "registration_voxel_mm", "interp",
             "final_dims", "final_voxels",
             "save_scans_with_skulls", "use_gpu", "enable_tta", "debug",
         ])
@@ -921,6 +922,7 @@ def preprocess_library(
                 modalities=modalities,
                 anchor_label=anchor_label,
                 registration_metric=registration_metric,
+                anchor_to_coreg_metric=anchor_to_coreg_metric,
                 interp=interp,
                 registration_strategy=registration_strategy,
                 registration_voxel_mm=registration_voxel_mm,
@@ -1030,7 +1032,7 @@ def preprocess_library(
             str(coreg_ref or "NONE") if not dont_coregister else "NONE",
             str(patient_mask or "NONE") if reuse_patient_brainmask else "DISABLED",
             anchor_label, ",".join(modalities) if modalities else "AUTO",
-            registration_metric, registration_strategy, registration_voxel_mm, interp,
+            registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
             final_dims, final_voxels,
             save_scans_with_skulls, use_gpu, enable_tta, debug,
         ])
@@ -1055,7 +1057,7 @@ def preprocess_library(
                         str(patient_ref.get(patient) or "NONE") if not dont_coregister else "NONE",
                         str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
                         anchor_label, ",".join(modalities) if modalities else "AUTO",
-                        registration_metric, registration_strategy, registration_voxel_mm, interp,
+                        registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
                         final_dims, final_voxels,
                         save_scans_with_skulls, use_gpu, enable_tta, debug,
                     ])
@@ -1074,7 +1076,7 @@ def preprocess_library(
                     str(patient_ref.get(patient) or "NONE") if not dont_coregister else "NONE",
                     str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
                     anchor_label, ",".join(modalities) if modalities else "AUTO",
-                    registration_metric, registration_strategy, registration_voxel_mm, interp,
+                    registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
                     final_dims, final_voxels,
                     save_scans_with_skulls, use_gpu, enable_tta, debug,
                 ])
@@ -1159,7 +1161,12 @@ def main():
         ),
     )
     p.add_argument("--anchor_label", default="T1c", help="Anchor label for registration/skull stripping (default: T1c).")
-    p.add_argument("--registration_metric", default="mi", help="Registration similarity metric (default: mi).")
+    p.add_argument("--registration_metric", default="mi", help="Registration similarity metric: 'correlation' or 'mi' (mutual information) (default: mi).")
+    p.add_argument(
+        "--anchor_to_coreg_metric",
+        default="correlation",
+        help="Similarity metric used for registration of the anchor volume to the co-registration volume: 'correlation' or 'mi' (mutual information) (default: correlation).",
+    )
     p.add_argument("--interp", type=str, default="3", help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...). Accepts int 0-5 or strings like \'nearest\', \'linear\', \'cubic\'.")
     p.add_argument("--registration_strategy", default="medium", help="Registration preset: accurate|medium|fast (default: medium).")
     p.add_argument("--registration_voxel_mm", default="2,2,2", help="Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
@@ -1212,6 +1219,7 @@ def main():
         modalities=modalities,
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
+        anchor_to_coreg_metric=args.anchor_to_coreg_metric,
         interp=args.interp,
         registration_strategy=args.registration_strategy,
         registration_voxel_mm=args.registration_voxel_mm,

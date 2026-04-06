@@ -204,6 +204,7 @@ def run_preprocessing_pipeline(
     temp_dir,
     anchor_label="T1c",
     registration_metric="mi",
+    anchor_to_coreg_metric=None,
     interp=3,
     co_register_path=None,
     registration_strategy="medium",
@@ -242,6 +243,8 @@ def run_preprocessing_pipeline(
         Anchor must be a 3D NIfTI.
     registration_metric : str, default="mi"
         Similarity metric used for registration (passed to `register_images`), e.g. "mi" or "correlation".
+    anchor_to_coreg_metric : str, default=None
+        Similarity metric used for registration of the anchor volume to the co-registration volume. Defaults to registration_metric if not provided.
     registration_voxel_mm: str, default="2,2,2"
         Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.
     interp : int, default=3
@@ -295,6 +298,10 @@ def run_preprocessing_pipeline(
     verbose : bool, default=True
         If True, print progress messages.
     """
+
+    #Set anchor_to_coreg_metric if not specified
+    if anchor_to_coreg_metric is None:
+        anchor_to_coreg_metric = registration_metric
 
     # Allow multiple output target grids for the final resize step.
     final_dims_list, final_voxels_list = _normalize_final_targets(final_dims, final_voxels)
@@ -468,7 +475,7 @@ def run_preprocessing_pipeline(
             output_path=anchor_coreg,
             transform_path=coreg_tfm,
             apply_only=False,
-            similarity_metric=registration_metric,
+            similarity_metric=anchor_to_coreg_metric,
             interpolation=interp,
             registration_voxel_mm=registration_voxel_mm,
             registration_strategy=registration_strategy,
@@ -830,7 +837,7 @@ def run_preprocessing_pipeline(
                 output_path=anchor_coreg,
                 transform_path=coreg_tfm,
                 apply_only=False,
-                similarity_metric=registration_metric,
+                similarity_metric=anchor_to_coreg_metric,
                 interpolation=interp,
                 registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
@@ -1514,6 +1521,7 @@ def preprocess_single_brain_mri(
     modalities=None,
     anchor_label="T1c",
     registration_metric="mi",
+    anchor_to_coreg_metric=None,
     interp=3,
     co_register_path=None,
     registration_strategy="medium",
@@ -1556,6 +1564,8 @@ def preprocess_single_brain_mri(
         Label in `scans` to use as the reference space for registration and skull stripping.
     registration_metric : str, default="mi"
         Similarity metric used for registration (passed to `register_images`).
+    anchor_to_coreg_metric : str, default=None
+        Similarity metric used for registration of the anchor volume to the co-registration volume. Defaults to registration_metric if not provided.
     interp : int, default=3
         Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...).
     co_register_path : str | Path | None, default=None
@@ -1743,6 +1753,7 @@ def preprocess_single_brain_mri(
             temp_dir=temp_dir,
             anchor_label=anchor_label,
             registration_metric=registration_metric,
+            anchor_to_coreg_metric=anchor_to_coreg_metric,
             interp=interp,
             co_register_path=co_register_path,
             registration_strategy=registration_strategy,
@@ -1776,6 +1787,7 @@ def preprocess_single_brain_mri(
                 registration_metric=registration_metric,
                 interp=interp,
                 registration_strategy=registration_strategy,
+                anchor_to_coreg_metric=anchor_to_coreg_metric,
                 registration_voxel_mm=registration_voxel_mm,
                 co_register_path=co_register_path,
                 n_workers_per_registration_process=n_workers_per_registration_process,
@@ -1883,6 +1895,11 @@ def main():
         "--registration_metric",
         default="mi",
         help="Metric for registration steps: 'correlation' or 'mi' (mutual information) (default: mi).",
+    )
+    parser.add_argument(
+        "--anchor_to_coreg_metric",
+        default=None,
+        help="Similarity metric used for registration of the anchor volume to the co-registration volume. Defaults to registration_metric if not provided.",
     )
     parser.add_argument("--interp", type=str, default="3", help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...). Accepts int 0-5 or strings like \'nearest\', \'linear\', \'cubic\'.")
     parser.add_argument(
@@ -2029,6 +2046,7 @@ def main():
         scan_dir=args.scan_dir,
         anchor_label=args.anchor_label,
         registration_metric=args.registration_metric,
+        anchor_to_coreg_metric=args.anchor_to_coreg_metric,
         interp=args.interp,
         registration_strategy=args.registration_strategy,
         registration_voxel_mm=args.registration_voxel_mm,

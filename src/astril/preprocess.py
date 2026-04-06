@@ -758,6 +758,7 @@ def register_images(
     interpolation="auto",
     integer: bool = False,
     registration_voxel_mm="1,1,1",
+    fine_touch_up: bool = False,
     n_workers: int = None,
     *,
     fixed_frame_index: int = 0,
@@ -864,7 +865,15 @@ def register_images(
         - If you request a spacing finer than both input scans along any axis, that axis is clamped to the
           finest available input spacing and a warning is printed (to avoid unintended upsampling).
         The final resampling to output_path is still done onto the fixed grid at full resolution.
-    
+
+    fine_touch_up : bool, default=False
+        If True, run a native-resolution fine touch-up registration intended for very small residual
+        misalignments after a broader registration has already been performed. This mode disables the
+        translation pre-pass, disables the multiresolution pyramid, uses all voxels for the metric,
+        and ignores registration_voxel_mm / registration_strategy if they conflict with those goals.
+        Non-conflicting user settings such as registration_type, similarity_metric, metric_focus, and
+        interpolation are still respected.
+
     n_workers : int, default = None
         Limits how many CPU threads are used for registration and resampling. Default behavior is to use all available threads.
     fixed_frame_index : int, default=0
@@ -1596,6 +1605,24 @@ def register_images(
         # IMPORTANT: now that moving is effectively 3D, keep these aligned:
         moving_for_reg = moving_img
 
+    # ------------------------------------------------------------------
+    # Fine touch-up mode: native-resolution, all-voxel, no pre-pass, no pyramid
+    # ------------------------------------------------------------------
+    fine_touch_up = bool(fine_touch_up)
+    if fine_touch_up:
+        if apply_only and verbose:
+            print("[register_images] WARNING: --fine_touch_up has no effect together with --apply_only.")
+        if str(registration_strategy).strip().lower() != "medium":
+            print(
+                f"[WARNING] --fine_touch_up ignores --registration_strategy={registration_strategy!r} "
+               "and uses a native-resolution single-level fine optimization instead."
+            )
+        req_spacing_for_warning = _normalize_spacing_mm(registration_voxel_mm)
+        if req_spacing_for_warning is not None:
+            print(
+                f"[WARNING] --fine_touch_up ignores --registration_voxel_mm={registration_voxel_mm!r} "
+                "and always optimizes on the native registration frames."
+            )
 
     # ------------------------------------------------------------------
     # Optional downsampling for transform estimation (registration-time only)
@@ -1606,7 +1633,7 @@ def register_images(
     fixed_reg_img = fixed_for_reg
     moving_reg_img = moving_for_reg
 
-    req_spacing = _normalize_spacing_mm(registration_voxel_mm)
+    req_spacing = None if fine_touch_up else _normalize_spacing_mm(registration_voxel_mm)
     if req_spacing is not None and not apply_only:
         if verbose:
             print(f"Using {req_spacing} mm voxel spacing for registration optimization.")
@@ -1664,6 +1691,8 @@ def register_images(
                 shrink=[8, 4, 2, 1],
                 smooth=[3, 2, 1, 0],
                 mi_bins=50,
+                learning_rate=2.0,
+                min_step=1e-4,
             ),
             "medium": dict(
                 sampling_fraction=0.25,
@@ -1671,6 +1700,8 @@ def register_images(
                 shrink=[4, 2, 1],
                 smooth=[2, 1, 0],
                 mi_bins=50,
+                learning_rate=2.0,
+                min_step=1e-4,
             ),
             "fast": dict(
                 sampling_fraction=0.10,
@@ -1678,11 +1709,27 @@ def register_images(
                 shrink=[4, 2, 1],
                 smooth=[2, 1, 0],
                 mi_bins=32,
+                learning_rate=2.0,
+                min_step=1e-4,
+            ),
+            # Fine touch-up intentionally avoids coarse search behavior.
+            "fine_touch_up": dict(
+                sampling_fraction=1.0,
+                iters=80,
+                shrink=[1],
+                smooth=[0],
+                mi_bins=64,
+                learning_rate=0.20,
+                min_step=1e-5,
             ),
         }
-        if strategy not in presets:
-            raise ValueError("registration_strategy must be one of: 'accurate', 'medium', 'fast'.")
-        p = presets[strategy]
+        if fine_touch_up:
+            p = presets["fine_touch_up"]
+            strategy = "fine_touch_up"
+        else:
+            if strategy not in presets or strategy == "fine_touch_up":
+                raise ValueError("registration_strategy must be one of: 'accurate', 'medium', 'fast'.")
+            p = presets[strategy]
 
         # Transform family
         if registration_type == "rigid":
@@ -1696,130 +1743,134 @@ def register_images(
 
 
         # ------------------------------------------------------------------
-        # Initializer: translation pre-pass ("translation_then_main")
+        # Initializer: translation pre-pass (disabled for fine touch-up mode)
         # ------------------------------------------------------------------
         # Default behavior: do a coarse translation-only registration on heavily
         # downsampled images, then use that translation to initialize the main
         # rigid/affine/translation optimization. This often reduces iterations to
         # convergence and helps avoid poor local minima for high-res volumes.
         prepass_offset = (0.0, 0.0, 0.0)
-        try:
-            fixed_sp = tuple(float(x) for x in fixed_for_reg.GetSpacing())
-            moving_sp = tuple(float(x) for x in moving_for_reg.GetSpacing())
-            req_sp = _normalize_spacing_mm(registration_voxel_mm)
-            # Aim for ~2mm isotropic (or coarser), but never upsample beyond the finest available axis.
-            # If the user already requested a coarser spacing for the main pass, reuse that.
-            prepass_spacing = []
-            for i in range(3):
-                finest_in = min(fixed_sp[i], moving_sp[i])
-                user_req = float(req_sp[i]) if req_sp is not None else 0.0
-                prepass_spacing.append(max(2.0, user_req, finest_in))
-            prepass_spacing = tuple(prepass_spacing)
-
-            fixed_pre = sitk_resample_to_spacing(
-                fixed_for_reg,
-                prepass_spacing,
-                interp="linear",
-                default_value=0.0,
-                pixel_id=sitk.sitkFloat32,
-                n_workers=n_workers,
-            )
-            moving_pre = sitk_resample_to_spacing(
-                moving_for_reg,
-                prepass_spacing,
-                interp="linear",
-                default_value=0.0,
-                pixel_id=sitk.sitkFloat32,
-                n_workers=n_workers,
-            )
-
-            tx_pre = sitk.TranslationTransform(3)
-            reg_pre = sitk.ImageRegistrationMethod()
-            
-            # If requested, zero background voxels for the *metric images* (no hard masks).
-            fixed_pre_use, moving_pre_use = _maybe_background_subtract_images(fixed_pre, moving_pre, stage="prepass")
-            _maybe_set_metric_focus_masks(reg_pre, fixed_pre_use, moving_pre_use, stage="prepass")
-
-            # CenteredTransformInitializer returns a transform with a good initial offset.
-            # Using GEOMETRY (not MOMENTS) is typically more robust across modalities.
+        if not fine_touch_up:
             try:
-                tx_pre_init = sitk.CenteredTransformInitializer(
-                    fixed_pre_use,
-                    moving_pre_use,
-                    sitk.TranslationTransform(3),
-                    sitk.CenteredTransformInitializerFilter.GEOMETRY,
+                fixed_sp = tuple(float(x) for x in fixed_for_reg.GetSpacing())
+                moving_sp = tuple(float(x) for x in moving_for_reg.GetSpacing())
+                req_sp = _normalize_spacing_mm(registration_voxel_mm)
+                # Aim for ~2mm isotropic (or coarser), but never upsample beyond the finest available axis.
+                # If the user already requested a coarser spacing for the main pass, reuse that.
+                prepass_spacing = []
+                for i in range(3):
+                    finest_in = min(fixed_sp[i], moving_sp[i])
+                    user_req = float(req_sp[i]) if req_sp is not None else 0.0
+                    prepass_spacing.append(max(2.0, user_req, finest_in))
+                prepass_spacing = tuple(prepass_spacing)
+
+                fixed_pre = sitk_resample_to_spacing(
+                    fixed_for_reg,
+                    prepass_spacing,
+                    interp="linear",
+                    default_value=0.0,
+                    pixel_id=sitk.sitkFloat32,
+                    n_workers=n_workers,
                 )
-            except Exception:
-                tx_pre_init = sitk.TranslationTransform(3)
-            reg_pre.SetInitialTransform(tx_pre_init, inPlace=False)
+                moving_pre = sitk_resample_to_spacing(
+                    moving_for_reg,
+                    prepass_spacing,
+                    interp="linear",
+                    default_value=0.0,
+                    pixel_id=sitk.sitkFloat32,
+                    n_workers=n_workers,
+                )
 
-            set_sitk_object_threads(reg_pre, n_workers)
+                tx_pre = sitk.TranslationTransform(3)
+                reg_pre = sitk.ImageRegistrationMethod()
+            
+                # If requested, zero background voxels for the *metric images* (no hard masks).
+                fixed_pre_use, moving_pre_use = _maybe_background_subtract_images(fixed_pre, moving_pre, stage="prepass")
+                _maybe_set_metric_focus_masks(reg_pre, fixed_pre_use, moving_pre_use, stage="prepass")
 
-            # Metric (keep user's choice, but keep it light)
-            if similarity_metric == "correlation":
-                reg_pre.SetMetricAsCorrelation()
-            else:
-                reg_pre.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
-
-            reg_pre.SetShrinkFactorsPerLevel([4, 2, 1])
-            reg_pre.SetSmoothingSigmasPerLevel([2, 1, 0])
-            reg_pre.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-            # Always sample stochastically for speed
-            reg_pre.SetMetricSamplingStrategy(reg_pre.RANDOM)
-            if metric_sampling_seed is None:
-                reg_pre.SetMetricSamplingPercentage(0.10)
-            else:
-                reg_pre.SetMetricSamplingPercentage(0.10, int(metric_sampling_seed))
-
-            reg_pre.SetInterpolator(sitk.sitkLinear)
-            reg_pre.SetOptimizerAsRegularStepGradientDescent(
-                learningRate=2.0,
-                minStep=1e-4,
-                numberOfIterations=60,
-                gradientMagnitudeTolerance=1e-6,
-            )
-            reg_pre.SetOptimizerScalesFromPhysicalShift()
-
-            use_global_cap_pre = (n_workers is not None and not set_sitk_object_threads(reg_pre, n_workers))
-            with global_sitk_thread_cap(n_workers, enabled=use_global_cap_pre, verbose=False):
+                # CenteredTransformInitializer returns a transform with a good initial offset.
+                # Using GEOMETRY (not MOMENTS) is typically more robust across modalities.
                 try:
-                    tfm_pre = reg_pre.Execute(fixed_pre_use, moving_pre_use)
-                except Exception as e:
-                    # Common failure for partial-FOV scans: MI can't evaluate because samples are out of bounds.
-                    msg = str(e)
-                    if "All samples map outside moving image buffer" in msg:
-                        if verbose:
-                            print(
-                                "[register_images] WARNING: translation pre-pass MI failed due to insufficient overlap; "
-                                "falling back to center-alignment translation."
-                            )
-                        tfm_pre = tx_pre_init
-                    else:
-                        raise
+                    tx_pre_init = sitk.CenteredTransformInitializer(
+                        fixed_pre_use,
+                        moving_pre_use,
+                        sitk.TranslationTransform(3),
+                        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+                    )
+                except Exception:
+                    tx_pre_init = sitk.TranslationTransform(3)
+                reg_pre.SetInitialTransform(tx_pre_init, inPlace=False)
 
-            # SimpleITK may return a CompositeTransform even for a pure translation stage
-            # (e.g., when an initial transform is provided with inPlace=False).
-            # CompositeTransform has no GetOffset, so unwrap carefully.
-            try:
-                tfm_use = tfm_pre
-                if hasattr(sitk, "CompositeTransform") and isinstance(tfm_use, sitk.CompositeTransform):
-                    n_t = int(tfm_use.GetNumberOfTransforms())
-                    if n_t > 0:
-                        tfm_use = tfm_use.GetNthTransform(n_t - 1)
+                set_sitk_object_threads(reg_pre, n_workers)
 
-                prepass_offset = _transform_translation_vector(tfm_use)
-            except Exception as _e:
+                # Metric (keep user's choice, but keep it light)
+                if similarity_metric == "correlation":
+                    reg_pre.SetMetricAsCorrelation()
+                else:
+                    reg_pre.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+
+                reg_pre.SetShrinkFactorsPerLevel([4, 2, 1])
+                reg_pre.SetSmoothingSigmasPerLevel([2, 1, 0])
+                reg_pre.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+                # Always sample stochastically for speed
+                reg_pre.SetMetricSamplingStrategy(reg_pre.RANDOM)
+                if metric_sampling_seed is None:
+                    reg_pre.SetMetricSamplingPercentage(0.10)
+                else:
+                    reg_pre.SetMetricSamplingPercentage(0.10, int(metric_sampling_seed))
+
+                reg_pre.SetInterpolator(sitk.sitkLinear)
+                reg_pre.SetOptimizerAsRegularStepGradientDescent(
+                    learningRate=2.0,
+                    minStep=1e-4,
+                    numberOfIterations=60,
+                    gradientMagnitudeTolerance=1e-6,
+                )
+                reg_pre.SetOptimizerScalesFromPhysicalShift()
+
+                use_global_cap_pre = (n_workers is not None and not set_sitk_object_threads(reg_pre, n_workers))
+                with global_sitk_thread_cap(n_workers, enabled=use_global_cap_pre, verbose=False):
+                    try:
+                        tfm_pre = reg_pre.Execute(fixed_pre_use, moving_pre_use)
+                    except Exception as e:
+                        # Common failure for partial-FOV scans: MI can't evaluate because samples are out of bounds.
+                        msg = str(e)
+                        if "All samples map outside moving image buffer" in msg:
+                            if verbose:
+                                print(
+                                    "[register_images] WARNING: translation pre-pass MI failed due to insufficient overlap; "
+                                    "falling back to center-alignment translation."
+                                )
+                            tfm_pre = tx_pre_init
+                        else:
+                            raise
+
+                # SimpleITK may return a CompositeTransform even for a pure translation stage
+                # (e.g., when an initial transform is provided with inPlace=False).
+                # CompositeTransform has no GetOffset, so unwrap carefully.
+                try:
+                    tfm_use = tfm_pre
+                    if hasattr(sitk, "CompositeTransform") and isinstance(tfm_use, sitk.CompositeTransform):
+                        n_t = int(tfm_use.GetNumberOfTransforms())
+                        if n_t > 0:
+                            tfm_use = tfm_use.GetNthTransform(n_t - 1)
+
+                    prepass_offset = _transform_translation_vector(tfm_use)
+                except Exception as _e:
+                    if verbose:
+                        print(f"[register_images] WARNING: could not read translation from pre-pass transform ({type(tfm_pre)}): {_e}")
+
                 if verbose:
-                    print(f"[register_images] WARNING: could not read translation from pre-pass transform ({type(tfm_pre)}): {_e}")
+                    print(f"[register_images] translation pre-pass spacing={prepass_spacing} offset={prepass_offset}")
 
+            except Exception as e:
+                # Pre-pass is a performance/robustness optimization; failure should not abort registration.
+                if verbose:
+                    print(f"[register_images] WARNING: translation pre-pass failed: {type(e).__name__}: {e}")
+        else:
             if verbose:
-                print(f"[register_images] translation pre-pass spacing={prepass_spacing} offset={prepass_offset}")
-
-        except Exception as e:
-            # Pre-pass is a performance/robustness optimization; failure should not abort registration.
-            if verbose:
-                print(f"[register_images] WARNING: translation pre-pass failed: {type(e).__name__}: {e}")
+                print("[register_images] fine touch-up mode: skipping translation pre-pass and multiresolution pyramid.")
 
         fixed_main_use, moving_main_use = _maybe_background_subtract_images(fixed_reg_img, moving_reg_img, stage="main")
 
@@ -1828,12 +1879,13 @@ def register_images(
         )
 
         # Add pre-pass translation to the main initializer if supported.
-        try:
-            base = np.array(initial_transform.GetTranslation(), dtype=float)
-            off = np.array(prepass_offset, dtype=float)
-            initial_transform.SetTranslation(tuple((base + off).tolist()))
-        except Exception:
-            pass
+        if not fine_touch_up:
+            try:
+                base = np.array(initial_transform.GetTranslation(), dtype=float)
+                off = np.array(prepass_offset, dtype=float)
+                initial_transform.SetTranslation(tuple((base + off).tolist()))
+            except Exception:
+                pass
 
         registration = sitk.ImageRegistrationMethod()
         _maybe_set_metric_focus_masks(registration, fixed_main_use, moving_main_use, stage="main")
@@ -1873,12 +1925,21 @@ def register_images(
         # Optimizer
         registration.SetInterpolator(sitk_interp)
         registration.SetOptimizerAsRegularStepGradientDescent(
-            learningRate=2.0,
-            minStep=1e-4,
+            learningRate=float(p["learning_rate"]),
+            minStep=float(p["min_step"]),
             numberOfIterations=int(p["iters"]),
             gradientMagnitudeTolerance=1e-6,
         )
         registration.SetOptimizerScalesFromPhysicalShift()
+
+        # Fine touch-up mode intentionally uses conservative optimizer steps to keep the
+        # search local after a prior coarse alignment. For rigid transforms, additionally
+        # reduce angular step sizes relative to translations to discourage wandering.
+        if fine_touch_up and registration_type == "rigid":
+            try:
+                registration.SetOptimizerScales([1000.0, 1000.0, 1000.0, 1.0, 1.0, 1.0])
+            except Exception:
+                pass
 
         # If per-object thread control isn't available for registration, we can
         # optionally fall back to a global cap (LAST RESORT).
@@ -1905,6 +1966,7 @@ def register_images(
                     "registration_type": str(registration_type),
                     "similarity_metric": str(similarity_metric),
                     "registration_strategy": str(registration_strategy),
+                    "fine_touch_up": bool(fine_touch_up),
                 },
             )
 
@@ -5183,6 +5245,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     basic.add_argument("--interp", default="cubic", help="Interpolation for registration+resampling. Accepts int 0-5 or strings like linear/cubic; use 'auto' to reuse recorded interpolation when --apply_only.")
     basic.add_argument("--as_integer", action="store_true", help="Save volume with integer data rather than as a float. Recommended if registering segmentation masks.")
     basic.add_argument("--registration_voxel_mm", default="1,1,1", help="Optional spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
+    basic.add_argument("--fine_touch_up", action="store_true", help="Run a native-resolution fine touch-up registration: all voxels, no translation pre-pass, no multiresolution pyramid, and conservative optimizer settings intended for small residual corrections after a broader alignment.")
     basic.add_argument("--use_first_frame_only", action="store_true", help="For 4d moving volumes, return registered volume as a 3d volume registered only using the first frame of the input volume.")
     basic.add_argument("--keep_moving_grid", action="store_true", help="Retain voxel dimensions/spacing from the original moving image instead of resampling to match dimensions/spacing of the fixed image.")
 
@@ -5211,6 +5274,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             interpolation=a.interp,
             integer=a.as_integer,
             registration_voxel_mm=a.registration_voxel_mm,
+            fine_touch_up=a.fine_touch_up,
             use_first_frame_only=a.use_first_frame_only,
             keep_moving_grid=a.keep_moving_grid,
             verbose=a.verbose,
