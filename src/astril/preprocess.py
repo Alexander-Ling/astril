@@ -914,6 +914,61 @@ def register_images(
     # We copy metadata keys using a strict allowlist to avoid copying any Slicer
     # segmentation container fields (e.g. Segmentation_ConversionParameters) that can
     # cause display shifts if they become inconsistent after resampling.
+
+    def _update_segment_extents_from_labelmap(dst_img):
+        """
+        Recompute Segment{n}_Extent from the resampled labelmap data.
+
+        This is mainly for 3D Slicer .seg.nrrd compatibility. We intentionally
+        do not copy stale Segment*_Extent fields from the source, because the
+        voxel bounds can change after resampling.
+        """
+        try:
+            import SimpleITK as sitk
+            import numpy as np
+            import re
+
+            arr = sitk.GetArrayViewFromImage(dst_img)  # z, y, x
+            if arr.ndim != 3:
+                return
+
+            keys = list(dst_img.GetMetaDataKeys())
+            segment_indices = []
+            for k in keys:
+                m = re.match(r"^Segment(\d+)_LabelValue$", str(k).strip(), flags=re.IGNORECASE)
+                if m:
+                    segment_indices.append(int(m.group(1)))
+
+            for seg_idx in sorted(set(segment_indices)):
+                lv_key = f"Segment{seg_idx}_LabelValue"
+                if not dst_img.HasMetaDataKey(lv_key):
+                    continue
+
+                try:
+                    label_value = int(float(dst_img.GetMetaData(lv_key)))
+                except Exception:
+                    continue
+
+                nz = np.argwhere(arr == label_value)  # z, y, x
+                ext_key = f"Segment{seg_idx}_Extent"
+
+                if nz.size == 0:
+                    # Empty segment: use Slicer-style empty extent
+                    dst_img.SetMetaData(ext_key, "0 -1 0 -1 0 -1")
+                    continue
+
+                zmin, ymin, xmin = nz.min(axis=0)
+                zmax, ymax, xmax = nz.max(axis=0)
+                # Slicer extent order is x0 x1 y0 y1 z0 z1
+                dst_img.SetMetaData(
+                    ext_key,
+                    f"{int(xmin)} {int(xmax)} {int(ymin)} {int(ymax)} {int(zmin)} {int(zmax)}"
+                )
+        except Exception:
+           # Best-effort only
+            return
+
+
     def _copy_nrrd_metadata_nongeom(src_img, dst_img):
         try:
             src_keys = list(src_img.GetMetaDataKeys())
@@ -2006,6 +2061,7 @@ def register_images(
         # Preserve NRRD metadata (e.g., 3D Slicer segment names) without copying geometry-ish keys.
         if _is_nrrd_path(output_path):
             _copy_nrrd_metadata_nongeom(moving_img, registered)
+            _update_segment_extents_from_labelmap(registered)
 
         if verbose:
             print(f"Saving resampled image...")
@@ -2556,6 +2612,7 @@ def apply_or_reverse_transforms(
     import os
     import json
     import shutil
+    import re
     import tempfile
 
     from .preprocessing_utils import read_padding_record
@@ -2609,14 +2666,48 @@ def apply_or_reverse_transforms(
     with open(transform_record_path, "r") as f:
         record = json.load(f)
 
-    steps = list(record.items())
+    # Only keep entries that actually represent transform steps.
+    # Some transform-record JSON files also contain top-level metadata
+    # such as "label", "inputs", "outputs", or "brainmask", which should
+    # not be interpreted as pipeline steps.
+    steps = []
+    for step_name, record_entry in record.items():
+        if isinstance(record_entry, dict):
+            if "transform" in record_entry:
+                steps.append((step_name, record_entry))
+        elif isinstance(record_entry, str):
+            if record_entry.endswith(".tfm") or record_entry.endswith("_padding.txt"):
+                steps.append((step_name, record_entry))
+
     if mode == "reverse":
         steps = list(reversed(steps))
 
     # If user overrides, apply to ALL steps. If None, infer per-step.
     user_resize_order, user_sitk_interp = _normalize_interp_override(interp)
 
+    # Preserve the output container type through intermediate steps.
+    # In particular, do not create .nii.gz intermediates and then copy/rename
+    # them to .nrrd/.seg.nrrd at the end.
+    if str(output_path).lower().endswith(".nii.gz"):
+        intermediate_suffix = ".nii.gz"
+    elif str(output_path).lower().endswith(".nii"):
+        intermediate_suffix = ".nii"
+    elif str(output_path).lower().endswith(".nrrd"):
+        intermediate_suffix = ".nrrd"
+    else:
+        intermediate_suffix = os.path.splitext(str(output_path))[1] or ".nii.gz"
+
     temp_file = input_path
+
+    def _looks_like_segmentation(path):
+        p = str(path).lower()
+        return (
+            p.endswith(".seg.nrrd")
+            or p.endswith(".label.nrrd")
+            or p.endswith("_seg.nrrd")
+            or p.endswith("_segmentation.nrrd")
+        )
+
     temp_files = []
 
     for step_name, record_entry in steps:
@@ -2640,7 +2731,7 @@ def apply_or_reverse_transforms(
             step_resize_order, step_sitk_interp = (user_resize_order, user_sitk_interp) if user_resize_order is not None else (1, "linear")
 
         if tfm_path.endswith(".tfm"):
-            intermediate = tempfile.mktemp(suffix=".nii.gz")
+            intermediate = tempfile.mktemp(suffix=intermediate_suffix)
             if not ref_path or not os.path.exists(ref_path):
                 raise RuntimeError(f"[Error] Reference image not found for transform: {tfm_path}")
 
@@ -2654,6 +2745,8 @@ def apply_or_reverse_transforms(
                     output_path=intermediate,
                     transform_path=tfm_path,
                     apply_only=True,
+                    interpolation=step_sitk_interp,
+                    integer=_looks_like_segmentation(temp_file) or _looks_like_segmentation(output_path),
                     verbose=False,
                 )
             else:
@@ -2671,7 +2764,7 @@ def apply_or_reverse_transforms(
 
         elif tfm_path.endswith("_padding.txt"):
             padding_record = read_padding_record(tfm_path)
-            intermediate = tempfile.mktemp(suffix=".nii.gz")
+            intermediate = tempfile.mktemp(suffix=intermediate_suffix)
 
             if mode == "apply":
                 resize_mri(
