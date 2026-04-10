@@ -2279,19 +2279,141 @@ def inverse_transform_image(
     import os
     import json
     import SimpleITK as sitk
-    from .preprocessing_utils import get_nifti_ndim, sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
+    from .preprocessing_utils import sitk_extract_3d_from_4d, sitk_join_3d_frames_to_4d
 
-    orig_ndim, orig_shape = get_nifti_ndim(original_image_path)
-    tr_ndim, tr_shape = get_nifti_ndim(transformed_image_path)
+    def _looks_like_segmentation(path):
+        p = str(path).lower()
+        return (
+            p.endswith(".seg.nrrd")
+            or p.endswith(".label.nrrd")
+            or p.endswith("_seg.nrrd")
+            or p.endswith("_segmentation.nrrd")
+        )
+
+    def _is_nrrd_path(path):
+        p = str(path).lower()
+        return p.endswith(".nrrd") or p.endswith(".nhdr")
+
+    def _get_image_ndim(path):
+        import SimpleITK as sitk
+        try:
+            img = sitk.ReadImage(str(path))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load image: {path}\n{e}")
+        return int(img.GetDimension()), tuple(int(v) for v in img.GetSize())
+
+    def _update_segment_extents_from_labelmap(dst_img):
+        """
+        Recompute Segment{n}_Extent from the resampled labelmap data.
+        Best-effort support for 3D Slicer .seg.nrrd compatibility.
+        """
+        try:
+            import SimpleITK as sitk
+            import numpy as np
+            import re
+
+            arr = sitk.GetArrayViewFromImage(dst_img)  # z, y, x
+            if arr.ndim != 3:
+                return
+
+            keys = list(dst_img.GetMetaDataKeys())
+            segment_indices = []
+            for k in keys:
+                m = re.match(r"^Segment(\d+)_LabelValue$", str(k).strip(), flags=re.IGNORECASE)
+                if m:
+                    segment_indices.append(int(m.group(1)))
+
+            for seg_idx in sorted(set(segment_indices)):
+                lv_key = f"Segment{seg_idx}_LabelValue"
+                if not dst_img.HasMetaDataKey(lv_key):
+                    continue
+
+                try:
+                    label_value = int(float(dst_img.GetMetaData(lv_key)))
+                except Exception:
+                    continue
+
+                nz = np.argwhere(arr == label_value)  # z, y, x
+                ext_key = f"Segment{seg_idx}_Extent"
+                if nz.size == 0:
+                    dst_img.SetMetaData(ext_key, "0 -1 0 -1 0 -1")
+                    continue
+
+                zmin, ymin, xmin = nz.min(axis=0)
+                zmax, ymax, xmax = nz.max(axis=0)
+                dst_img.SetMetaData(
+                    ext_key,
+                    f"{int(xmin)} {int(xmax)} {int(ymin)} {int(ymax)} {int(zmin)} {int(zmax)}"
+                )
+        except Exception:
+            return
+
+    def _copy_nrrd_metadata_nongeom(src_img, dst_img):
+        """
+        Copy non-geometry NRRD metadata that is useful for Slicer segmentations,
+        while avoiding fields that become stale after resampling.
+        """
+        try:
+            src_keys = list(src_img.GetMetaDataKeys())
+        except Exception:
+            return
+
+        exclude_exact = {
+            "space",
+            "space directions",
+            "space origin",
+            "sizes",
+            "kinds",
+            "type",
+            "dimension",
+            "measurement frame",
+            "data file",
+            "byte skip",
+            "line skip",
+            "endian",
+            "encoding",
+        }
+
+        exclude_prefixes = (
+            "ITK_",
+            "NRRD_",
+            "Segmentation_",
+        )
+
+        for k in src_keys:
+            try:
+                if k in exclude_exact:
+                   continue
+                if any(k.startswith(pref) for pref in exclude_prefixes):
+                    continue
+                if re.match(r"^Segment\d+_Extent$", k):
+                   continue
+                v = src_img.GetMetaData(k)
+                dst_img.SetMetaData(k, v)
+            except Exception:
+                continue
+
+    orig_ndim, orig_shape = _get_image_ndim(original_image_path)
+    tr_ndim, tr_shape = _get_image_ndim(transformed_image_path)
 
     if orig_ndim not in (3, 4) or tr_ndim not in (3, 4):
         raise ValueError(
-            f"inverse_transform_image supports only 3D/4D NIfTI. "
+            f"inverse_transform_image supports only 3D/4D images. "
             f"Got original_ndim={orig_ndim} transformed_ndim={tr_ndim}."
         )
 
-    original_img = sitk.ReadImage(str(original_image_path), sitk.sitkFloat32)
-    transformed_img = sitk.ReadImage(str(transformed_image_path), sitk.sitkFloat32)
+    is_seg = (
+        _looks_like_segmentation(original_image_path)
+        or _looks_like_segmentation(transformed_image_path)
+        or _looks_like_segmentation(output_path)
+    )
+
+    if is_seg:
+        original_img = sitk.ReadImage(str(original_image_path))
+        transformed_img = sitk.ReadImage(str(transformed_image_path))
+    else:
+        original_img = sitk.ReadImage(str(original_image_path), sitk.sitkFloat32)
+        transformed_img = sitk.ReadImage(str(transformed_image_path), sitk.sitkFloat32)
 
     # Choose a 3D spatial reference grid to recover into
     original_ref_3d = original_img if orig_ndim == 3 else sitk_extract_3d_from_4d(original_img, int(original_frame_index))
@@ -2330,6 +2452,10 @@ def inverse_transform_image(
             0.0,
             transformed_img.GetPixelID(),
         )
+        if is_seg and _is_nrrd_path(output_path):
+            _copy_nrrd_metadata_nongeom(transformed_img, recovered)
+            _update_segment_extents_from_labelmap(recovered)
+
         sitk.WriteImage(recovered, str(output_path))
     else:
         # 4D: invert each 3D frame in memory, then re-stack to 4D.
@@ -2348,6 +2474,10 @@ def inverse_transform_image(
             frames_out.append(recovered3d)
 
         out4d = sitk_join_3d_frames_to_4d(frames_out, spatial_reference=original_ref_3d, time_reference=transformed_img)
+        if is_seg and _is_nrrd_path(output_path):
+            _copy_nrrd_metadata_nongeom(transformed_img, out4d)
+            _update_segment_extents_from_labelmap(out4d)
+
         sitk.WriteImage(out4d, str(output_path))
 
     # If diffusion sidecars exist next to the transformed image, rotate/copy them
@@ -2619,6 +2749,99 @@ def apply_or_reverse_transforms(
     # assumes these are in-scope/importable in your module
     # from .preprocessing_functions import register_images, inverse_transform_image, resize_mri, reverse_resize_mri
 
+    def _is_mrk_json(path):
+        p = str(path).lower()
+        return p.endswith(".mrk.json")
+
+    def _load_json(path):
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save_json(obj, path):
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+            f.write("\n")
+
+    def _transform_point_for_markup(pt_xyz, tfm, coord_system="RAS"):
+        """
+        Transform a single markup point through a SimpleITK transform.
+
+        Slicer markups are commonly stored in RAS. SimpleITK physical coordinates
+        are LPS. Convert RAS<->LPS around TransformPoint().
+        """
+        x, y, z = [float(v) for v in pt_xyz]
+        cs = str(coord_system).strip().upper()
+
+        if cs == "RAS":
+            in_pt = (-x, -y, z)  # RAS -> LPS
+            out_pt = tfm.TransformPoint(in_pt)
+            return [-float(out_pt[0]), -float(out_pt[1]), float(out_pt[2])]  # LPS -> RAS
+        elif cs == "LPS":
+            out_pt = tfm.TransformPoint((x, y, z))
+            return [float(out_pt[0]), float(out_pt[1]), float(out_pt[2])]
+        else:
+            raise ValueError(f"Unsupported markup coordinateSystem: {coord_system!r}")
+
+    def _apply_or_reverse_transforms_to_mrk_json(
+        input_path,
+        steps,
+        base_dir,
+        output_path,
+        mode="apply",
+    ):
+        import os
+        import SimpleITK as sitk
+
+        data = _load_json(input_path)
+
+        markups = data.get("markups", [])
+        if not isinstance(markups, list):
+            raise ValueError(f"Invalid .mrk.json format: 'markups' must be a list in {input_path}")
+
+        for step_name, record_entry in steps:
+            if isinstance(record_entry, dict):
+                tfm_path = os.path.normpath(os.path.join(base_dir, record_entry["transform"]))
+            else:
+                tfm_path = os.path.normpath(os.path.join(base_dir, record_entry))
+
+            if tfm_path.endswith(".tfm"):
+                tfm = sitk.ReadTransform(str(tfm_path))
+                if mode == "apply":
+                    try:
+                        tfm = tfm.GetInverse()
+                    except Exception as e:
+                        raise ValueError(f"Failed to invert transform '{tfm_path}': {e}")
+
+                for markup in markups:
+                    coord_system = markup.get("coordinateSystem", "RAS")
+                    control_points = markup.get("controlPoints", [])
+                    if not isinstance(control_points, list):
+                        continue
+                    for cp in control_points:
+                        pos = cp.get("position", None)
+                        if pos is None:
+                            continue
+                        if not isinstance(pos, (list, tuple)) or len(pos) != 3:
+                            continue
+                        cp["position"] = _transform_point_for_markup(pos, tfm, coord_system=coord_system)
+
+            elif tfm_path.endswith("_padding.txt"):
+                # No-op for markups in physical coordinates.
+                # Padding / resize records alter image sampling grid while preserving
+                # world coordinates via the image geometry, so there is no additional
+                # point displacement to apply here.
+                continue
+            else:
+                raise ValueError(f"Unsupported transform step: {tfm_path}")
+
+        _save_json(data, output_path)
+        print(f"[Info] {'Applied' if mode == 'apply' else 'Reversed'} transforms to markup file: {output_path}")
+
+        return
+
+
     def _normalize_interp_override(user_interp):
         """
         Returns:
@@ -2709,6 +2932,16 @@ def apply_or_reverse_transforms(
         )
 
     temp_files = []
+
+    # Special case: Slicer markups JSON
+    # These are point sets in physical coordinates, so only true spatial
+    # transforms (.tfm) should move them. Grid-resampling padding records are
+    # treated as no-ops.
+    if _is_mrk_json(input_path) or _is_mrk_json(output_path):
+        _apply_or_reverse_transforms_to_mrk_json(
+            input_path=input_path, steps=steps, base_dir=base_dir, output_path=output_path, mode=mode
+        )
+        return
 
     for step_name, record_entry in steps:
         if isinstance(record_entry, dict):
