@@ -2228,9 +2228,29 @@ def _is_dicom_dir(path: str) -> bool:
     try:
         if not os.path.isdir(path):
             return False
-        for name in os.listdir(path)[:8]:
+        names = os.listdir(path)
+        # First: fast path for standard .dcm files
+        for name in names[:32]:
             if name.lower().endswith(".dcm"):
                 return True
+
+        # Second: allow extensionless DICOMs (common in some Brainlab exports)
+        # Check a small sample of regular files for the DICM magic at byte offset 128.
+        checked = 0
+        for name in names:
+            fp = os.path.join(path, name)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                with open(fp, "rb") as f:
+                    header = f.read(132)
+                if len(header) >= 132 and header[128:132] == b"DICM":
+                    return True
+            except Exception:
+                pass
+            checked += 1
+            if checked >= 32:
+                break
         return False
     except Exception:
         return False
@@ -2269,7 +2289,21 @@ def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None, temp_root
         _dbg(verbose, "No gdcmconv/dcmdjpeg found; cannot transcode.")
         return None
 
-    dcm_files = sorted([p for p in src.iterdir() if p.suffix.lower()==".dcm"])
+    dcm_files = []
+    for p in sorted(src.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() == ".dcm":
+            dcm_files.append(p)
+            continue
+        # Also accept extensionless DICOMs by checking the DICM magic
+        try:
+            with open(p, "rb") as f:
+                header = f.read(132)
+            if len(header) >= 132 and header[128:132] == b"DICM":
+                dcm_files.append(p)
+        except Exception:
+            pass
     if not dcm_files:
         _dbg(verbose, "No .dcm files to transcode.")
         return None
@@ -2409,6 +2443,11 @@ def _nifti_from_any(input_path_or_dir: str,
         _log_nifti_shape(input_path_or_dir, input_path_or_dir, verbose)
         # If caller asked for a specific output_path, copy to that path
         if output_path:
+            if os.path.isdir(input_path_or_dir):
+                raise RuntimeError(
+                    f"Input path was treated as non-DICOM, but it is a directory: {input_path_or_dir}. "
+                    "This usually means DICOM directory detection failed."
+                )
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(input_path_or_dir), str(output_path))
             return output_path, False
