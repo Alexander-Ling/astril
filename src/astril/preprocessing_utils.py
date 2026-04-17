@@ -3058,30 +3058,81 @@ def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = "
 # ------------------------------------------------------------------------
 def get_nifti_ndim(nifti_path):
     """
-    Return (ndim, shape) for a NIfTI file.
-    ndim is 3 or 4 for typical MRI volumes.
+    Return (ndim, shape) for a NIfTI file using the same effective 3D/4D
+    interpretation as `register_images()`.
+
+    In particular:
+      - ordinary 4D images are treated as 4D
+      - 3D images with multiple components per voxel (e.g. vector images
+        sometimes used for perfusion/time-series data) are also treated as 4D
+
+    Returns
+    -------
+    (ndim, shape)
+        ndim is 3 or 4 for typical MRI volumes.
+        shape is:
+          - (sx, sy, sz) for effective 3D images
+          - (sx, sy, sz, st) for effective 4D images
     """
     import numpy as np
     import nibabel as nib
+    import SimpleITK as sitk
+
+    # Keep nibabel-based diagnostics because it is good at exposing malformed
+    # headers / zooms that can later cause affine issues.
 
     try:
-        img = nib.load(nifti_path)
+        nib_img = nib.load(nifti_path)
     except Exception as e:
         raise RuntimeError(f"Failed to load NIfTI: {nifti_path}\n{e}")
 
-    shape = img.shape
-    ndim = len(shape)
+    nib_shape = nib_img.shape
+    nib_ndim = len(nib_shape)
 
     # Best-effort diagnostics for broken headers that can later trigger affine/zoom issues.
     # (Do not spam; only print if clearly invalid.)
     try:
-        zooms = img.header.get_zooms()
+        zooms = nib_img.header.get_zooms()
         if any((not np.isfinite(float(z)) or float(z) <= 0) for z in zooms[:3]):
-            print(f"[WARN][get_nifti_ndim] Invalid zooms for {nifti_path}: {zooms}. affine=\n{img.affine}")
+            print(f"[WARN][get_nifti_ndim] Invalid zooms for {nifti_path}: {zooms}. affine=\n{nib_img.affine}")
     except Exception:
         pass
 
-    return ndim, shape
+    # Match the effective 3D/4D inference used by register_images().
+    # SimpleITK exposes vector images as 3D + multiple components per pixel.
+    try:
+        sitk_img = sitk.ReadImage(nifti_path) #This may be unecessarily expensive
+        """
+        Something like below with a header only read might work better here,
+        but I'm not sure it would expose all of the information needed.
+            r = sitk.ImageFileReader()
+            r.SetFileName(nifti_path)
+            r.ReadImageInformation()
+            dim = int(r.GetDimension())
+            size = tuple(int(x) for x in r.GetSize())
+            comps = int(r.GetNumberOfComponents()) <-- Not sure if this would work and don't have time to test right now.
+        """
+        dim = int(sitk_img.GetDimension())
+        comps = int(sitk_img.GetNumberOfComponentsPerPixel())
+
+        if dim == 4:
+            sx, sy, sz, st = sitk_img.GetSize()
+            return 4, (int(sx), int(sy), int(sz), int(st))
+
+        if dim == 3 and comps > 1:
+            sx, sy, sz = sitk_img.GetSize()
+            return 4, (int(sx), int(sy), int(sz), int(comps))
+
+        if dim == 3:
+            sx, sy, sz = sitk_img.GetSize()
+            return 3, (int(sx), int(sy), int(sz))
+
+        # Fall back to nibabel if SITK sees something unusual but nibabel
+        # still provided a plausible ndim.
+        return nib_ndim, nib_shape
+    except Exception:
+        # If SITK read fails for any reason, preserve previous nibabel behavior.
+        return nib_ndim, nib_shape
 
 def extract_nifti_frame(nifti_4d_path, frame_index, out_path):
     """
