@@ -906,6 +906,9 @@ def register_images(
     from datetime import datetime
     from pathlib import Path
 
+    #Temporary debug loggin
+    #print(f"[Register -- DEBUG] fixed_path = {fixed_path}; moving_path = {moving_path}")
+
     # NOTE:
     # For NRRD outputs (especially 3D Slicer segmentations / labelmaps), important
     # per-segment fields (e.g., Segment0_Name, Segment1_Name, ...) live in NRRD metadata.

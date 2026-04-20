@@ -987,6 +987,7 @@ def preprocess_library(
     warned_missing_patient_masks = False
 
     def _process_exam_dir(exam_dir: Path) -> None:
+        #print(f"[Preprocess -- DEBUG] running _process_exam_dir on {exam_dir}")
         nonlocal warned_missing_patient_masks
         patient, exam = _parse_patient_exam(exam_dir)
         out_exam = out_dir / patient / exam

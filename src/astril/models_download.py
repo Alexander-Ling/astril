@@ -243,6 +243,8 @@ def cli_download(argv=None) -> None:
     p.add_argument("--keep-archives", action="store_true", help="Keep .zip archives after extraction")
     args = p.parse_args(argv)
     only = [s.strip() for s in args.only.split(",")] if args.only else None
+    #Temporary warning that newer model is coming
+    print(f"[astril -- WARNING] The currently downloadable model was trained on data preprocessed in a different manner than astril.preprocess_brain_mris -- it works poorly on astril preprocessed volumes. An updated model will be available shortly.")
     # Stash flag on the function for simple propagation without changing signature
     download_models._keep_archives = bool(args.keep_archives)  # type: ignore[attr-defined]
     out = download_models(overwrite=args.overwrite, only=only)

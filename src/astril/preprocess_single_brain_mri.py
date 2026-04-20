@@ -106,6 +106,33 @@ def _derive_ids_and_basename_prefix(anchor_path: str, patientID=None, timepoint=
     basename_prefix = f"{patientID}_{timepoint}"
     return patientID, timepoint, scanID, basename_prefix
 
+def _skip_marker_for_expected_output(path: str) -> str | None:
+    """
+    For expected 4D *_unregistered outputs, return the corresponding skip-marker path.
+
+    Examples
+    --------
+    ..._Perfusion_unregistered.nii.gz -> ..._Perfusion_unregistered.SKIPPED.json
+    ..._Perfusion_unregistered.nrrd   -> ..._Perfusion_unregistered.SKIPPED.json
+    """
+    p = os.fspath(path)
+    pl = p.lower()
+    if pl.endswith("_unregistered.nii.gz"):
+        return p[:-7] + ".SKIPPED.json"
+    if pl.endswith("_unregistered.nrrd"):
+        return p[:-5] + ".SKIPPED.json"
+    return None
+
+
+def _expected_output_exists_or_skipped(path: str) -> bool:
+    """
+    Return True if an expected output exists, or if it is a 4D *_unregistered output
+    that has a corresponding SKIPPED marker.
+    """
+    if os.path.exists(path):
+        return True
+    skip_marker = _skip_marker_for_expected_output(path)
+    return bool(skip_marker and os.path.exists(skip_marker))
 
 def expected_preprocessing_outputs(
     *,
@@ -188,7 +215,7 @@ def expected_preprocessing_outputs(
 def missing_preprocessing_outputs(**kwargs) -> list[str]:
     """Return a sorted list of expected outputs that are missing on disk."""
     expected = expected_preprocessing_outputs(**kwargs)
-    missing = [p for p in expected if not os.path.exists(p)]
+    missing = [p for p in expected if not _expected_output_exists_or_skipped(p)]
     return sorted(missing)
 
 
@@ -1002,6 +1029,7 @@ def run_preprocessing_pipeline(
     # 4D scans: keep native-space; skull-strip only.
     # We map the anchor brainmask back into each 4D scan's native space using the inverse of a frame-based transform.
     unregistered_4d_outputs: dict[str, str] = {}
+    skipped_4d_outputs: dict[str, str] = {}
     for lbl in fourd_labels:
         src_4d = scans[lbl]
         if verbose:
@@ -1012,6 +1040,7 @@ def run_preprocessing_pipeline(
         tmp_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_TEMP_REG_SHOULD_NOT_USE.nii.gz")
         out_unreg = os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.nii.gz")
         mask_in_native = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brainmask_native_temp.nii.gz")
+        skip_marker = os.path.join(output_dir, f"{basename_prefix}_{lbl}_unregistered.SKIPPED.json")
 
         try:
             # Default: register against the (possibly preprocessed) anchor in coreg space.
@@ -1064,6 +1093,27 @@ def run_preprocessing_pipeline(
         except Exception as e:
             if verbose:
                 print(f"[WARN] Skipping 4D label '{lbl}' due to native skull-strip failure: {e}")
+
+            # Record an explicit skip marker so resume/completeness checks do not
+            # keep treating this exam as partially complete forever.
+            try:
+                with open(skip_marker, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "label": lbl,
+                            "status": "skipped",
+                            "step": "4D native skull-strip",
+                            "reason": str(e),
+                            "source": os.fspath(src_4d),
+                        },
+                        fh,
+                        indent=2,
+                    )
+                skipped_4d_outputs[lbl] = skip_marker
+            except Exception as marker_e:
+                if verbose:
+                    print(f"[WARN] Failed to write skip marker for 4D label '{lbl}': {marker_e}")
+
             # Clean up partial outputs
             for p in (out_unreg, mask_in_native, tfm, tmp_reg):
                 try:
@@ -1072,6 +1122,13 @@ def run_preprocessing_pipeline(
                 except Exception:
                     pass
             continue
+
+        # Success path: if a skip marker exists from an earlier partial run, remove it.
+        try:
+            if os.path.exists(skip_marker):
+                os.remove(skip_marker)
+        except Exception:
+            pass
 
         # If a sibling 4D NRRD exists (e.g., diffusion NRRD for Slicer), skull-strip it as well.
         # We do NOT estimate any additional transforms here: we reuse the same native-space mask.
@@ -1703,7 +1760,7 @@ def preprocess_single_brain_mri(
             timepoint=timepoint,
             scanID=scanID,
         )
-        missing = [p for p in expected if not os.path.exists(p)]
+        missing = [p for p in expected if not _expected_output_exists_or_skipped(p)]
         preexisting = len(expected) - len(missing)
 
         if not missing:
