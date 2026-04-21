@@ -3053,6 +3053,81 @@ def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = "
     return out
 
 
+def preflight_sitk_read_in_subprocess(image_path, *, full_read: bool = True, timeout_sec: int = 120):
+    """
+    Probe a SimpleITK read in a child Python process.
+
+    This protects the main interpreter from native-library crashes caused by
+    malformed image files. If the child crashes, hangs, or exits non-zero,
+    raise RuntimeError in the parent process.
+    """
+    import sys
+    import textwrap
+
+    p = os.fspath(image_path)
+
+    code = textwrap.dedent(r"""
+        import json
+        import sys
+        import SimpleITK as sitk
+
+        path = sys.argv[1]
+        full_read = (sys.argv[2] == '1')
+
+        r = sitk.ImageFileReader()
+        r.SetFileName(path)
+        r.ReadImageInformation()
+
+        info = {
+            'path': path,
+            'dimension': int(r.GetDimension()),
+            'size': tuple(int(x) for x in r.GetSize()),
+        }
+
+        if hasattr(r, 'GetNumberOfComponents'):
+            try:
+                info['components'] = int(r.GetNumberOfComponents())
+            except Exception:
+                info['components'] = 1
+        else:
+            info['components'] = 1
+
+        if full_read:
+            ncomp = int(info.get('components', 1))
+            if int(r.GetDimension()) == 3 and ncomp > 1:
+                r.SetOutputPixelType(sitk.sitkVectorFloat32)
+            else:
+                r.SetOutputPixelType(sitk.sitkFloat32)
+            img = r.Execute()
+            info['loaded_dimension'] = int(img.GetDimension())
+            info['loaded_components'] = int(img.GetNumberOfComponentsPerPixel())
+
+        print(json.dumps(info))
+    """)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', code, p, '1' if full_read else '0'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=int(timeout_sec),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"SimpleITK preflight timed out for image: {p}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to launch SimpleITK preflight subprocess for image: {p}\n{e}") from e
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or '').strip()
+        stdout = (proc.stdout or '').strip()
+        msg = stderr or stdout or f'child exited with code {proc.returncode}'
+        raise RuntimeError(f"SimpleITK preflight failed for image: {p}\n{msg}")
+
+    return (proc.stdout or '').strip()
+
+
 # ------------------------------------------------------------------------
 # General NIfTI helpers for 3D/4D pipelines
 # ------------------------------------------------------------------------
@@ -3252,6 +3327,9 @@ def apply_mask_anydim_sitk(input_image_path, mask_path, output_path):
     """
     import SimpleITK as sitk
     import numpy as np
+
+    preflight_sitk_read_in_subprocess(input_image_path, full_read=True, timeout_sec=120)
+    preflight_sitk_read_in_subprocess(mask_path, full_read=True, timeout_sec=120)
 
     # Preserve original pixel type to avoid accidentally changing vector layout on write.
     img = sitk.ReadImage(str(input_image_path))

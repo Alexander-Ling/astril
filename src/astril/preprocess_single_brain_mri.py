@@ -134,6 +134,25 @@ def _expected_output_exists_or_skipped(path: str) -> bool:
     skip_marker = _skip_marker_for_expected_output(path)
     return bool(skip_marker and os.path.exists(skip_marker))
 
+def _write_scan_skip_marker(output_dir: str, basename_prefix: str, label: str, source_path: str, reason: str) -> str:
+    """
+    Write a JSON skip marker for a scan that was intentionally skipped.
+
+    This is used for corrupt/unreadable inputs so the rest of the exam can
+    continue processing without repeatedly retrying the same bad file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    marker = os.path.join(output_dir, f"{basename_prefix}_{label}.SKIPPED.json")
+    payload = {
+        "label": str(label),
+        "status": "skipped",
+        "reason": str(reason),
+        "source": os.fspath(source_path),
+    }
+    with open(marker, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return marker
+
 def expected_preprocessing_outputs(
     *,
     scans: dict,
@@ -347,6 +366,7 @@ def run_preprocessing_pipeline(
         ensure_hd_bet_installed,
         find_sidecars_for_nifti,
         copy_sidecars_for_output,
+        preflight_sitk_read_in_subprocess,
     )
 
     from astril.preprocess import (
@@ -441,9 +461,19 @@ def run_preprocessing_pipeline(
 
     # Track which inputs are 4D so we can treat them differently
     ndim_by_label: dict[str, int] = {}
-    for lbl, pth in scans.items():
-        ndim, _ = get_nifti_ndim(pth)
-        ndim_by_label[lbl] = int(ndim)
+    skipped_input_labels: dict[str, str] = {}
+    for lbl, pth in list(scans.items()):
+        try:
+            ndim, _ = get_nifti_ndim(pth)
+            ndim_by_label[lbl] = int(ndim)
+        except Exception as e:
+            if lbl == anchor_label:
+                raise RuntimeError(f"Anchor '{anchor_label}' failed input preflight/dimension read: {pth}\n{e}") from e
+            marker = _write_scan_skip_marker(output_dir, basename_prefix, lbl, pth, f"input_preflight_failed: {e}")
+            skipped_input_labels[lbl] = marker
+            if verbose:
+                print(f"[WARN] Skipping corrupt input label '{lbl}': {e}")
+            scans.pop(lbl, None)
 
     fourd_labels = [lbl for lbl, nd in ndim_by_label.items() if nd == 4]
     threed_labels = [lbl for lbl, nd in ndim_by_label.items() if nd == 3]
@@ -1731,6 +1761,36 @@ def preprocess_single_brain_mri(
             f"Anchor label '{anchor_label}' not found in scans. Got: {sorted(scans.keys())}"
         )
 
+    # Best-effort input preflight before computing expected outputs.
+    # If a non-anchor file can crash SimpleITK during load, mark it skipped here
+    # so the rest of the exam can still be processed safely.
+    from astril.preprocessing_utils import preflight_sitk_read_in_subprocess
+
+    anchor_path_for_ids = os.fspath(scans[anchor_label])
+    _patientID, _timepoint, _scanID, _basename_prefix = _derive_ids_and_basename_prefix(
+        anchor_path_for_ids, patientID=patientID, timepoint=timepoint, scanID=scanID
+    )
+
+    for lbl, p in list(scans.items()):
+        if p is None:
+            scans.pop(lbl, None)
+            continue
+        scans[lbl] = os.fspath(p)
+        if not os.path.isfile(scans[lbl]):
+            raise FileNotFoundError(f"Scan not found for label '{lbl}': {scans[lbl]}")
+        try:
+            preflight_sitk_read_in_subprocess(scans[lbl], full_read=True, timeout_sec=120)
+        except Exception as e:
+            if lbl == anchor_label:
+                raise RuntimeError(f"Anchor '{anchor_label}' failed input preflight: {scans[lbl]}\n{e}") from e
+            marker = _write_scan_skip_marker(output_dir, _basename_prefix, lbl, scans[lbl], f"input_preflight_failed: {e}")
+            if verbose:
+                print(f"[WARN] Skipping corrupt input label '{lbl}' and writing marker: {marker}")
+            scans.pop(lbl, None)
+
+    if anchor_label not in scans:
+        raise RuntimeError(f"Anchor label '{anchor_label}' was removed during input preflight; cannot preprocess exam.")
+
     # ------------------------------------------------------------------
     # Robust "skip if complete" behavior:
     # Only skip when *all* expected outputs for this run configuration exist.
@@ -1788,15 +1848,7 @@ def preprocess_single_brain_mri(
             run_status = "RAN"
             run_message = f"Running fresh: {len(expected)} expected outputs."
 
-# Normalize to strings/paths and validate existence
-    for lbl, p in list(scans.items()):
-
-        if p is None:
-            scans.pop(lbl, None)
-            continue
-        scans[lbl] = os.fspath(p)
-        if not os.path.isfile(scans[lbl]):
-            raise FileNotFoundError(f"Scan not found for label '{lbl}': {scans[lbl]}")
+# Inputs were normalized and preflighted above.
 
     if debug:
         # Keep debug workspaces inside output_dir so large intermediate files land on
