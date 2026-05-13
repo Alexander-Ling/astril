@@ -221,10 +221,13 @@ class DynamicAttentionResUNet(Model):
             prev_dec_channels = dec_filters
 
         # 3.4. Final conv => num_output_slices * out_channels
+        # dtype='float32' keeps softmax in full precision regardless of global mixed-precision
+        # policy — float16 softmax underflows to -inf in the loss log.
         self.final_conv = Conv2D(
             filters=self.num_output_slices * self.out_channels,
             kernel_size=1,
             activation='softmax',
+            dtype='float32',
             name="Final_Conv"
         )
 
@@ -235,6 +238,7 @@ class DynamicAttentionResUNet(Model):
                     self.num_output_slices * self.out_channels,
                     kernel_size=1,
                     activation='softmax',
+                    dtype='float32',
                     name=f"Aux_Conv_{i}"
                 )
                 for i in range(min(2, self.num_encoder_levels))

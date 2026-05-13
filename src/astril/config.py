@@ -1,5 +1,8 @@
 # These all get dynamically assigned by the loaded config files
 
+# Mixed precision (float16 for RTX tensor cores)
+use_mixed_precision = False
+
 # BrainIAC
 use_brainiac_embeddings = False
 brainiac_weights_path = None        # path to .ckpt if user supplies manually

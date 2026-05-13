@@ -63,6 +63,9 @@ def parse_train_parameters(config_file_path):
     config.use_intensity_augmentation = cfg_parser.getboolean("DEFAULT", "use_intensity_augmentation", fallback=False)
     config.intensity_augmentation_strength = cfg_parser.getfloat("DEFAULT", "intensity_augmentation_strength", fallback=0.1)
 
+    # Mixed precision
+    config.use_mixed_precision = cfg_parser.getboolean("DEFAULT", "use_mixed_precision", fallback=False)
+
     # BrainIAC (informational; main() sets these if --Use_BrainIAC_Embeddings passed)
     config.use_brainiac_embeddings = cfg_parser.getboolean("DEFAULT", "use_brainiac_embeddings", fallback=False)
 
@@ -94,6 +97,11 @@ def main():
     parser.add_argument("--Use_Intensity_Augmentation", action="store_true",
                         help="Enable random intensity (noise + contrast) augmentation.")
 
+    # Mixed precision
+    parser.add_argument("--Use_Mixed_Precision", action="store_true",
+                        help="Enable float16 mixed precision for RTX tensor cores. "
+                             "Halves activation VRAM and enables tensor-core utilisation.")
+
     # BrainIAC
     parser.add_argument("--Use_BrainIAC_Embeddings", action="store_true",
                         help="Pre-compute BrainIAC saliency maps and use as an extra input channel.")
@@ -122,6 +130,8 @@ def main():
         config.print_every_n_subbatches = args.print_every_n_subbatches
     if args.minimum_height_width is not None:
         config.minimum_height_width = args.minimum_height_width
+    if args.Use_Mixed_Precision:
+        config.use_mixed_precision = True
     if args.Use_SE_Blocks:
         config.use_se_blocks = True
     if args.Use_Deep_Supervision:
@@ -135,6 +145,8 @@ def main():
     # so the saved config accurately reflects what was actually used for training.
     from .create_config_files import update_train_config_flags
     cfg_updates = {}
+    if args.Use_Mixed_Precision:
+        cfg_updates["use_mixed_precision"] = "true"
     if args.Use_SE_Blocks:
         cfg_updates["use_se_blocks"] = "true"
     if args.Use_Deep_Supervision:

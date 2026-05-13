@@ -912,3 +912,52 @@ def compute_weighted_macro_metrics(agg, num_classes, epsilon=1e-9):
         'weighted_macro_recall': weighted_recall_sum,
         'micro_accuracy': micro_accuracy
     }
+
+
+# -----------------------------------------------------------------------------
+# Hardware stats and training stats logging
+# -----------------------------------------------------------------------------
+
+def get_vram_stats_mb():
+    """
+    Returns (current_mb, peak_mb) GPU memory usage.
+    Returns (0.0, 0.0) if no GPU is available or TF version lacks memory_info.
+    """
+    try:
+        import tensorflow as tf
+        info = tf.config.experimental.get_memory_info('GPU:0')
+        return info['current'] / 1024 ** 2, info['peak'] / 1024 ** 2
+    except Exception:
+        return 0.0, 0.0
+
+
+def append_training_stats(
+    file_path,
+    epoch,
+    data_load_s,
+    train_s,
+    val_s,
+    slices_per_sec,
+    mean_grad_norm,
+    learning_rate,
+    vram_used_mb,
+    vram_peak_mb,
+):
+    """
+    Appends one row per epoch to training_stats.tsv.
+    Writes header on first call (when file does not yet exist).
+    """
+    mode = 'a' if os.path.exists(file_path) else 'w'
+    header = (
+        "Epoch\tDataLoad_s\tTrain_s\tVal_s\t"
+        "Slices_Per_Sec\tMean_Grad_Norm\tLR\tVRAM_Used_MB\tVRAM_Peak_MB\n"
+    )
+    val_s_str = f"{val_s:.1f}" if val_s is not None else "NA"
+    with open(file_path, mode) as f:
+        if mode == 'w':
+            f.write(header)
+        f.write(
+            f"{epoch}\t{data_load_s:.1f}\t{train_s:.1f}\t{val_s_str}\t"
+            f"{slices_per_sec:.0f}\t{mean_grad_norm:.4f}\t{learning_rate:.6f}\t"
+            f"{vram_used_mb:.0f}\t{vram_peak_mb:.0f}\n"
+        )
