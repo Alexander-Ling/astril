@@ -16,8 +16,6 @@ import shutil
 from pathlib import Path
 import configparser
 from typing import TYPE_CHECKING
-import torch
-import torch.nn.functional as F
 if TYPE_CHECKING:
     # Optional: keeps editors/type-checkers happy without importing at runtime
     import nibabel as nib  # noqa: F401
@@ -174,7 +172,9 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     extra_channel_path: optional path to an additional channel NIfTI (e.g. BrainIAC saliency map)
     appended to the subject's channel list at inference time.
     """
-    # Lazy imports: avoid nibabel/numpy at module import time
+    # Lazy imports: avoid nibabel/numpy/torch at module import time
+    import torch
+    import torch.nn.functional as F
     import nibabel as nib
     import numpy as np
     from .run_segmentation import (
@@ -526,7 +526,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
 
 
 def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_outputs=False,
-                channel_patterns=None, brainmask_pattern="_brainmask.nii.gz", segment_suffix="_GBM_seg.nii.gz"):
+                channel_patterns=None, brainmask_pattern="_brainmask.nii.gz", segment_suffix="_GBM-seg.nii.gz"):
     """
     Runs the full GBM segmentation pipeline per subject.
     """

@@ -243,7 +243,7 @@ def train_model():
         optimizer.load_state_dict(optimizer_checkpoint["optimizer_state_dict"])
 
     use_amp = bool(use_mixed_precision and device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device='cuda', enabled=use_amp)
     print(f"Mixed precision enabled: {use_amp}")
 
     dummy_input_shape = (1, num_channels * num_input_slices, minimum_height_width, minimum_height_width)

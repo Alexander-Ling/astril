@@ -210,6 +210,8 @@ def create_config_files(
         # BrainIAC flags (default off; main.py sets use_brainiac_embeddings=true when used)
         f.write("use_brainiac_embeddings = false\n")
         f.write("brainiac_embedding_type = saliency_map\n")
+        # Mixed precision (default off; safe to enable on CUDA hardware)
+        f.write("use_mixed_precision = false\n")
         # Augmentation flags (default off; set via --Use_Flip_Augmentation / --Use_Intensity_Augmentation)
         f.write("use_flip_augmentation = false\n")
         f.write("use_intensity_augmentation = false\n")

@@ -614,28 +614,11 @@ def append_metrics_to_file(file_path, epoch, class_metrics, all_classes_metrics=
 
 
 def _metric_value(value):
-    if hasattr(value, "result"):
-        value = value.result()
     if hasattr(value, "detach"):
         value = value.detach().cpu()
     if hasattr(value, "numpy"):
         value = value.numpy()
     return float(value)
-
-def prepare_class_metrics_for_logging(train_or_val_class_metrics):
-    """
-    Prepare a dictionary of metrics for each class index.
-    """
-    class_metrics = {}
-    num_cls = len(train_or_val_class_metrics['accuracy'])
-    for class_index in range(num_cls):
-        class_metrics[class_index] = {
-            'accuracy':  train_or_val_class_metrics['accuracy'][class_index],
-            'precision': train_or_val_class_metrics['precision'][class_index],
-            'recall':    train_or_val_class_metrics['recall'][class_index],
-            'loss':      train_or_val_class_metrics['loss'][class_index],
-        }
-    return class_metrics
 
 # -----------------------------------------------------------------------------
 # Training Helpers (Checkpointing + Schedules)

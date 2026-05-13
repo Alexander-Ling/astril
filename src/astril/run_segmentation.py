@@ -6,8 +6,6 @@ This module runs the segmentation process using a 2.5D pipeline and PyTorch
 .pt checkpoints.
 """
 
-print("Initializing segmentation environment...")
-
 import os
 import sys
 import argparse
