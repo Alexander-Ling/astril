@@ -60,7 +60,7 @@ def generate_models_json(
     models_dir: Union[str, Path, None] = None,
     output_path: Union[str, Path, None] = None,
     url_mapping: Optional[Union[Dict[str, str], str, Path]] = None,
-    include: Optional[Sequence[str]] = ("*.keras", "*.h5", "*.cfg", "*.zip"),
+    include: Optional[Sequence[str]] = ("*.pt", "*.cfg", "*.zip"),
     exclude: Optional[Sequence[str]] = (".git*", "*.gitignore", "*.gitkeep", "models.json", "osf_urls.json", "*.txt"),
     overwrite: bool = True,
     pretty: bool = True,
@@ -68,7 +68,7 @@ def generate_models_json(
     """
     Create models.json with entries like:
       {
-        "Axial_1.h5": {"url": "...", "sha256": "...", "bytes": 160392920, "version": "2025-04-01T20:45:00Z"},
+        "Axial_1.pt": {"url": "...", "sha256": "...", "bytes": 160392920, "version": "2025-04-01T20:45:00Z"},
         ...
       }
 
@@ -117,7 +117,7 @@ def generate_models_json(
             "version": _iso8601_utc(st.st_mtime),
         }
 
-        # Heuristics for SavedModel archives (.zip)
+        # Heuristics for packaged model archives (.zip)
         if p.suffix.lower() == ".zip":
             import zipfile, posixpath
             try:
@@ -173,7 +173,7 @@ def cli_make_models_json(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--url-map", type=str, default=None,
                    help=("Path to filename->URL JSON. If omitted, "
                          "defaults to <models_dir>/osf_urls.json when present."))
-    p.add_argument("--include", type=str, default="*.keras,*.h5,*.cfg,*.zip",
+    p.add_argument("--include", type=str, default="*.pt,*.cfg,*.zip",
                    help="Comma-separated include globs")
     p.add_argument("--exclude", type=str, default=".git*,*.gitignore,*.gitkeep,models.json,osf_urls.json,*.txt",
                    help="Comma-separated exclude globs")

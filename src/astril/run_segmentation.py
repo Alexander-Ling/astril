@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Module: run_segmentation
-This module runs the segmentation process using a 2.5D pipeline.
-It loads model files from paths specified in the segmentation configuration.
-Pre-trained models may be provided as full models (directories or .keras files)
-or as HDF5 files containing only weights. In the latter case, the model architecture
-is rebuilt using parameters extracted from the associated model training config file.
+This module runs the segmentation process using a 2.5D pipeline and PyTorch
+.pt checkpoints.
 """
 
 print("Initializing segmentation environment...")
@@ -17,18 +14,9 @@ import argparse
 import configparser
 import numpy as np
 import nibabel as nib
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 from pathlib import Path
-from tensorflow.keras.models import load_model
-
-
-# Keras 3 layers (for wrapping legacy SavedModel)
-try:
-    import keras
-    from keras.layers import TFSMLayer
-except Exception:  # pragma: no cover
-    keras = None
-    TFSMLayer = None
 
 # Import data loading functions from your package.
 from .data_loading import (
@@ -42,8 +30,7 @@ from .data_loading import (
 # Import model architecture and custom layers.
 from .model_architecture import (
     DynamicAttentionResUNet,
-    ResidualConvBlock,
-    AttentionBlock
+    create_dynamic_unet_from_metadata,
 )
 
 # Import global configuration variables (if available).
@@ -51,45 +38,6 @@ try:
     from .config import num_channels as global_num_channels
 except ImportError:
     global_num_channels = None
-
-# Define custom objects dictionary for full model loading.
-custom_objects_dict = {
-    'ResidualConvBlock': ResidualConvBlock,
-    'AttentionBlock': AttentionBlock,
-    'DynamicAttentionResUNet': DynamicAttentionResUNet
-}
-
-
-########################################################################
-# SavedModel helpers (Keras 3 no longer loads these via load_model)
-########################################################################
-def _is_tf_saved_model_dir(path: str | Path) -> bool:
-    p = Path(path)
-    if not p.is_dir():
-        return False
-    return (p / "saved_model.pb").exists() or (p / "saved_model.pbtxt").exists()
-
-
-def _wrap_saved_model_as_keras(saved_model_dir: str,
-                               input_channels: int,
-                               call_endpoint: str = "serving_default"):
-    """
-    Wrap a TF SavedModel as a Keras Model for inference using Keras 3 TFSMLayer.
-    The wrapped model has Input shape (None, None, None, input_channels) and
-    returns the first tensor if the SavedModel outputs a dict.
-    """
-    if TFSMLayer is None or keras is None:
-        raise ImportError(
-            "Keras 3 is required to load TensorFlow SavedModel via TFSMLayer. "
-            "Install `keras>=3` or convert your model to `.keras`."
-        )
-    inp = keras.Input(shape=(None, None, input_channels), dtype=tf.float32, name="input")
-    layer = TFSMLayer(saved_model_dir, call_endpoint=call_endpoint)
-    out = layer(inp)
-    if isinstance(out, dict):
-        # deterministically pick the first output
-        out = next(iter(out.values()))
-    return keras.Model(inp, out, name="wrapped_saved_model")
 
 ########################################################################
 # Shared helper: load a list of models given config-derived arrays
@@ -101,46 +49,35 @@ def load_models_for_config(
     model_min_hw: list[int],
     num_modal_channels: int,
     model_call_endpoints: list[str] | None = None,
+    device: torch.device | None = None,
 ):
     """
     Unified model loader used by run_segmentation.py and segment_GBM.py.
-    Supports .keras, legacy .h5 (weights-only), and TF SavedModel directories.
+    Supports only migrated PyTorch .pt checkpoints.
     """
-    if model_call_endpoints is None:
-        model_call_endpoints = ["serving_default"] * len(model_paths)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     loaded = []
     for i, mp in enumerate(model_paths):
         mp = mp.strip()
         print(f"[INFO] Loading model {i+1}/{len(model_paths)} => {mp}")
-
-        # 1) Native Keras v3 model
-        if mp.endswith(".keras"):
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-            loaded.append(model)
-            continue
-
-        # 2) Legacy weight-only HDF5
-        if mp.endswith(".h5"):
+        if not mp.endswith(".pt"):
+            raise ValueError(
+                f"Unsupported model path '{mp}'. Migrated astril inference expects PyTorch .pt checkpoints."
+            )
+        try:
+            checkpoint = torch.load(mp, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(mp, map_location=device)
+        if "architecture" in checkpoint:
+            model = create_dynamic_unet_from_metadata(checkpoint["architecture"])
+        else:
             train_cfg = model_train_config_files[i].strip()
-            min_hw_val = model_min_hw[i]
-            input_slices = model_num_input_slices[i]
-            model = load_pretrained_model(mp, train_cfg, min_hw_val, input_slices)
-            loaded.append(model)
-            continue
-
-        # 3) Legacy TF SavedModel directory (Keras 3 path via TFSMLayer)
-        if os.path.isdir(mp) and _is_tf_saved_model_dir(mp):
-            input_slices = model_num_input_slices[i]
-            input_channels = num_modal_channels * input_slices
-            call_ep = model_call_endpoints[i] if i < len(model_call_endpoints) else "serving_default"
-            print(f"  [INFO] Detected TF SavedModel; wrapping via TFSMLayer (endpoint='{call_ep}').")
-            model = _wrap_saved_model_as_keras(mp, input_channels=input_channels, call_endpoint=call_ep)
-            loaded.append(model)
-            continue
-
-        # 4) Fallback: try Keras loader (covers directories that might be Keras)
-        model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
+            model = build_model_from_train_config(train_cfg)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
         loaded.append(model)
 
     return loaded
@@ -194,7 +131,6 @@ def build_model_from_train_config(config_path):
         use_se_blocks=use_se_blocks,
         use_deep_supervision=use_deep_supervision,
     )
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return model
 
 
@@ -203,37 +139,6 @@ def _train_config_requires_brainiac(config_path: str) -> bool:
     cp = configparser.ConfigParser()
     cp.read(config_path)
     return cp["DEFAULT"].getboolean("use_brainiac_embeddings", fallback=False)
-
-
-########################################################################
-# Helper: Load a pretrained model (full model or weight-only HDF5).
-########################################################################
-def load_pretrained_model(mp, train_config_path, min_hw, num_input_slices):
-    """
-    Attempts to load the full model from the path mp. If that fails with a ValueError
-    (indicating that the file contains only weights), rebuilds the model architecture using
-    the provided training config file and loads the weights after initializing the model
-    with a dummy input tensor.
-
-    Parameters:
-      mp (str): Path to the model file.
-      train_config_path (str): Path to the training configuration file.
-      min_hw (int): Minimum height/width to use for the dummy input.
-      num_input_slices (int): Number of input slices (used in computing input channels).
-    """
-    try:
-        model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        return model
-    except ValueError as e:
-        if "No model config found" in str(e):
-            model = build_model_from_train_config(train_config_path)
-            # Create a dummy input tensor based on the minimum height/width and the model's input channels.
-            dummy_input = tf.zeros((1, min_hw, min_hw, model.input_channels))
-            _ = model(dummy_input)  # Run a forward pass to create the variables.
-            model.load_weights(mp)
-            return model
-        else:
-            raise
 
 
 ########################################################################
@@ -301,6 +206,10 @@ def run_segmentation(
     tiebreaker_model=0,
     debug_models=False
 ):
+    force_cpu = os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    device = torch.device("cuda" if torch.cuda.is_available() and not force_cpu else "cpu")
+    print(f"[INFO] PyTorch device: {device}")
+
     # --- A) Parse segmentation config and load paths ---
     if not os.path.isfile(segmentation_config_file):
         raise FileNotFoundError(f"Config file not found: {segmentation_config_file}")
@@ -328,7 +237,7 @@ def run_segmentation(
     if len(model_paths) != len(model_slicing_planes):
         raise ValueError("Mismatch between the number of model paths and model_train_slicing_planes.")
 
-    # Optional: per-model SavedModel call endpoints (defaults to 'serving_default')
+    # Legacy configs may include this key; PyTorch checkpoints ignore it.
     _endpoints_str = config_parser["DEFAULT"].get("model_call_endpoints", None)
     if _endpoints_str:
         model_call_endpoints = [s.strip() for s in _endpoints_str.split(",")]
@@ -368,6 +277,7 @@ def run_segmentation(
         model_min_hw=model_min_hw,
         num_modal_channels=num_modal_channels,
         model_call_endpoints=model_call_endpoints,
+        device=device,
     )
 
     # --- C) Detect BrainIAC dependency and prepare weights/temp dir ---
@@ -465,12 +375,15 @@ def run_segmentation(
             mask_info = transform_infos[0]
             val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
             all_preds = []
-            for x_batch, m_batch in val_gen:
-                batch_pred = model(x_batch, training=False)
-                # Handle deep supervision tuple (training=False normally suppresses it)
-                if isinstance(batch_pred, tuple):
-                    batch_pred = batch_pred[0]
-                all_preds.append(batch_pred.numpy() if hasattr(batch_pred, 'numpy') else batch_pred)
+            with torch.no_grad():
+                for x_batch, m_batch in val_gen:
+                    x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
+                    x_tensor = x_tensor.permute(0, 3, 1, 2).contiguous()
+                    batch_logits = model(x_tensor)
+                    if isinstance(batch_logits, tuple):
+                        batch_logits = batch_logits[0]
+                    batch_pred = F.softmax(batch_logits, dim=-1).cpu().numpy()
+                    all_preds.append(batch_pred)
 
             if not all_preds:
                 print(f"[WARNING] No slices processed for exam {subj_idx+1} ({base_name}).")
@@ -515,7 +428,7 @@ def run_segmentation(
             plane_outputs.append(final_arr)
 
         print(f"[INFO] Merging via {merging_method}...")
-        merged_label = majority_vote(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+        merged_label = merge_predictions(plane_outputs).astype(np.uint8)
         nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
         print(f"[INFO] Final seg => {out_path}")
 
@@ -538,15 +451,14 @@ def main():
     parser.add_argument("--overwrite_existing_outputs", action="store_true", default=False,
                         help="Overwrite existing outputs instead of skipping.")
     parser.add_argument("--use_cpu", action="store_true", default=False,
-                        help="Force TensorFlow to use CPU.")
+                        help="Force PyTorch to use CPU.")
     parser.add_argument("--debug_models", action="store_true", default=False,
                         help="Save each model's pre-merge label for debug.")
 
     args = parser.parse_args()
     if args.use_cpu:
-        print("[INFO] Forcing TensorFlow to use CPU.")
+        print("[INFO] Forcing PyTorch to use CPU.")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        tf.config.set_visible_devices([], "GPU")
     run_segmentation(
         segmentation_config_file=args.config,
         slice_batch_size=args.slice_batch_size,

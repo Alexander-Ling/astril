@@ -5,7 +5,6 @@ import numpy as np
 import nibabel as nib
 import psutil
 import matplotlib.pyplot as plt
-from tensorflow.keras.utils import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from scipy.ndimage import rotate
 
@@ -14,6 +13,14 @@ from nibabel.orientations import io_orientation, ornt_transform, apply_orientati
 from nibabel.funcs import as_closest_canonical
 
 from .config import n_cores, minimum_height_width
+
+
+class Sequence:
+    """Minimal sequence protocol used by astril's NumPy batch generators."""
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
 
 # -------------------------------------------------
 # Basic I/O

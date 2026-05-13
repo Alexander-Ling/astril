@@ -16,6 +16,8 @@ import shutil
 from pathlib import Path
 import configparser
 from typing import TYPE_CHECKING
+import torch
+import torch.nn.functional as F
 if TYPE_CHECKING:
     # Optional: keeps editors/type-checkers happy without importing at runtime
     import nibabel as nib  # noqa: F401
@@ -25,7 +27,7 @@ if TYPE_CHECKING:
 # Model set specification (single source of truth)
 # ------------------------------------------------------------
 GBM_V1_SPEC = {
-    # name: {plane, model_dir (SavedModel folder name), train_cfg filename}
+    # name: {plane, model checkpoint stem, train_cfg filename}
     "Axial_1":     {"plane": "Axial",    "dir": "Axial_1",    "cfg": "Axial_1_train_parameters.cfg"},
     "Coronal_1":   {"plane": "Coronal",  "dir": "Coronal_1",  "cfg": "Coronal_1_train_parameters.cfg"},
     "Sagittal_1":  {"plane": "Sagittal", "dir": "Sagittal_1", "cfg": "Sagittal_1_train_parameters.cfg"},
@@ -43,25 +45,21 @@ def _resolve_gbm_family_root(family: str = "GBM_seg_v1") -> Path:
 def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1"):
     """
     For the given list of logical model names (keys in GBM_V1_SPEC),
-    return parallel lists: model_paths (dirs/.keras/.h5), train_cfg_paths, planes.
+    return parallel lists: model_paths (.pt), train_cfg_paths, planes.
     """
     root = _resolve_gbm_family_root(family)
     model_paths, train_cfgs, planes = [], [], []
     for name in names:
         spec = GBM_V1_SPEC[name]
-        model_dir = root / spec["dir"]
-        keras_file = (root / f"{spec['dir']}.keras")
-        h5_file = (root / f"{spec['dir']}.h5")
-        # Prefer directory SavedModel (what your downloader now produces)
-        if model_dir.is_dir():
-            model_paths.append(str(model_dir))
-        elif keras_file.is_file():
-            model_paths.append(str(keras_file))
-        elif h5_file.is_file():
-            model_paths.append(str(h5_file))
+        pt_file = root / f"{spec['dir']}.pt"
+        nested_pt_file = root / spec["dir"] / f"{spec['dir']}.pt"
+        if pt_file.is_file():
+            model_paths.append(str(pt_file))
+        elif nested_pt_file.is_file():
+            model_paths.append(str(nested_pt_file))
         else:
             # Leave an unresolved path to fail fast later
-            model_paths.append(str(model_dir))  # expected SavedModel dir
+            model_paths.append(str(pt_file))
         train_cfgs.append(str(root / spec["cfg"]))
         planes.append(spec["plane"])
     return model_paths, train_cfgs, planes
@@ -69,7 +67,7 @@ def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1"):
 def _required_gbm_paths(family: str = "GBM_seg_v1") -> tuple[list[Path], list[Path]]:
     """Return (required_model_dirs_or_files, required_cfg_files) for presence checks."""
     root = _resolve_gbm_family_root(family)
-    dirs_or_files = [root / spec["dir"] for spec in GBM_V1_SPEC.values()]
+    dirs_or_files = [root / f"{spec['dir']}.pt" for spec in GBM_V1_SPEC.values()]
     cfgs = [root / spec["cfg"] for spec in GBM_V1_SPEC.values()]
     return dirs_or_files, cfgs
 
@@ -181,6 +179,8 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         undo_all_transforms,
         apply_inverse_canonical_4d,
         majority_vote,
+        average_prob,
+        max_prob,
     )
 
     # Parse segmentation config file.
@@ -263,11 +263,16 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         mask_info = transform_infos[0]
         val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
         all_preds = []
-        for x_batch, _ in val_gen:
-            batch_pred = model(x_batch, training=False)
-            if isinstance(batch_pred, tuple):
-                batch_pred = batch_pred[0]
-            all_preds.append(batch_pred.numpy() if hasattr(batch_pred, 'numpy') else batch_pred)
+        device = next(model.parameters()).device
+        model.eval()
+        with torch.no_grad():
+            for x_batch, _ in val_gen:
+                x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
+                x_tensor = x_tensor.permute(0, 3, 1, 2).contiguous()
+                batch_logits = model(x_tensor)
+                if isinstance(batch_logits, tuple):
+                    batch_logits = batch_logits[0]
+                all_preds.append(F.softmax(batch_logits, dim=-1).cpu().numpy())
         if not all_preds:
             print(f"[WARNING] No predictions for exam {subject_index+1} (model {m_idx+1}).")
             reassembled_4d = np.zeros((oh, ow, od, n_cls), dtype=np.float32)
@@ -305,7 +310,14 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             print(f"[DEBUG] Wrote per-model debug label to {dbg_path}")
         plane_outputs.append(reoriented_4d)
     print(f"[INFO] Merging predictions for exam {subject_index+1} via {merging_method}...")
-    merged_label = majority_vote(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+    if merging_method == "majority_vote":
+        merged_label = majority_vote(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+    elif merging_method == "average_prob":
+        merged_label = average_prob(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+    elif merging_method == "max_prob":
+        merged_label = max_prob(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+    else:
+        raise ValueError(f"Unknown merging method '{merging_method}'")
     nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
     print(f"[INFO] Final segmentation saved: {out_path}")
 
