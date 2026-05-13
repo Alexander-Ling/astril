@@ -151,6 +151,7 @@ def compute_brainiac_saliency_maps(
     output_dir: Path,
     device: Optional[str] = None,
     overwrite: bool = False,
+    window_stride: int = 48,
 ) -> List[str]:
     """
     Runs BrainIAC attention rollout on each NIfTI volume and saves the resulting
@@ -164,9 +165,11 @@ def compute_brainiac_saliency_maps(
     astril's preprocessing pipeline). Any MRI modality is accepted; only the
     spatial content matters for attention computation.
 
-    BrainIAC operates at 96x96x96 / 1mm isotropic. Inputs are resampled to
-    that space before processing, then saliency maps are resampled back to the
-    original voxel space before saving.
+    BrainIAC is a ViT with 16^3-voxel patches designed for 96^3 inputs at 1 mm
+    isotropic. To preserve full spatial resolution across the entire volume, the
+    input is tiled with overlapping 96^3 windows (stride=window_stride, default
+    48 voxels = 50% overlap). Attention rollout is computed for each window and
+    results are blended with a 3-D cosine taper to suppress seam artefacts.
     """
     # Lazy imports — only needed when this function is called
     try:
@@ -178,7 +181,7 @@ def compute_brainiac_saliency_maps(
         raise ImportError(_MISSING_DEPS_MSG) from e
 
     try:
-        from monai.networks.nets import ViT
+        from monai.networks.nets import ViT  # noqa: F401 — confirms monai is present
     except ImportError as e:
         raise ImportError(_MISSING_DEPS_MSG) from e
 
@@ -188,7 +191,7 @@ def compute_brainiac_saliency_maps(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load BrainIAC model
+    # Load BrainIAC model once; reuse across all scans
     model = _load_brainiac_model(weights_path, device)
     model.eval()
 
@@ -203,26 +206,17 @@ def compute_brainiac_saliency_maps(
 
         print(f"[brainiac] Computing saliency map for: {stem}")
 
-        # Resample input to 96^3 at 1mm isotropic
         sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
-        resampled, original_info = _resample_to_brainiac_space(sitk_img)
+        sitk_1mm = _ensure_1mm_isotropic(sitk_img)
 
-        # Convert to tensor: (1, 1, 96, 96, 96)
-        arr = sitk.GetArrayFromImage(resampled).astype(np.float32)
-        arr = _normalize_volume(arr)
-        tensor = torch.from_numpy(arr[np.newaxis, np.newaxis]).to(device)
+        saliency_arr = _compute_sliding_window_saliency(
+            sitk_1mm, model, device, stride=window_stride
+        )
 
-        # Compute attention rollout saliency
-        with torch.no_grad():
-            saliency_arr = _compute_attention_rollout(model, tensor, device)
-
-        # Resample saliency back to original space
-        saliency_sitk = sitk.GetImageFromArray(saliency_arr.astype(np.float32))
-        saliency_sitk.CopyInformation(resampled)
-        saliency_original = _resample_to_original_space(saliency_sitk, original_info)
-
-        # Save as NIfTI
-        nib_img = _sitk_to_nibabel(saliency_original)
+        # Attach 1 mm geometry then convert to RAS NIfTI
+        saliency_sitk = sitk.GetImageFromArray(saliency_arr)
+        saliency_sitk.CopyInformation(sitk_1mm)
+        nib_img = _sitk_to_nibabel(saliency_sitk)
         nib.save(nib_img, str(out_path))
         output_paths.append(str(out_path))
 
@@ -282,57 +276,119 @@ def _load_brainiac_model(weights_path: Path, device: str):
                 break
         cleaned[k] = v
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    if missing:
-        print(f"[brainiac] Warning: {len(missing)} keys not loaded from checkpoint "
-              f"(may be MONAI API rename): {missing[:3]}{'...' if len(missing) > 3 else ''}")
+    cross_attn_keys = [k for k in missing if "cross_attn" in k or "norm_cross_attn" in k]
+    other_missing = [k for k in missing if k not in cross_attn_keys]
+    if cross_attn_keys:
+        # MONAI added optional cross-attention sub-layers to SABlock in newer versions.
+        # These are never invoked in a standard single-input ViT forward pass, so
+        # randomly-initialised weights here have no effect on saliency maps.
+        print(f"[brainiac] Note: {len(cross_attn_keys)} cross-attention keys not in checkpoint "
+              f"(MONAI API addition, unused in standard forward pass — safe to ignore).")
+    if other_missing:
+        print(f"[brainiac] Warning: {len(other_missing)} unexpected missing keys from checkpoint: "
+              f"{other_missing[:3]}{'...' if len(other_missing) > 3 else ''}")
 
     return model
 
 
-def _resample_to_brainiac_space(sitk_img):
-    """Resamples a SimpleITK image to 96^3 at 1mm isotropic. Returns (resampled, original_info)."""
+def _ensure_1mm_isotropic(sitk_img, tol: float = 0.01):
+    """Returns the image unchanged if already 1 mm isotropic (within tol),
+    otherwise resamples to 1 mm isotropic preserving the physical FOV."""
     import SimpleITK as sitk
+    import numpy as np
 
-    original_info = {
-        "size": sitk_img.GetSize(),
-        "spacing": sitk_img.GetSpacing(),
-        "origin": sitk_img.GetOrigin(),
-        "direction": sitk_img.GetDirection(),
-    }
+    spacing = np.array(sitk_img.GetSpacing())
+    if np.all(np.abs(spacing - 1.0) < tol):
+        return sitk_img
+
+    orig_size = np.array(sitk_img.GetSize(), dtype=float)
+    new_size = np.round(orig_size * spacing).astype(int).tolist()
 
     resampler = sitk.ResampleImageFilter()
     resampler.SetOutputSpacing([1.0, 1.0, 1.0])
-    resampler.SetSize([96, 96, 96])
+    resampler.SetSize(new_size)
     resampler.SetOutputOrigin(sitk_img.GetOrigin())
     resampler.SetOutputDirection(sitk_img.GetDirection())
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0.0)
-
-    # Adjust origin to center the resampled volume within the original FOV
-    orig_spacing = sitk_img.GetSpacing()
-    orig_size = sitk_img.GetSize()
-    center_orig = [
-        sitk_img.GetOrigin()[i] + (orig_size[i] * orig_spacing[i]) / 2.0
-        for i in range(3)
-    ]
-    new_origin = [center_orig[i] - 48.0 for i in range(3)]
-    resampler.SetOutputOrigin(new_origin)
-
-    return resampler.Execute(sitk_img), original_info
+    return resampler.Execute(sitk_img)
 
 
-def _resample_to_original_space(saliency_sitk, original_info):
-    """Resamples a saliency map back to the original scan space."""
+def _make_cosine_window(size: int):
+    """3-D raised-cosine taper: weight=1 at the centre, 0 at every edge face.
+    Used to blend overlapping window saliency maps without seam artefacts."""
+    import numpy as np
+    t = np.linspace(0.0, np.pi, size, dtype=np.float32)
+    w1d = (1.0 - np.cos(t)) / 2.0          # 0 → 1 → 0
+    return w1d[:, None, None] * w1d[None, :, None] * w1d[None, None, :]
+
+
+def _compute_sliding_window_saliency(
+    sitk_1mm,
+    model,
+    device: str,
+    window_size: int = 96,
+    stride: int = 48,
+):
+    """Tile a 1 mm isotropic SimpleITK image with overlapping 96^3 windows,
+    compute BrainIAC attention-rollout saliency for each, and blend with a
+    cosine taper. Returns a float32 numpy array (z, y, x) in SimpleITK order.
+
+    At 50 % overlap (stride=48) a 240×240×155 volume requires 4×4×2 = 32
+    forward passes; each patch covers 16 mm in original space rather than the
+    ~40 mm produced by down-sampling the full FOV to 96^3.
+    """
+    import numpy as np
     import SimpleITK as sitk
+    import torch
 
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetOutputSpacing(original_info["spacing"])
-    resampler.SetSize(original_info["size"])
-    resampler.SetOutputOrigin(original_info["origin"])
-    resampler.SetOutputDirection(original_info["direction"])
-    resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetDefaultPixelValue(0.0)
-    return resampler.Execute(saliency_sitk)
+    sz_x, sz_y, sz_z = sitk_1mm.GetSize()   # SimpleITK: (x, y, z)
+
+    def window_starts(size: int) -> list:
+        if size <= window_size:
+            return [0]
+        starts = list(range(0, size - window_size, stride))
+        if starts[-1] + window_size < size:
+            starts.append(size - window_size)
+        return starts
+
+    xs = window_starts(sz_x)
+    ys = window_starts(sz_y)
+    zs = window_starts(sz_z)
+
+    total = len(xs) * len(ys) * len(zs)
+    print(f"[brainiac]   sliding-window saliency: {len(xs)}×{len(ys)}×{len(zs)} = {total} windows")
+
+    # Accumulators in SimpleITK array order (z, y, x)
+    accum   = np.zeros((sz_z, sz_y, sz_x), dtype=np.float64)
+    weights = np.zeros((sz_z, sz_y, sz_x), dtype=np.float64)
+    blend   = _make_cosine_window(window_size)  # (w, w, w) = (z, y, x)
+
+    roi = sitk.RegionOfInterestImageFilter()
+
+    for sx in xs:
+        for sy in ys:
+            for sz in zs:
+                roi.SetIndex([sx, sy, sz])
+                roi.SetSize([window_size, window_size, window_size])
+                crop = roi.Execute(sitk_1mm)
+
+                arr = sitk.GetArrayFromImage(crop).astype(np.float32)  # (z,y,x)
+                arr = _normalize_volume(arr)
+                tensor = torch.from_numpy(arr[np.newaxis, np.newaxis]).to(device)
+
+                sal = _compute_attention_rollout(model, tensor, device)  # (w,w,w)
+
+                accum  [sz:sz+window_size, sy:sy+window_size, sx:sx+window_size] += sal * blend
+                weights[sz:sz+window_size, sy:sy+window_size, sx:sx+window_size] += blend
+
+    saliency = (accum / np.maximum(weights, 1e-9)).astype(np.float32)
+
+    sal_min, sal_max = saliency.min(), saliency.max()
+    if sal_max > sal_min:
+        saliency = (saliency - sal_min) / (sal_max - sal_min)
+
+    return saliency
 
 
 def _normalize_volume(arr):
@@ -400,7 +456,12 @@ def _compute_attention_rollout(model, tensor, device):
 
 
 def _sitk_to_nibabel(sitk_img):
-    """Converts a SimpleITK image to a nibabel Nifti1Image."""
+    """Converts a SimpleITK image to a nibabel Nifti1Image.
+
+    SimpleITK stores images internally in LPS (DICOM convention); NIfTI/nibabel
+    uses RAS. The LPS→RAS conversion negates the x and y components of both the
+    origin and the direction matrix columns.
+    """
     import numpy as np
     import nibabel as nib
     import SimpleITK as sitk
@@ -408,12 +469,14 @@ def _sitk_to_nibabel(sitk_img):
     arr = sitk.GetArrayFromImage(sitk_img)  # (z, y, x) in SimpleITK
     arr = np.transpose(arr, (2, 1, 0))      # -> (x, y, z) for nibabel
 
-    spacing = sitk_img.GetSpacing()
-    origin = sitk_img.GetOrigin()
+    spacing = np.array(sitk_img.GetSpacing())
+    origin = np.array(sitk_img.GetOrigin())
     direction = np.array(sitk_img.GetDirection()).reshape(3, 3)
 
+    # LPS → RAS: negate x and y axes
+    lps_to_ras = np.diag([-1., -1., 1.])
     affine = np.eye(4)
-    affine[:3, :3] = direction * np.array(spacing)
-    affine[:3, 3] = origin
+    affine[:3, :3] = (lps_to_ras @ direction) * spacing
+    affine[:3, 3] = lps_to_ras @ origin
 
     return nib.Nifti1Image(arr, affine)
