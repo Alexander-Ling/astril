@@ -97,10 +97,12 @@ def main():
     # BrainIAC
     parser.add_argument("--Use_BrainIAC_Embeddings", action="store_true",
                         help="Pre-compute BrainIAC saliency maps and use as an extra input channel.")
-    parser.add_argument("--HF_Token", type=str, default=None,
-                        help="HuggingFace API token for downloading BrainIAC weights automatically.")
     parser.add_argument("--BrainIAC_Weights_Path", type=str, default=None,
-                        help="Path to a locally downloaded BrainIAC .ckpt file (alternative to --HF_Token).")
+                        help=(
+                            "Optional path to a locally downloaded BrainIAC .ckpt file. "
+                            "If not provided, weights are downloaded automatically from Dropbox "
+                            "on first use and cached for subsequent runs."
+                        ))
 
     args = parser.parse_args()
     parse_train_parameters(args.config)
@@ -152,7 +154,6 @@ def main():
         from .data_loading import read_paths_from_file
 
         weights_path = ensure_brainiac_weights(
-            hf_token=args.HF_Token,
             weights_path=args.BrainIAC_Weights_Path,
         )
 

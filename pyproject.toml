@@ -10,7 +10,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.6.9996"
+version = "0.6.9997"
 description = "Automated segmentation toolkit for radiology image libraries. Currently optimized for MRI brain image processing. Specifically, performs automatic scan selection of DICOM series, conversion to NIFTI/NRRD formats, preprocessing (co-registration, skull stripping, normalization), and GBM segmentation. Also includes robust toolset to train new segmentation models, and generalized functions for processing radiomic images."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -66,7 +66,6 @@ preprocessing = [
 brainiac = [
     "torch>=2.0",
     "monai>=1.3.2",
-    "huggingface_hub>=0.20",
     "einops>=0.7",
     "scikit-image>=0.21",
 ]

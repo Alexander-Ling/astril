@@ -384,7 +384,7 @@ def run_segmentation(
         )
         import tempfile
         try:
-            brainiac_weights_path = ensure_brainiac_weights(hf_token=None, weights_path=None)
+            brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
         except BrainIACWeightsNotFoundError as e:
             raise RuntimeError(str(e))
         brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))

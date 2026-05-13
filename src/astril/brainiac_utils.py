@@ -6,11 +6,13 @@ BrainIAC reference:
   "A generalizable foundation model for analysis of human brain MRI"
   Nature Neuroscience, Feb 2026. https://doi.org/10.1038/s41593-026-02202-6
   GitHub: https://github.com/AIM-KannLab/BrainIAC
-  HuggingFace: https://huggingface.co/Divytak/brainiac
+
+Weights are downloaded automatically from Dropbox on first use and cached
+locally. A manual path override is available via --BrainIAC_Weights_Path.
+Astril does not redistribute BrainIAC weights.
 
 License note: BrainIAC weights are distributed under a custom non-commercial
-research-only license. Users must agree to the BrainIAC license on HuggingFace
-before downloading. Astril does not redistribute BrainIAC weights.
+research-only license (see GitHub for full terms).
 """
 
 from __future__ import annotations
@@ -21,22 +23,24 @@ from typing import List, Optional
 
 from .paths import preferred_models_dir
 
-BRAINIAC_HF_REPO = "Divytak/brainiac"
-# Exact filename resolved at download time via huggingface_hub.list_repo_files().
-# This fallback name is used only when the repo has exactly one .ckpt file.
-_BRAINIAC_CKPT_FALLBACK = "BrainIAC.ckpt"
+# Direct download URL for the BrainIAC foundation model checkpoint.
+# dl=1 forces Dropbox to serve the raw file rather than the preview page.
+BRAINIAC_CKPT_URL = (
+    "https://www.dropbox.com/scl/fo/i51xt63roognvt7vuslbl/"
+    "AMblt6reQVvlSrORTB3_2lE/BrainIAC.ckpt"
+    "?rlkey=9w55le6tslwxlfz6c0viylmjb&dl=1"
+)
+BRAINIAC_CKPT_FILENAME = "BrainIAC.ckpt"
 
-_MISSING_WEIGHTS_MSG = (
-    "BrainIAC model weights not found locally.\n\n"
-    "To use BrainIAC embeddings you must do one of the following:\n\n"
-    "  (a) Provide --HF_Token <your_token> so astril can download the weights\n"
-    "      automatically from HuggingFace. Obtain a free token at:\n"
-    "      https://huggingface.co/settings/tokens\n"
-    "      You may also need to accept the BrainIAC license agreement at:\n"
-    "      https://huggingface.co/Divytak/brainiac\n\n"
-    "  (b) Manually download the BrainIAC checkpoint from the link above,\n"
-    "      then pass the local file path via --BrainIAC_Weights_Path <path>.\n\n"
-    "A free HuggingFace account is required."
+_DOWNLOAD_FAILED_MSG = (
+    "Automatic download of BrainIAC weights failed.\n\n"
+    "You can download the checkpoint manually from the Dropbox folder linked\n"
+    "in the BrainIAC GitHub repository:\n\n"
+    "  https://github.com/AIM-KannLab/BrainIAC\n\n"
+    "Once downloaded, supply the local path via:\n\n"
+    "  --BrainIAC_Weights_Path <path/to/BrainIAC.ckpt>\n\n"
+    "The weights will be cached automatically so you will not need to supply\n"
+    "the path again."
 )
 
 _MISSING_DEPS_MSG = (
@@ -44,7 +48,7 @@ _MISSING_DEPS_MSG = (
     "Install them with:\n\n"
     "  pip install astril[brainiac]\n\n"
     "or manually:\n\n"
-    "  pip install torch>=2.0 monai>=1.3.2 huggingface_hub>=0.20 einops>=0.7"
+    "  pip install torch>=2.0 monai>=1.3.2 einops>=0.7"
 )
 
 
@@ -82,77 +86,53 @@ def copy_user_weights(src_path: str, dest_dir: Optional[Path] = None) -> Path:
     return dest
 
 
-def download_brainiac_weights(hf_token: str, dest_dir: Optional[Path] = None) -> Path:
+def download_brainiac_weights(dest_dir: Optional[Path] = None) -> Path:
     """
-    Downloads the BrainIAC checkpoint from HuggingFace using huggingface_hub.
-    Returns the local path to the downloaded file.
-    Raises BrainIACWeightsNotFoundError with a clear message on auth failure.
+    Downloads BrainIAC.ckpt from Dropbox into the astril cache directory.
+    Uses requests (a core astril dependency) with a tqdm progress bar.
+    Returns the path to the downloaded file.
+    Raises BrainIACWeightsNotFoundError if the download fails.
     """
-    try:
-        from huggingface_hub import hf_hub_download, list_repo_files
-        from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
-        from requests.exceptions import HTTPError
-    except ImportError:
-        raise ImportError(_MISSING_DEPS_MSG)
+    import requests
+    from tqdm import tqdm
 
-    dest = dest_dir or _brainiac_cache_dir()
+    dest = (dest_dir or _brainiac_cache_dir()) / BRAINIAC_CKPT_FILENAME
+    tmp = dest.with_suffix(".part")
 
-    # Resolve the exact checkpoint filename from the repo
+    print(f"[brainiac] Downloading BrainIAC weights from Dropbox...")
+    print(f"[brainiac] Destination: {dest}")
+
     try:
-        repo_files = list(list_repo_files(BRAINIAC_HF_REPO, token=hf_token))
-        ckpt_files = [f for f in repo_files if f.endswith(".ckpt")]
-        if not ckpt_files:
-            raise BrainIACWeightsNotFoundError(
-                f"No .ckpt files found in HuggingFace repo '{BRAINIAC_HF_REPO}'. "
-                "The repository structure may have changed. Check: "
-                f"https://huggingface.co/{BRAINIAC_HF_REPO}"
-            )
-        filename = ckpt_files[0]
-        if len(ckpt_files) > 1:
-            print(
-                f"[brainiac] Multiple checkpoints found in repo: {ckpt_files}. "
-                f"Using '{filename}'."
-            )
-    except (RepositoryNotFoundError, HTTPError) as e:
+        with requests.get(BRAINIAC_CKPT_URL, stream=True, timeout=60) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length", 0)) or None
+            with tqdm(total=total, unit="B", unit_scale=True, desc="BrainIAC.ckpt") as bar:
+                with tmp.open("wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+                            bar.update(len(chunk))
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
         raise BrainIACWeightsNotFoundError(
-            f"Could not access HuggingFace repo '{BRAINIAC_HF_REPO}'. "
-            "Verify your HF_Token is valid and you have accepted the BrainIAC "
-            f"license at https://huggingface.co/{BRAINIAC_HF_REPO}\n"
-            f"Original error: {e}"
+            f"{_DOWNLOAD_FAILED_MSG}\n\nOriginal error: {e}"
         )
 
-    print(f"[brainiac] Downloading '{filename}' from {BRAINIAC_HF_REPO}...")
-    try:
-        local_path = hf_hub_download(
-            repo_id=BRAINIAC_HF_REPO,
-            filename=filename,
-            token=hf_token,
-            local_dir=str(dest),
-        )
-    except (EntryNotFoundError, HTTPError) as e:
-        raise BrainIACWeightsNotFoundError(
-            f"Failed to download BrainIAC weights. "
-            f"Check your token and license acceptance.\nError: {e}"
-        )
-
-    final_path = dest / filename
-    if Path(local_path).resolve() != final_path.resolve():
-        shutil.copy2(local_path, str(final_path))
-
-    print(f"[brainiac] Weights saved to: {final_path}")
-    return final_path
+    tmp.replace(dest)
+    print(f"[brainiac] Weights saved to: {dest}")
+    return dest
 
 
-def ensure_brainiac_weights(
-    hf_token: Optional[str],
-    weights_path: Optional[str],
-) -> Path:
+def ensure_brainiac_weights(weights_path: Optional[str]) -> Path:
     """
     Resolves BrainIAC weights using the following priority:
-      1. User-supplied weights_path (copied into cache)
+      1. User-supplied weights_path (copied into cache on first use)
       2. Previously cached weights
-      3. Download from HuggingFace using hf_token
-      4. Raise BrainIACWeightsNotFoundError with instructions
+      3. Automatic download from Dropbox
+      4. Raise BrainIACWeightsNotFoundError with manual download instructions
+
+    After the first successful resolution the weights are cached locally,
+    so neither weights_path nor a download is needed on subsequent runs.
     """
     if weights_path is not None:
         return copy_user_weights(weights_path)
@@ -162,10 +142,7 @@ def ensure_brainiac_weights(
         print(f"[brainiac] Using cached weights: {cached}")
         return cached
 
-    if hf_token is not None:
-        return download_brainiac_weights(hf_token)
-
-    raise BrainIACWeightsNotFoundError(_MISSING_WEIGHTS_MSG)
+    return download_brainiac_weights()
 
 
 def compute_brainiac_saliency_maps(
@@ -257,7 +234,13 @@ def compute_brainiac_saliency_maps(
 # ---------------------------------------------------------------------------
 
 def _load_brainiac_model(weights_path: Path, device: str):
-    """Loads the BrainIAC ViT backbone from a .ckpt checkpoint."""
+    """Loads the BrainIAC ViT backbone from a .ckpt checkpoint.
+
+    MONAI 1.5 renamed pos_embed -> proj_type (patch projection) and added
+    pos_embed_type (position embedding style). save_attn=True stores attention
+    weights on each block's .attn.att_mat after every forward pass, which is
+    used directly by _compute_attention_rollout without needing hooks.
+    """
     import torch
     from monai.networks.nets import ViT
 
@@ -269,9 +252,11 @@ def _load_brainiac_model(weights_path: Path, device: str):
         mlp_dim=3072,
         num_layers=12,
         num_heads=12,
-        pos_embed="conv",
+        proj_type="conv",           # was pos_embed="conv" in MONAI < 1.4
+        pos_embed_type="learnable", # standard ViT learnable positional embeddings
         classification=False,
         dropout_rate=0.0,
+        save_attn=True,             # stores att_mat on each SABlock after forward
     ).to(device)
 
     ckpt = torch.load(str(weights_path), map_location=device, weights_only=False)
@@ -287,7 +272,8 @@ def _load_brainiac_model(weights_path: Path, device: str):
         cleaned[k] = v
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
     if missing:
-        print(f"[brainiac] Warning: missing keys in checkpoint: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        print(f"[brainiac] Warning: {len(missing)} keys not loaded from checkpoint "
+              f"(may be MONAI API rename): {missing[:3]}{'...' if len(missing) > 3 else ''}")
 
     return model
 
@@ -351,53 +337,50 @@ def _compute_attention_rollout(model, tensor, device):
     """
     Computes a 3D saliency map via attention rollout from BrainIAC's ViT backbone.
     Returns a float32 numpy array of shape (96, 96, 96).
+
+    MONAI 1.5 ViT (with save_attn=True) stores attention weights directly on
+    each block as block.attn.att_mat with shape (batch, heads, patches, patches).
+    There is no CLS token in MONAI's ViT when classification=False, so rollout
+    produces a (patches, patches) matrix; per-patch importance is the mean
+    attention received across all query positions (column mean of the rollout).
     """
     import torch
     import numpy as np
 
-    # Register hooks to capture attention weights from each transformer block
-    attentions = []
-
-    def _hook(module, input, output):
-        # MONAI ViT SABlock returns (x, attn_weights) or just x depending on version
-        if isinstance(output, tuple) and len(output) == 2:
-            attentions.append(output[1].detach().cpu())
-
-    hooks = []
-    for block in model.blocks:
-        hooks.append(block.attn.register_forward_hook(_hook))
+    num_patches = 6 * 6 * 6  # 216 patches for 96^3 input / 16^3 patch size
 
     with torch.no_grad():
         _ = model(tensor)
 
-    for h in hooks:
-        h.remove()
+    # Collect per-layer attention matrices stored by save_attn=True
+    # att_mat shape: (batch, heads, num_patches, num_patches)
+    attentions = [block.attn.att_mat.detach().cpu() for block in model.blocks]
 
-    if not attentions:
-        # Fallback: return uniform saliency map if hooks captured nothing
+    if not attentions or attentions[0].shape[-1] != num_patches:
         return np.ones((96, 96, 96), dtype=np.float32)
 
-    # Attention rollout: multiply attention maps across layers
-    # Each attn: (batch, heads, num_patches+1, num_patches+1)
-    num_patches = 6 * 6 * 6  # 216 patches for 96^3 / 16^3
-    rollout = torch.eye(num_patches + 1)
+    # Attention rollout across layers:
+    # For each layer: avg over heads, add residual identity, row-normalise.
+    # Multiply layer matrices together to propagate attention through depth.
+    rollout = torch.eye(num_patches)
     for attn in attentions:
-        # Average over heads, add identity (residual connection)
-        attn_avg = attn[0].mean(0)  # (num_patches+1, num_patches+1)
-        attn_avg = attn_avg + torch.eye(num_patches + 1)
-        attn_avg = attn_avg / attn_avg.sum(dim=-1, keepdim=True)
+        attn_avg = attn[0].mean(0)                         # (P, P) avg over heads
+        attn_avg = attn_avg + torch.eye(num_patches)       # residual connection
+        attn_avg = attn_avg / attn_avg.sum(dim=-1, keepdim=True)  # row-normalise
         rollout = torch.mm(attn_avg, rollout)
 
-    # CLS token row: attention from CLS to all patches
-    cls_attn = rollout[0, 1:]  # (num_patches,) = (216,)
-    # Reshape to 3D spatial grid (6, 6, 6) and upsample to (96, 96, 96)
-    patch_grid = cls_attn.reshape(1, 1, 6, 6, 6).float()
+    # Per-patch importance = mean attention received across all query positions
+    # (column mean); equivalent to: how much does each patch get attended to?
+    patch_importance = rollout.mean(dim=0)  # (num_patches,) = (216,)
+
+    # Reshape to spatial grid (6, 6, 6) and upsample to (96, 96, 96)
+    patch_grid = patch_importance.reshape(1, 1, 6, 6, 6).float()
     saliency_3d = torch.nn.functional.interpolate(
         patch_grid, size=(96, 96, 96), mode='trilinear', align_corners=False
     )
     saliency_arr = saliency_3d[0, 0].numpy()
 
-    # Normalize to [0, 1]
+    # Normalise to [0, 1]
     sal_min, sal_max = saliency_arr.min(), saliency_arr.max()
     if sal_max > sal_min:
         saliency_arr = (saliency_arr - sal_min) / (sal_max - sal_min)
