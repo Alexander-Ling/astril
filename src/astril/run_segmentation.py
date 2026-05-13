@@ -33,12 +33,6 @@ from .model_architecture import (
     create_dynamic_unet_from_metadata,
 )
 
-# Import global configuration variables (if available).
-try:
-    from .config import num_channels as global_num_channels
-except ImportError:
-    global_num_channels = None
-
 ########################################################################
 # Shared helper: load a list of models given config-derived arrays
 ########################################################################
@@ -48,7 +42,6 @@ def load_models_for_config(
     model_num_input_slices: list[int],
     model_min_hw: list[int],
     num_modal_channels: int,
-    model_call_endpoints: list[str] | None = None,
     device: torch.device | None = None,
 ):
     """
@@ -62,20 +55,26 @@ def load_models_for_config(
     for i, mp in enumerate(model_paths):
         mp = mp.strip()
         print(f"[INFO] Loading model {i+1}/{len(model_paths)} => {mp}")
-        if not mp.endswith(".pt"):
+        if not mp.lower().endswith(".pt"):
             raise ValueError(
                 f"Unsupported model path '{mp}'. Migrated astril inference expects PyTorch .pt checkpoints."
             )
+        if not os.path.isfile(mp):
+            raise FileNotFoundError(f"PyTorch model checkpoint not found: {mp}")
         try:
             checkpoint = torch.load(mp, map_location=device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(mp, map_location=device)
         if "architecture" in checkpoint:
             model = create_dynamic_unet_from_metadata(checkpoint["architecture"])
+            state_dict = checkpoint.get("model_state_dict")
         else:
             train_cfg = model_train_config_files[i].strip()
-            model = build_model_from_train_config(train_cfg)
-        model.load_state_dict(checkpoint["model_state_dict"])
+            model = build_model_from_train_config(train_cfg, num_modal_channels=num_modal_channels)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+        if state_dict is None:
+            raise ValueError(f"Checkpoint '{mp}' does not contain model_state_dict.")
+        model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
         loaded.append(model)
@@ -85,7 +84,7 @@ def load_models_for_config(
 ########################################################################
 # Helper: Build model from a model training config file.
 ########################################################################
-def build_model_from_train_config(config_path):
+def build_model_from_train_config(config_path, num_modal_channels=None):
     """
     Reads a model training config file (INI format) and builds a U-Net model
     with the parameters specified.
@@ -101,20 +100,22 @@ def build_model_from_train_config(config_path):
     encoder_level_factors = [int(x.strip()) for x in cfg.get("encoder_level_factors", fallback="1,2,4,8").split(",") if x.strip()]
     center_depth = cfg.getint("center_depth", fallback=1)
     
-    # Try to get num_channels from the config; otherwise, infer from image_paths_files.
-    num_channels_val = cfg.get("num_channels", None)
-    if num_channels_val is None or num_channels_val.strip() == "":
-        ips = cfg.get("image_paths_files", "")
-        if ips.strip():
-            num_channels = len(ips.split(","))
-        else:
-            num_channels = 1  # fallback default
+    if num_modal_channels is not None:
+        num_channels = int(num_modal_channels)
     else:
-        num_channels = int(num_channels_val)
-    
-    # If a global value was defined (e.g. from .config) and is not None, use that instead.
-    if global_num_channels is not None:
-        num_channels = global_num_channels
+        # Try to get num_channels from the config; otherwise, infer from image_paths_files.
+        num_channels_val = cfg.get("num_channels", None)
+        if num_channels_val is None or num_channels_val.strip() == "":
+            ips = cfg.get("image_paths_files", "")
+            if ips.strip():
+                num_channels = len(ips.split(","))
+            else:
+                num_channels = 1  # fallback default
+        else:
+            num_channels = int(num_channels_val)
+
+    if num_channels < 1:
+        raise ValueError(f"Invalid num_channels={num_channels} while building model from {config_path}")
 
     input_channels = num_channels * num_input_slices
 
@@ -237,13 +238,6 @@ def run_segmentation(
     if len(model_paths) != len(model_slicing_planes):
         raise ValueError("Mismatch between the number of model paths and model_train_slicing_planes.")
 
-    # Legacy configs may include this key; PyTorch checkpoints ignore it.
-    _endpoints_str = config_parser["DEFAULT"].get("model_call_endpoints", None)
-    if _endpoints_str:
-        model_call_endpoints = [s.strip() for s in _endpoints_str.split(",")]
-    else:
-        model_call_endpoints = ["serving_default"] * len(model_paths)
-
     maskPattern = config_parser["DEFAULT"]["maskpattern"]
     segmentSuffix = config_parser["DEFAULT"]["segmentsuffix"]
 
@@ -276,7 +270,6 @@ def run_segmentation(
         model_num_input_slices=model_num_input_slices,
         model_min_hw=model_min_hw,
         num_modal_channels=num_modal_channels,
-        model_call_endpoints=model_call_endpoints,
         device=device,
     )
 

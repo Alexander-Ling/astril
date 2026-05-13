@@ -228,7 +228,7 @@ def compute_brainiac_saliency_maps(
 
     # Explicitly release model and CUDA memory before astril training starts.
     # PyTorch's caching allocator holds GPU blocks even after Python objects are
-    # freed; empty_cache() hands them back to CUDA so TF can claim them cleanly.
+    # freed; empty_cache() returns them before astril training starts.
     del model
     import gc
     gc.collect()

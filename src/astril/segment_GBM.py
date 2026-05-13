@@ -64,16 +64,21 @@ def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1"):
         planes.append(spec["plane"])
     return model_paths, train_cfgs, planes
 
-def _required_gbm_paths(family: str = "GBM_seg_v1") -> tuple[list[Path], list[Path]]:
-    """Return (required_model_dirs_or_files, required_cfg_files) for presence checks."""
+def _required_gbm_paths(family: str = "GBM_seg_v1") -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Return alternative .pt checkpoint locations and required cfg files."""
     root = _resolve_gbm_family_root(family)
-    dirs_or_files = [root / f"{spec['dir']}.pt" for spec in GBM_V1_SPEC.values()]
+    model_alternatives = [
+        (root / f"{spec['dir']}.pt", root / spec["dir"] / f"{spec['dir']}.pt")
+        for spec in GBM_V1_SPEC.values()
+    ]
     cfgs = [root / spec["cfg"] for spec in GBM_V1_SPEC.values()]
-    return dirs_or_files, cfgs
+    return model_alternatives, cfgs
 
 def _ensure_models_available() -> None:
-    need_dirs, need_cfgs = _required_gbm_paths("GBM_seg_v1")
-    missing = [p for p in (need_dirs + need_cfgs) if not p.exists()]
+    need_models, need_cfgs = _required_gbm_paths("GBM_seg_v1")
+    missing_models = [alts[0] for alts in need_models if not any(p.exists() for p in alts)]
+    missing_cfgs = [p for p in need_cfgs if not p.exists()]
+    missing = missing_models + missing_cfgs
     if missing:
         target = _resolve_gbm_family_root("GBM_seg_v1")
         items = "\n".join(f"  - {m}" for m in missing)
@@ -169,7 +174,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     extra_channel_path: optional path to an additional channel NIfTI (e.g. BrainIAC saliency map)
     appended to the subject's channel list at inference time.
     """
-    # Lazy imports: avoid TF/nibabel/numpy at module import time
+    # Lazy imports: avoid nibabel/numpy at module import time
     import nibabel as nib
     import numpy as np
     from .run_segmentation import (
@@ -383,7 +388,6 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     # STEP 2: Load pre-trained models (Model 1 and Model 2).
     #########################################
     print("[INFO] Loading Model 1 weights...")
-    loaded_models_model1 = []
     # derive lists needed by the unified loader from the model_1 config we just created
     cp_tmp = configparser.ConfigParser()
     cp_tmp.read(seg_config_model1)
@@ -397,7 +401,6 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         model_num_input_slices=m1_num_in,
         model_min_hw=m1_min_hw,
         num_modal_channels=num_modal_channels,
-        model_call_endpoints=None,
     )
     
     print("[INFO] Loading Model 2 weights...")
@@ -420,7 +423,6 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         model_num_input_slices=m2_num_in,
         model_min_hw=m2_min_hw,
         num_modal_channels=3,
-        model_call_endpoints=None,
     )
     
     #########################################

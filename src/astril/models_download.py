@@ -18,7 +18,7 @@ class ModelEntry:
     sha256: Optional[str]
     bytes: Optional[int]
     # Optional extra metadata (forward-compatible with richer models.json)
-    kind: Optional[str] = None            # e.g. "saved_model_zip"
+    kind: Optional[str] = None            # e.g. "pytorch_zip    "
     extract_to: Optional[str] = None      # target subdir name under models dir
     expect: Optional[List[str]] = None    # sanity-check paths after extract
 

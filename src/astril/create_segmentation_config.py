@@ -77,7 +77,7 @@ def create_segmentation_config(
        run_segmentation can use them.
     4. Creates a central `segmentation_parameters.cfg` describing:
        - The .cfg files for channels & mask
-       - The model checkpoints/paths & their *training* parameters
+       - The PyTorch .pt model checkpoints & their *training* parameters
        - The merging method (e.g. "majority_vote")
        - The output volume directory or "in_place" if segmentation results go alongside each mask
 
@@ -93,7 +93,7 @@ def create_segmentation_config(
     maskPattern : str
         Pattern to identify mask files, e.g. "-brainmask.nii.gz".
     model_paths : list of str
-        Paths (or directories) to trained models.
+        Paths to migrated PyTorch .pt checkpoints.
     modelTrainConfigFiles : list of str
         Paths to the train_parameters.cfg used to train each corresponding model in model_paths.
     merging_method : str
@@ -130,6 +130,12 @@ def create_segmentation_config(
         raise ValueError("You must provide both model_paths and modelTrainConfigFiles (one per model).")
     if len(model_paths) != len(modelTrainConfigFiles):
         raise ValueError("Mismatch: the number of model_paths must match the number of modelTrainConfigFiles.")
+    invalid_model_paths = [m for m in model_paths if not str(m).lower().endswith(".pt")]
+    if invalid_model_paths:
+        raise ValueError(
+            "Migrated astril segmentation expects PyTorch .pt checkpoints. "
+            f"Invalid model_paths: {invalid_model_paths}"
+        )
 
     if inputVolumeDirectory is None:
         raise ValueError("`inputVolumeDirectory` must be provided.")
@@ -280,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--maskPattern", required=True,
                         help="Pattern to identify mask files (e.g. brainmask.nii.gz).")
     parser.add_argument("--model_paths", nargs="+", required=True,
-                        help="Paths to model checkpoints/directories. One per slicing plane.")
+                        help="Paths to PyTorch .pt model checkpoints. One per slicing plane.")
     parser.add_argument("--modelTrainConfigFiles", nargs="+", required=True,
                         help="Paths to the train_parameters.cfg used to train each model. Must match length of model_paths.")
     parser.add_argument("--merging_method", default="majority_vote",

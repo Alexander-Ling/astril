@@ -23,7 +23,11 @@ def parse_train_parameters(config_file_path):
     config.num_input_slices = cfg_parser.getint("DEFAULT", "num_input_slices")
     config.num_output_slices = cfg_parser.getint("DEFAULT", "num_output_slices")
     config.training_schedule_file = cfg_parser.get("DEFAULT", "training_schedule_file")
-    config.pretrained_model_path = cfg_parser.get("DEFAULT", "pretrained_model_path")
+    raw_pretrained = cfg_parser.get("DEFAULT", "pretrained_model_path", fallback=None)
+    if raw_pretrained is None or raw_pretrained.strip().lower() in {"", "none", "null", "na"}:
+        config.pretrained_model_path = None
+    else:
+        config.pretrained_model_path = raw_pretrained
     config.print_every_n_subbatches = cfg_parser.getint("DEFAULT", "print_every_n_subbatches")
     config.minimum_height_width = cfg_parser.getint("DEFAULT", "minimum_height_width")
     config.num_channels = len(config.image_paths_files)
@@ -206,7 +210,6 @@ def main():
     if cfg_updates:
         update_train_config_flags(args.config, **cfg_updates)
 
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
     from .train import train_model
     train_model()
 

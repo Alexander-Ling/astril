@@ -1,6 +1,22 @@
 {
   "GBM_seg_v1.zip": {
     "bytes": 1429228910,
+    "expect": [
+      "Axial_1.pt",
+      "Axial_1_train_parameters.cfg",
+      "Axial_2.pt",
+      "Axial_2_train_parameters.cfg",
+      "Coronal_1.pt",
+      "Coronal_1_train_parameters.cfg",
+      "Coronal_2.pt",
+      "Coronal_2_train_parameters.cfg",
+      "Sagittal_1.pt",
+      "Sagittal_1_train_parameters.cfg",
+      "Sagittal_2.pt",
+      "Sagittal_2_train_parameters.cfg"
+    ],
+    "extract_to": "GBM_seg_v1",
+    "kind": "pytorch_zip",
     "sha256": "b169e36cfa7df532da4c0efc36a0cd1523a63a5fea880b00d52edc705e32b61c",
     "url": "https://osf.io/download/tkfwe/",
     "version": "2025-09-19T13:45:01Z"

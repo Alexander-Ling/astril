@@ -228,7 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--numClasses", type=int, required=True, help="Number of segmentation classes, including background.")
     parser.add_argument("--nEpochs", type=int, default=400, help="Number of training epochs.")
     parser.add_argument("--trainingSchedulePath", required=True, help="Path to training schedule file.")
-    parser.add_argument("--preTrainedModelPath", default=None, help="Optional path to pre-trained model.")
+    parser.add_argument("--preTrainedModelPath", default=None, help="Optional path to a migrated PyTorch .pt checkpoint.")
     parser.add_argument("--subbatchLogFrequency", type=int, default=10, help="Log training outputs every this many sub-batches.")
     parser.add_argument("--numInputSlices", type=int, default=3, help="Number of adjacent slices input to cnn model each cycle.")
     parser.add_argument("--numOutputSlices", type=int, default=1, help="Number of segmented slices output from cnn model each cycle.")
@@ -242,6 +242,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     encoder_level_factors = [int(x) for x in args.encoder_level_factors.split(",") if x.strip()]
+
+    if args.preTrainedModelPath and not str(args.preTrainedModelPath).lower().endswith(".pt"):
+        raise ValueError("--preTrainedModelPath must point to a PyTorch .pt checkpoint.")
 
     create_config_files(
         workingDirectory=args.workingDirectory,

@@ -117,7 +117,7 @@ def generate_models_json(
             "version": _iso8601_utc(st.st_mtime),
         }
 
-        # Heuristics for packaged model archives (.zip)
+        # Heuristics for packaged PyTorch model archives (.zip)
         if p.suffix.lower() == ".zip":
             import zipfile, posixpath
             try:
@@ -125,24 +125,24 @@ def generate_models_json(
                     names = zf.namelist()
                     # Normalize names to forward slashes
                     names = [n if isinstance(n, str) else n.decode("utf-8", "ignore") for n in names]
-                    # Detect single top-level directory (e.g., Axial_1/*)
+                    # Detect single top-level directory (e.g., GBM_seg_v1/*)
                     top_levels = {n.split("/", 1)[0] for n in names if "/" in n}
                     topdir = None
                     if len(top_levels) == 1:
-                        candidate = next(iter(top_levels))
-                        if f"{candidate}/saved_model.pb" in names:
-                            topdir = candidate
-                    # Or flat zip (saved_model.pb at root)
-                    has_root_pb = "saved_model.pb" in names
+                        topdir = next(iter(top_levels))
 
-                    if topdir or has_root_pb:
-                        record["kind"] = "saved_model_zip"
+                    pt_names = [n for n in names if n.lower().endswith(".pt")]
+                    cfg_names = [n for n in names if n.lower().endswith(".cfg")]
+                    if pt_names:
+                        record["kind"] = "pytorch_zip"
                         record["extract_to"] = topdir or p.stem
-                        # Minimum expectations (variables shard filename can vary; check index file)
-                        record["expect"] = [
-                            "saved_model.pb",
-                            "variables/variables.index"
-                        ]
+                        expect = []
+                        for n in pt_names + cfg_names:
+                            if topdir and n.startswith(f"{topdir}/"):
+                                expect.append(n.split("/", 1)[1])
+                            else:
+                                expect.append(n)
+                        record["expect"] = sorted(expect)
             except Exception:
                 # If inspection fails, we still include the zip without annotations
                 pass
