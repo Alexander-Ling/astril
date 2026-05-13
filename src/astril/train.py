@@ -96,6 +96,17 @@ def train_model():
     log_file, log_file_path = init_logging(output_dir)
     print(f"Logging to: {log_file_path}")
 
+    # GPU availability check — if TF can't find a GPU, all ops run on CPU.
+    gpus = tf.config.list_physical_devices('GPU')
+    print(f"TensorFlow detected GPUs: {gpus}")
+    if not gpus:
+        print("WARNING: No GPU detected by TensorFlow — training will run on CPU only.")
+    else:
+        for gpu in gpus:
+            info = tf.config.experimental.get_device_details(gpu)
+            print(f"  GPU: {info.get('device_name', gpu.name)}, "
+                  f"Compute capability: {info.get('compute_capability', 'unknown')}")
+
     # 2. Load the training schedule from CSV/TSV.
     training_schedule = pd.read_csv(training_schedule_file, sep='\t')
 
@@ -182,6 +193,8 @@ def train_model():
     model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
     # 8. Create gradient accumulation Variables — must be after model is built.
+    # tf.zeros_like(tv) inherits the same device as tv, so accum_grads are
+    # co-located with the model weights without needing explicit device strings.
     accum_grads = [
         tf.Variable(tf.zeros_like(tv), trainable=False, name=f"ag_{i}")
         for i, tv in enumerate(model.trainable_variables)
@@ -387,17 +400,28 @@ def train_model():
             dtype=tf.float32,
         )
 
-        # Build tf.data pipeline — prefetch overlaps CPU batch preparation with GPU compute.
-        train_ds = (
-            tf.data.Dataset.from_tensor_slices((
-                X_epoch_data,
-                y_epoch_data,
-                mask_epoch_data.astype(np.float32),  # bool→float32 once here, not per-step
-            ))
-            .batch(slice_sub_batch_size, drop_remainder=False)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-        total_batches = math.ceil(len(X_epoch_data) / slice_sub_batch_size)
+        # Build tf.data pipeline — from_generator slices into existing numpy buffers without
+        # copying them (unlike from_tensor_slices which calls tf.constant and doubles RAM).
+        # Prefetch overlaps CPU batch preparation with GPU compute.
+        _n = len(X_epoch_data)
+        _bs = slice_sub_batch_size
+        total_batches = math.ceil(_n / _bs)
+        _mask_f32 = mask_epoch_data.astype(np.float32)  # convert bool→float32 once
+
+        def _batch_gen():
+            for i in range(0, _n, _bs):
+                yield (X_epoch_data[i:i+_bs],
+                       y_epoch_data[i:i+_bs],
+                       _mask_f32[i:i+_bs])
+
+        train_ds = tf.data.Dataset.from_generator(
+            _batch_gen,
+            output_signature=(
+                tf.TensorSpec(shape=(None, None, None, None),    dtype=tf.float32),
+                tf.TensorSpec(shape=(None, None, None, None, 1), dtype=tf.uint8),
+                tf.TensorSpec(shape=(None, None, None, None, 1), dtype=tf.float32),
+            ),
+        ).prefetch(tf.data.AUTOTUNE)
         batch_counter = 0
 
         mem = psutil.virtual_memory()

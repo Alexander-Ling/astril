@@ -226,6 +226,17 @@ def compute_brainiac_saliency_maps(
         nib.save(nib_img, str(out_path))
         output_paths.append(str(out_path))
 
+    # Explicitly release model and CUDA memory before TensorFlow training starts.
+    # PyTorch's caching allocator holds GPU blocks even after Python objects are
+    # freed; empty_cache() hands them back to CUDA so TF can claim them cleanly.
+    del model
+    import gc
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.synchronize()    # ensure all GPU ops have completed
+        torch.cuda.empty_cache()    # return cached blocks to CUDA/OS
+        print("[brainiac] Released GPU memory back to CUDA.")
+
     return output_paths
 
 
