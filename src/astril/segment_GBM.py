@@ -163,10 +163,13 @@ def compute_final_segmentation_path(mask_path, original_mask_pattern, final_mask
 # New helper functions for per-subject processing.
 ###############################################################################
 def process_subject_with_models(seg_config_file, subject_index, loaded_models,
-                                slice_batch_size, overwrite, segment_suffix, tiebreaker_model, debug_models):
+                                slice_batch_size, overwrite, segment_suffix, tiebreaker_model, debug_models,
+                                extra_channel_path=None):
     """
     Process one subject (identified by its mask file in the segmentation config)
     using the provided pre-loaded models (for one segmentation stage).
+    extra_channel_path: optional path to an additional channel NIfTI (e.g. BrainIAC saliency map)
+    appended to the subject's channel list at inference time.
     """
     # Lazy imports: avoid TF/nibabel/numpy at module import time
     import nibabel as nib
@@ -194,6 +197,10 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         raise ValueError("Exam index out of range!")
     volume_paths_list = list(zip(*channel_file_lists))
     volume_paths_list = [list(vp) for vp in volume_paths_list]
+
+    # Append extra channel (e.g. BrainIAC saliency map) if provided
+    if extra_channel_path is not None:
+        volume_paths_list[subject_index] = volume_paths_list[subject_index] + [extra_channel_path]
 
     # Get subject's mask file.
     mask_path = mask_paths[subject_index]
@@ -257,8 +264,10 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
         all_preds = []
         for x_batch, _ in val_gen:
-            batch_pred = model.predict(x_batch)
-            all_preds.append(batch_pred)
+            batch_pred = model(x_batch, training=False)
+            if isinstance(batch_pred, tuple):
+                batch_pred = batch_pred[0]
+            all_preds.append(batch_pred.numpy() if hasattr(batch_pred, 'numpy') else batch_pred)
         if not all_preds:
             print(f"[WARNING] No predictions for exam {subject_index+1} (model {m_idx+1}).")
             reassembled_4d = np.zeros((oh, ow, od, n_cls), dtype=np.float32)
@@ -411,7 +420,22 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     mask_paths = read_paths_from_file(mask_cfg_file)
     num_subjects = len(mask_paths)
     print(f"[INFO] Found {num_subjects} exam(s) to process in {input_dir}.")
-    
+
+    # Detect BrainIAC dependency from Model 1 training configs
+    from .run_segmentation import _train_config_requires_brainiac
+    brainiac_needed = any(_train_config_requires_brainiac(tc) for tc in model1_train_configs)
+    brainiac_weights_path = None
+    brainiac_tmp_dir = None
+    if brainiac_needed:
+        from .brainiac_utils import ensure_brainiac_weights, BrainIACWeightsNotFoundError
+        import tempfile
+        try:
+            brainiac_weights_path = ensure_brainiac_weights(hf_token=None, weights_path=None)
+        except BrainIACWeightsNotFoundError as e:
+            raise RuntimeError(str(e))
+        brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
+        print(f"[brainiac] BrainIAC embeddings required. Saliency maps cached at: {brainiac_tmp_dir}")
+
     for subj_idx in range(num_subjects):
         # BEFORE ANY PROCESSING: Check if the final segmentation file already exists.
         # Use the original mask pattern (from --brainmask_pattern) and the Model 2 mask pattern.
@@ -421,11 +445,24 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             print(f"[INFO] Skipping subject {subj_idx+1}: final segmentation file {final_seg_path} already exists.")
             continue
 
+        # Compute BrainIAC saliency map for this subject if Model 1 requires it
+        brainiac_sal_path_subj = None
+        if brainiac_needed:
+            from .brainiac_utils import compute_brainiac_saliency_maps
+            ref_path = read_paths_from_file(
+                cp_model1["DEFAULT"]["channel_paths_files"].split(",")[0]
+            )[subj_idx]
+            sal_paths = compute_brainiac_saliency_maps(
+                [ref_path], brainiac_weights_path, brainiac_tmp_dir, overwrite=False
+            )
+            brainiac_sal_path_subj = sal_paths[0]
+
         print("\n==============================")
         print(f"[INFO] Processing exam {subj_idx+1} of {num_subjects} with Model 1...")
         process_subject_with_models(seg_config_model1, subj_idx, loaded_models_model1,
                                     slice_batch_size, overwrite_existing_outputs, "_Model_1_seg.nii.gz",
-                                    tiebreaker_model=0, debug_models=debug_models)
+                                    tiebreaker_model=0, debug_models=debug_models,
+                                    extra_channel_path=brainiac_sal_path_subj)
         # Remap Model 1 segmentation outputs in the subject's directory.
         subject_dir = os.path.dirname(mask_paths[subj_idx])
         print("[INFO] Remapping Model 1 segmentation for Model 2 inputs...")

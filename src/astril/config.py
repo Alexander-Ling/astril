@@ -1,4 +1,19 @@
 # These all get dynamically assigned by the loaded config files
+
+# BrainIAC
+use_brainiac_embeddings = False
+brainiac_weights_path = None        # path to .ckpt if user supplies manually
+
+# Architecture flags
+use_se_blocks = False
+use_deep_supervision = False
+deep_supervision_weights = None     # list of floats e.g. [0.5, 0.25]
+
+# Augmentation
+use_flip_augmentation = False
+use_intensity_augmentation = False
+intensity_augmentation_strength = 0.1
+
 output_dir = None
 n_cores = None
 slicing_plane = None

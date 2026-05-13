@@ -472,7 +472,10 @@ def load_train_slices(
     num_input_slices,
     num_output_slices,
     class_multiplication_factors=None,
-    require_classes=None
+    require_classes=None,
+    use_flip_augmentation=False,
+    use_intensity_augmentation=False,
+    intensity_augmentation_strength=0.1,
 ):
     """
     Load all 2.5D slices from the scan at index `idx` for training,
@@ -564,6 +567,25 @@ def load_train_slices(
             if slice_has_all_classes(combined_gt, key_tuple):
                 augmentation_factor = factor_val
                 break
+
+        # (D2) Flip augmentation — randomly flip horizontal/vertical axes
+        if use_flip_augmentation:
+            for flip_axis in (0, 1):
+                if random.random() > 0.5:
+                    X_window = np.flip(X_window, axis=flip_axis).copy()
+                    Y_window = np.flip(Y_window, axis=flip_axis).copy()
+                    M_window = np.flip(M_window, axis=flip_axis).copy()
+
+        # (D3) Intensity augmentation — applied to inputs only, not labels/masks
+        if use_intensity_augmentation:
+            s = intensity_augmentation_strength
+            std = X_window.std()
+            if std > 0:
+                X_window = X_window + np.random.normal(
+                    0, s * std, X_window.shape
+                ).astype(X_window.dtype)
+            contrast = 1.0 + np.random.uniform(-s, s)
+            X_window = (X_window * contrast).astype(X_window.dtype)
 
         # (E) Check memory usage, append or replace
         ram_usage = get_ram_usage_percent()
@@ -744,7 +766,10 @@ def load_epoch_data(
     num_classes,
     class_multiplication_factors=None,
     require_classes=None,
-    do_shuffle=True
+    do_shuffle=True,
+    use_flip_augmentation=False,
+    use_intensity_augmentation=False,
+    intensity_augmentation_strength=0.1,
 ):
     X_epoch_list = []
     y_epoch_list = []
@@ -763,7 +788,10 @@ def load_epoch_data(
                 num_input_slices,
                 num_output_slices,
                 class_multiplication_factors,
-                require_classes
+                require_classes,
+                use_flip_augmentation,
+                use_intensity_augmentation,
+                intensity_augmentation_strength,
             )
             for idx in scan_indexes
         ]

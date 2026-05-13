@@ -375,6 +375,36 @@ def parse_and_validate_schedule_params(
     # compute beta for Tversky => (1 - alpha)
     beta_vals_list = [1.0 - a for a in alpha_vals_list]
 
+    # 2g) gradient_clip_norm => float > 0 or NA => default=None (no clipping)
+    gradient_clip_norm = get_optional_value(
+        current_params,
+        "gradient_clip_norm",
+        float,
+        default=None,
+        warn_msg="Must be a float > 0",
+        condition=lambda x: x > 0
+    )
+
+    # 2h) label_smoothing => float in [0, 0.5] => default=0.0
+    label_smoothing = get_optional_value(
+        current_params,
+        "label_smoothing",
+        float,
+        default=0.0,
+        warn_msg="Must be a float in [0, 0.5]",
+        condition=lambda x: 0.0 <= x <= 0.5
+    )
+
+    # 2i) deep_supervision_loss_weight => float in [0, 1] => default=0.5
+    deep_supervision_loss_weight = get_optional_value(
+        current_params,
+        "deep_supervision_loss_weight",
+        float,
+        default=0.5,
+        warn_msg="Must be a float in [0, 1]",
+        condition=lambda x: 0.0 <= x <= 1.0
+    )
+
     return {
         "scan_batch_size": scan_batch_size,
         "slice_sub_batch_size": slice_sub_batch_size,
@@ -389,7 +419,10 @@ def parse_and_validate_schedule_params(
         "class_multiplication_factors": class_multiplication_factors,
         "require_classes": require_classes,
         "alpha_vals_list": alpha_vals_list,
-        "beta_vals_list": beta_vals_list
+        "beta_vals_list": beta_vals_list,
+        "gradient_clip_norm": gradient_clip_norm,
+        "label_smoothing": label_smoothing,
+        "deep_supervision_loss_weight": deep_supervision_loss_weight,
     }
 
 # -----------------------------------------------------------------------------
@@ -512,7 +545,8 @@ def combined_focal_tversky_wce_loss(
     beta_vals,
     gamma=1.0,
     wce_weight=0.5,
-    smooth=1e-6
+    smooth=1e-6,
+    label_smoothing=0.0,
 ):
     """
     Combined Weighted Cross Entropy + Focal Tversky Loss.
@@ -520,11 +554,20 @@ def combined_focal_tversky_wce_loss(
       total_loss: tf.Tensor scalar for the entire batch
       per_class_loss: list (or tf.Tensor) of length num_classes giving the
                       combined loss contribution for each class.
+    label_smoothing: if > 0, soft-labels the one-hot targets for the WCE component,
+                     reducing overconfidence on rare classes.
     """
 
     # ------------------------------------------------------
     # 1) Weighted Cross Entropy for each class
     # ------------------------------------------------------
+    # Apply label smoothing to one-hot targets before WCE (Tversky uses original targets)
+    if label_smoothing > 0.0:
+        num_classes_ls = tf.cast(tf.shape(y_true)[-1], tf.float32)
+        y_true_smooth = y_true * (1.0 - label_smoothing) + label_smoothing / num_classes_ls
+    else:
+        y_true_smooth = y_true
+
     # Convert logits -> probabilities
     y_pred_prob = tf.nn.softmax(y_pred, axis=-1)
     y_pred_prob = tf.clip_by_value(y_pred_prob, smooth, 1.0 - smooth)
@@ -541,7 +584,7 @@ def combined_focal_tversky_wce_loss(
     for c in range(num_classes):
         w_c = class_weights[c]
 
-        y_true_c = y_true[..., c]  # shape (batch,H,W,out_slices)
+        y_true_c = y_true_smooth[..., c]  # shape (batch,H,W,out_slices); smoothed if requested
         y_pred_c = y_pred_prob[..., c]
 
         # cross-entropy = - w_c * y_true_c * log(y_pred_c)
@@ -578,7 +621,7 @@ def combined_focal_tversky_wce_loss(
         tversky_c = (intersection + smooth) / (intersection + alpha_c*fp + beta_c*fn + smooth)
         focal_tversky_c = tf.pow((1.0 - tversky_c), gamma)
 
-        # weight the class’s focal tversky
+        # weight the classï¿½s focal tversky
         per_class_ft.append(w_c * focal_tversky_c)
 
     # Divide the Tversky Sum by the Sum of the Weights
@@ -590,7 +633,7 @@ def combined_focal_tversky_wce_loss(
     # ------------------------------------------------------
     total_loss = wce_weight * total_wce + (1.0 - wce_weight) * total_ft
 
-    # For each class c, define that class’s portion:
+    # For each class c, define that classï¿½s portion:
     #   class_loss_c = wce_weight*(per_class_wce_sum[c]/valid_pixels)
     #                  + (1-wce_weight)*(per_class_ft[c]/num_classes)
     per_class_loss = []

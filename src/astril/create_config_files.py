@@ -1,8 +1,25 @@
+import configparser
 import os
 import argparse
 import glob
 from pathlib import Path
 import multiprocessing
+
+
+def update_train_config_flags(config_path, **flags):
+    """
+    Update boolean/string flags in an existing train_parameters.cfg file.
+    E.g. update_train_config_flags(path, use_brainiac_embeddings='true',
+                                         use_se_blocks='true')
+    Uses configparser so existing values are preserved and only named keys change.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read(str(config_path))
+    for key, value in flags.items():
+        cfg["DEFAULT"][key] = str(value)
+    with open(str(config_path), "w") as f:
+        cfg.write(f)
+
 
 def create_config_files(
     workingDirectory=".",
@@ -186,6 +203,17 @@ def create_config_files(
         f.write(f"center_depth = {center_depth}\n")
         encoder_factors_str = ",".join(str(x) for x in encoder_level_factors)
         f.write(f"encoder_level_factors = {encoder_factors_str}\n")
+        # Architecture flags (default off; main.py may update these after config generation)
+        f.write("use_se_blocks = false\n")
+        f.write("use_deep_supervision = false\n")
+        f.write("deep_supervision_weights = 0.5,0.25\n")
+        # BrainIAC flags (default off; main.py sets use_brainiac_embeddings=true when used)
+        f.write("use_brainiac_embeddings = false\n")
+        f.write("brainiac_embedding_type = saliency_map\n")
+        # Augmentation flags (default off; set via --Use_Flip_Augmentation / --Use_Intensity_Augmentation)
+        f.write("use_flip_augmentation = false\n")
+        f.write("use_intensity_augmentation = false\n")
+        f.write("intensity_augmentation_strength = 0.1\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate configuration files for MRI segmentation training.")

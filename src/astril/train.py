@@ -17,7 +17,7 @@ import tensorflow.keras.backend as K
 # Import configuration values.
 from .config import (
     output_dir,
-    image_paths_files,      # training channels config file list (comma?separated paths)
+    image_paths_files,      # training channels config file list (comma-separated paths)
     gt_paths_file,          # training ground truth file
     mask_paths_file,        # training mask file
     val_image_paths_files,  # validation channels config file list
@@ -33,7 +33,12 @@ from .config import (
     num_input_slices,
     num_output_slices,
     minimum_height_width,
-    n_cores
+    n_cores,
+    use_flip_augmentation,
+    use_intensity_augmentation,
+    intensity_augmentation_strength,
+    use_deep_supervision,
+    deep_supervision_weights,
 )
 from .data_loading import (
     read_paths_from_file,
@@ -215,6 +220,9 @@ def train_model():
         require_classes = parsed["require_classes"]
         alpha_vals_list = parsed["alpha_vals_list"]
         beta_vals_list = parsed["beta_vals_list"]
+        gradient_clip_norm = parsed["gradient_clip_norm"]
+        label_smoothing = parsed["label_smoothing"]
+        ds_loss_weight = parsed["deep_supervision_loss_weight"]
 
         print(f"\nParameters for Epoch {epoch+1}:")
         print(f"  scan_batch_size: {scan_batch_size}")
@@ -251,7 +259,10 @@ def train_model():
                 num_output_slices=num_output_slices,
                 num_classes=num_classes,
                 class_multiplication_factors=class_multiplication_factors,
-                require_classes=require_classes
+                require_classes=require_classes,
+                use_flip_augmentation=use_flip_augmentation,
+                use_intensity_augmentation=use_intensity_augmentation,
+                intensity_augmentation_strength=intensity_augmentation_strength,
             )
 
         if class_weights is not None:
@@ -288,7 +299,14 @@ def train_model():
         print("Training model...")
         for x_batch, y_batch, mask_batch, batch_samples in epoch_train_generator:
             with tf.GradientTape() as tape:
-                test_probabilities = model(x_batch, training=True)
+                model_output = model(x_batch, training=True)
+
+                # Unpack deep supervision tuple if applicable
+                if isinstance(model_output, tuple):
+                    test_probabilities, aux_outputs = model_output
+                else:
+                    test_probabilities, aux_outputs = model_output, []
+
                 y_batch_one_hot = tf.squeeze(tf.one_hot(y_batch, depth=num_classes), axis=-2)
                 loss_value, loss_per_class = combined_focal_tversky_wce_loss(
                     y_true=y_batch_one_hot,
@@ -298,9 +316,33 @@ def train_model():
                     alpha_vals=alpha_vals_list,
                     beta_vals=beta_vals_list,
                     gamma=tversky_gamma,
-                    wce_weight=wce_weight
+                    wce_weight=wce_weight,
+                    label_smoothing=label_smoothing,
                 )
+
+                # Deep supervision: add weighted auxiliary losses
+                if aux_outputs:
+                    ds_weights = deep_supervision_weights if deep_supervision_weights else [0.5, 0.25]
+                    for aux_out, aux_w in zip(aux_outputs, ds_weights):
+                        aux_loss, _ = combined_focal_tversky_wce_loss(
+                            y_true=y_batch_one_hot,
+                            y_pred=aux_out,
+                            mask=mask_batch,
+                            class_weights=final_class_weights,
+                            alpha_vals=alpha_vals_list,
+                            beta_vals=beta_vals_list,
+                            gamma=tversky_gamma,
+                            wce_weight=wce_weight,
+                            label_smoothing=label_smoothing,
+                        )
+                        loss_value = loss_value + ds_loss_weight * aux_w * aux_loss
+
             grads = tape.gradient(loss_value, model.trainable_variables)
+
+            # Gradient clipping (optional, guards against instability with high class weights)
+            if gradient_clip_norm is not None:
+                grads, _ = tf.clip_by_global_norm(grads, gradient_clip_norm)
+
             for i, grad in enumerate(grads):
                 accumulated_gradients[i] += grad
 
@@ -407,7 +449,9 @@ def train_model():
                 )
                 val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size)
                 for x_val_batch, y_val_batch_slice, mask_val_batch_slice in val_gen:
-                    val_probabilities = model(x_val_batch, training=False)
+                    val_output = model(x_val_batch, training=False)
+                    # training=False suppresses auxiliary heads; handle tuple defensively
+                    val_probabilities = val_output[0] if isinstance(val_output, tuple) else val_output
                     y_val_one_hot = tf.squeeze(tf.one_hot(y_val_batch_slice, depth=num_classes), axis=-2)
                     loss_val, loss_per_class_val = combined_focal_tversky_wce_loss(
                         y_true=y_val_one_hot,
@@ -417,7 +461,8 @@ def train_model():
                         alpha_vals=alpha_vals_list,
                         beta_vals=beta_vals_list,
                         gamma=tversky_gamma,
-                        wce_weight=wce_weight
+                        wce_weight=wce_weight,
+                        label_smoothing=label_smoothing,
                     )
                     val_class_metrics['loss_all'].update_state(loss_val)
                     for c in range(num_classes):

@@ -34,6 +34,7 @@ dependencies = [
 ]
 
 [project.scripts]
+train-model = "astril.main:main"
 create-config-files = "astril.create_config_files:main"
 remap-gt-classes = "astril.remap_gt_classes:main"
 create-segmentation-config = "astril.create_segmentation_config:main"
@@ -60,5 +61,12 @@ include-package-data = true
 [project.optional-dependencies]
 preprocessing = [
     "hd-bet>=2.0.1,<3",
-    "dicom2nifti>=2.4.7"
+    "dicom2nifti>=2.4.7",
+]
+brainiac = [
+    "torch>=2.0",
+    "monai>=1.3.2",
+    "huggingface_hub>=0.20",
+    "einops>=0.7",
+    "scikit-image>=0.21",
 ]

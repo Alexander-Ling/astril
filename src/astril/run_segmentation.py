@@ -181,16 +181,28 @@ def build_model_from_train_config(config_path):
 
     input_channels = num_channels * num_input_slices
 
+    use_se_blocks = cfg.getboolean("use_se_blocks", fallback=False)
+    use_deep_supervision = cfg.getboolean("use_deep_supervision", fallback=False)
+
     model = DynamicAttentionResUNet(
         input_channels=input_channels,
         base_num_filters=base_num_filters,
         encoder_level_factors=encoder_level_factors,
         num_output_slices=num_output_slices,
         out_channels=num_classes,
-        center_depth=center_depth
+        center_depth=center_depth,
+        use_se_blocks=use_se_blocks,
+        use_deep_supervision=use_deep_supervision,
     )
     model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return model
+
+
+def _train_config_requires_brainiac(config_path: str) -> bool:
+    """Returns True if the given training config declares use_brainiac_embeddings = true."""
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    return cp["DEFAULT"].getboolean("use_brainiac_embeddings", fallback=False)
 
 
 ########################################################################
@@ -358,7 +370,27 @@ def run_segmentation(
         model_call_endpoints=model_call_endpoints,
     )
 
-    # --- C) Define merging function ---
+    # --- C) Detect BrainIAC dependency and prepare weights/temp dir ---
+    brainiac_needed = any(
+        _train_config_requires_brainiac(tcfg) for tcfg in model_train_config_files
+    )
+    brainiac_weights_path = None
+    brainiac_tmp_dir = None
+    if brainiac_needed:
+        from .brainiac_utils import (
+            ensure_brainiac_weights,
+            compute_brainiac_saliency_maps,
+            BrainIACWeightsNotFoundError,
+        )
+        import tempfile
+        try:
+            brainiac_weights_path = ensure_brainiac_weights(hf_token=None, weights_path=None)
+        except BrainIACWeightsNotFoundError as e:
+            raise RuntimeError(str(e))
+        brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
+        print(f"[brainiac] BrainIAC embeddings required. Saliency maps will be cached at: {brainiac_tmp_dir}")
+
+    # --- D) Define merging function ---
     def merge_predictions(volumes_4d, method=merging_method):
         if method == "majority_vote":
             return majority_vote(volumes_4d, tiebreaker=tiebreaker_model)
@@ -369,7 +401,7 @@ def run_segmentation(
         else:
             raise ValueError(f"Unknown merging method '{method}'")
 
-    # --- D) Process each subject ---
+    # --- E) Process each subject ---
     for subj_idx in range(num_subjects):
         mask_path = mask_paths[subj_idx]
         if output_directory == "in_place":
@@ -379,6 +411,18 @@ def run_segmentation(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         base_name = os.path.basename(mask_path)
+
+        # Compute BrainIAC saliency map for this subject if required
+        if brainiac_needed:
+            from .brainiac_utils import compute_brainiac_saliency_maps
+            ref_channel_path = volume_paths_list[subj_idx][0]
+            sal_paths = compute_brainiac_saliency_maps(
+                [ref_channel_path],
+                brainiac_weights_path,
+                brainiac_tmp_dir,
+                overwrite=False,
+            )
+            volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + [sal_paths[0]]
         if ".nii.gz" in maskPattern:
             seg_name = base_name.replace(maskPattern, segmentSuffix)
         else:
@@ -422,8 +466,11 @@ def run_segmentation(
             val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
             all_preds = []
             for x_batch, m_batch in val_gen:
-                batch_pred = model.predict(x_batch)
-                all_preds.append(batch_pred)
+                batch_pred = model(x_batch, training=False)
+                # Handle deep supervision tuple (training=False normally suppresses it)
+                if isinstance(batch_pred, tuple):
+                    batch_pred = batch_pred[0]
+                all_preds.append(batch_pred.numpy() if hasattr(batch_pred, 'numpy') else batch_pred)
 
             if not all_preds:
                 print(f"[WARNING] No slices processed for exam {subj_idx+1} ({base_name}).")
