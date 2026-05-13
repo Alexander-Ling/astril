@@ -14,8 +14,6 @@ import shutil
 import subprocess
 import tempfile
 
-from .preprocessing_utils import ensure_hd_bet_installed  # type: ignore
-
 # We import and call your existing function directly (no subprocess).
 # If your package layout differs (e.g., installed as astril), adjust the import:
 from .preprocess_single_brain_mri import preprocess_single_brain_mri  # type: ignore
@@ -740,6 +738,7 @@ def preprocess_library(
 
         if patients_needing_mask:
             # Ensure hd-bet is available before we do any file prep work.
+            from .preprocessing_utils import ensure_hd_bet_installed
             ensure_hd_bet_installed()
 
             if not quiet:

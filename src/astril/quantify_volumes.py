@@ -12,8 +12,6 @@ Example:
 """
 
 import os
-import nibabel as nib
-import numpy as np
 import fnmatch
 from pathlib import Path
 import argparse
@@ -37,6 +35,8 @@ def calculate_volume_for_file(input_file_path, total_levels):
     Loads a segmentation file, computes the volume for each segmentation level (1..total_levels),
     and returns a formatted string with the file path, file name, and volumes.
     """
+    import nibabel as nib
+    import numpy as np
     try:
         img = nib.load(input_file_path)
         data = img.get_fdata()

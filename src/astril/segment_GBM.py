@@ -177,16 +177,14 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     import torch.nn.functional as F
     import nibabel as nib
     import numpy as np
-    from .run_segmentation import (
+    from .data_loading import (
         read_paths_from_file,
         load_val_data,
         ValDataGenerator,
         undo_all_transforms,
         apply_inverse_canonical_4d,
-        majority_vote,
-        average_prob,
-        max_prob,
     )
+    from .run_segmentation import majority_vote, average_prob, max_prob
 
     # Parse segmentation config file.
     cp = configparser.ConfigParser()
@@ -347,10 +345,8 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         parse_train_config_for_model_parameters,
     )
     from .remap_gt_classes import remap_gt_classes
-    from .run_segmentation import (
-        read_paths_from_file,
-        load_models_for_config,
-    )
+    from .data_loading import read_paths_from_file
+    from .run_segmentation import load_models_for_config
 
     if channel_patterns is None:
         channel_patterns = ["_T1c_brain-norm.nii.gz",

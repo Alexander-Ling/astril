@@ -8,13 +8,10 @@ import argparse
 import configparser
 from pathlib import Path
 
-import torch
-
-from astril.create_segmentation_config import parse_train_config_for_model_parameters
-from astril.model_architecture import DynamicAttentionResUNet, create_dynamic_unet_from_metadata
-
 
 def build_model_from_train_config(train_config_path):
+    from astril.create_segmentation_config import parse_train_config_for_model_parameters
+    from astril.model_architecture import DynamicAttentionResUNet
     cp = configparser.ConfigParser()
     cp.read(train_config_path)
     cfg = cp["DEFAULT"]
@@ -45,6 +42,8 @@ def build_model_from_train_config(train_config_path):
 
 
 def load_model_for_visualization(model_path, train_config_path=None, device=None):
+    import torch
+    from astril.model_architecture import create_dynamic_unet_from_metadata
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
@@ -65,6 +64,7 @@ def load_model_for_visualization(model_path, train_config_path=None, device=None
 
 
 def visualize_model(model, output_path, dummy_input_shape, device):
+    import torch
     dummy_input = torch.zeros(dummy_input_shape, dtype=torch.float32, device=device)
     traced = torch.jit.trace(model, dummy_input)
     traced.save(str(output_path))

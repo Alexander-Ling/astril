@@ -5,31 +5,13 @@ Module: run_segmentation
 This module runs the segmentation process using a 2.5D pipeline and PyTorch
 .pt checkpoints.
 """
+from __future__ import annotations
 
 import os
 import sys
 import argparse
 import configparser
-import numpy as np
-import nibabel as nib
-import torch
-import torch.nn.functional as F
 from pathlib import Path
-
-# Import data loading functions from your package.
-from .data_loading import (
-    read_paths_from_file,
-    load_val_data,
-    ValDataGenerator,
-    undo_all_transforms,
-    apply_inverse_canonical_4d
-)
-
-# Import model architecture and custom layers.
-from .model_architecture import (
-    DynamicAttentionResUNet,
-    create_dynamic_unet_from_metadata,
-)
 
 ########################################################################
 # Shared helper: load a list of models given config-derived arrays
@@ -46,6 +28,9 @@ def load_models_for_config(
     Unified model loader used by run_segmentation.py and segment_GBM.py.
     Supports only migrated PyTorch .pt checkpoints.
     """
+    import torch
+    from .model_architecture import create_dynamic_unet_from_metadata
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -87,6 +72,7 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
     Reads a model training config file (INI format) and builds a U-Net model
     with the parameters specified.
     """
+    from .model_architecture import DynamicAttentionResUNet
     cp = configparser.ConfigParser()
     cp.read(config_path)
     cfg = cp["DEFAULT"]
@@ -144,6 +130,7 @@ def _train_config_requires_brainiac(config_path: str) -> bool:
 # Merging helper functions.
 ########################################################################
 def majority_vote(softmax_list, tiebreaker=0):
+    import numpy as np
     label_vols = [np.argmax(s, axis=-1) for s in softmax_list]
     stacked = np.stack(label_vols, axis=0)
     num_models, H, W, D = stacked.shape
@@ -167,6 +154,7 @@ def majority_vote(softmax_list, tiebreaker=0):
     return best_label
 
 def average_prob(softmax_list, tiebreaker=0):
+    import numpy as np
     stacked = np.stack(softmax_list, axis=0)
     sum_probs = np.sum(stacked, axis=0)
     best_label = np.argmax(sum_probs, axis=-1)
@@ -181,6 +169,7 @@ def average_prob(softmax_list, tiebreaker=0):
     return best_label
 
 def max_prob(softmax_list, tiebreaker=0):
+    import numpy as np
     stacked = np.stack(softmax_list, axis=0)
     max_probs = np.max(stacked, axis=0)
     best_label = np.argmax(max_probs, axis=-1)
@@ -205,6 +194,18 @@ def run_segmentation(
     tiebreaker_model=0,
     debug_models=False
 ):
+    import numpy as np
+    import nibabel as nib
+    import torch
+    import torch.nn.functional as F
+    from .data_loading import (
+        read_paths_from_file,
+        load_val_data,
+        ValDataGenerator,
+        undo_all_transforms,
+        apply_inverse_canonical_4d,
+    )
+
     force_cpu = os.environ.get("CUDA_VISIBLE_DEVICES") == ""
     device = torch.device("cuda" if torch.cuda.is_available() and not force_cpu else "cpu")
     print(f"[INFO] PyTorch device: {device}")

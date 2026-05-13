@@ -1,8 +1,6 @@
 import os
 import argparse
-import numpy as np
 from pathlib import Path
-import nibabel as nib
 import ast
 
 def match_pattern(directory, pattern):
@@ -52,6 +50,8 @@ def remap_gt_classes(trainDataDirectory, gtPattern, classRemapDict, outputPatter
         overwrite_existing_outputs (bool): If True, overwrite outputs that already exist.
                                              Defaults to False (skip if exists).
     """
+    import numpy as np
+    import nibabel as nib
     # Parse classRemapDict
     remap_dict = parse_dict_string(classRemapDict)
     if not remap_dict:

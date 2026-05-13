@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-import nibabel as nib
-import numpy as np
 import argparse
 
 
@@ -43,6 +41,9 @@ def merge_seg_volumes(
     -------
     One merged segmentation volume (.nii.gz) per valid directory in `inputVolumeDirectory` (recursively).
     """
+    import nibabel as nib
+    import numpy as np
+
     input_dir = Path(inputVolumeDirectory).resolve()
 
     # If we're saving in a separate directory, prepare that path
