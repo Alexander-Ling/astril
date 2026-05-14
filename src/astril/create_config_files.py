@@ -100,14 +100,20 @@ def create_config_files(
 
     def match_pattern(directory, pattern):
         """
-        Matches a pattern in the given directory.
-        If a pattern is missing or ambiguous, returns None.
+        Matches a pattern in the given directory, returning the first unambiguous hit.
+        Pattern may contain '|'-separated fallbacks tried left-to-right
+        (e.g. "_T2f_normalized.nii.gz|_T2f_brain-norm.nii.gz").
+        Returns None if no pattern yields exactly one match.
         """
-        all_files = list(directory.iterdir())
-        matches = [file for file in all_files if pattern in file.name]
-        if len(matches) != 1:
+        if pattern is None:
             return None
-        return matches[0]
+        all_files = list(directory.iterdir())
+        for pat in pattern.split("|"):
+            pat = pat.strip()
+            matches = [f for f in all_files if pat in f.name]
+            if len(matches) == 1:
+                return matches[0]
+        return None
 
     # Process training directories
     # For channels with an alt pattern, subjects matching BOTH primary and alt are added
@@ -265,7 +271,7 @@ def create_config_files(
         f.write("use_intensity_augmentation = false\n")
         f.write("intensity_augmentation_strength = 0.1\n")
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Generate configuration files for MRI segmentation training.")
     parser.add_argument("--workingDirectory", default=".", help="Directory to store generated config files.")
     parser.add_argument("--trainDataDirectory", required=True, help="Directory with training data.")
@@ -332,3 +338,7 @@ if __name__ == "__main__":
         center_depth=args.center_depth,
         encoder_level_factors=encoder_level_factors
     )
+
+
+if __name__ == "__main__":
+    main()

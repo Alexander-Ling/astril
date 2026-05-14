@@ -295,6 +295,10 @@ def _load_brainiac_model(weights_path: Path, device: str):
 # PCA-based patch embedding pipeline (replaces attention-rollout saliency)
 # ---------------------------------------------------------------------------
 
+# Increment when the patch-grid embedding algorithm changes in a way that makes
+# old cached embeddings incompatible with newly generated PCA maps.
+BRAINIAC_EMBEDDING_CACHE_VERSION = 2
+
 def _extract_patch_embeddings_for_window(model, tensor, device: str):
     """Run one BrainIAC forward pass and return the final patch token embeddings.
 
@@ -377,14 +381,11 @@ def _compute_sliding_window_embeddings(
                 emb = _extract_patch_embeddings_for_window(model, tensor, device)  # (6,6,6,768)
 
                 for pk in range(6):
-                    gk = int(round((sz + pk * 16 + 8) / 16))
-                    gk = max(0, min(D_p - 1, gk))
+                    gk = min((sz + pk * 16 + 8) // 16, D_p - 1)
                     for pj in range(6):
-                        gj = int(round((sy + pj * 16 + 8) / 16))
-                        gj = max(0, min(H_p - 1, gj))
+                        gj = min((sy + pj * 16 + 8) // 16, H_p - 1)
                         for pi in range(6):
-                            gi = int(round((sx + pi * 16 + 8) / 16))
-                            gi = max(0, min(W_p - 1, gi))
+                            gi = min((sx + pi * 16 + 8) // 16, W_p - 1)
                             w = blend_patch[pk, pj, pi]
                             embed_accum[gk, gj, gi]  += emb[pk, pj, pi] * w
                             weight_accum[gk, gj, gi] += w
@@ -414,7 +415,8 @@ def fit_brainiac_pca(embedding_arrays, n_components: int):
     pca = PCA(n_components=n_components, svd_solver="randomized", random_state=42)
     pca.fit(patches)
     explained = pca.explained_variance_ratio_.sum() * 100
-    print(f"[brainiac] PCA done. Top {n_components} components explain {explained:.1f}% of variance.")
+    per_comp = "  ".join(f"PC{i}={v*100:.1f}%" for i, v in enumerate(pca.explained_variance_ratio_))
+    print(f"[brainiac] PCA done: {per_comp}  |  total={explained:.1f}%")
     return pca
 
 
@@ -487,15 +489,35 @@ def compute_brainiac_pca_features(
 
     embedding_cache: dict = {}
     full_sizes: dict = {}
+    recomputed_embeddings = set()
 
     for nifti_path, stem in zip(nifti_paths, stems):
         cache_path = output_dir / f"{stem}_{sequence_label}_embeddings.npy"
         size_path  = output_dir / f"{stem}_{sequence_label}_size.npy"
+        version_path = output_dir / f"{stem}_{sequence_label}_cache_version.txt"
 
-        if cache_path.exists() and size_path.exists() and not overwrite:
+        cache_version = None
+        if version_path.exists():
+            try:
+                cache_version = int(version_path.read_text().strip())
+            except ValueError:
+                cache_version = None
+
+        cache_is_current = (
+            cache_path.exists()
+            and size_path.exists()
+            and cache_version == BRAINIAC_EMBEDDING_CACHE_VERSION
+        )
+
+        if cache_is_current and not overwrite:
             embedding_cache[stem] = np.load(str(cache_path))
             full_sizes[stem] = tuple(np.load(str(size_path)).tolist())
         else:
+            if cache_path.exists() and not overwrite:
+                print(
+                    f"[brainiac] Ignoring stale {sequence_label} embedding cache "
+                    f"for {stem}; regenerating."
+                )
             print(f"[brainiac] Extracting {sequence_label} embeddings: {stem}")
             sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
             sitk_1mm = _ensure_1mm_isotropic(sitk_img)
@@ -503,7 +525,9 @@ def compute_brainiac_pca_features(
             emb = _compute_sliding_window_embeddings(sitk_1mm, model, device, stride=stride)
             np.save(str(cache_path), emb)
             np.save(str(size_path), np.array(full_sizes[stem]))
+            version_path.write_text(f"{BRAINIAC_EMBEDDING_CACHE_VERSION}\n")
             embedding_cache[stem] = emb
+            recomputed_embeddings.add(stem)
 
     del model
     import gc
@@ -529,7 +553,7 @@ def compute_brainiac_pca_features(
             output_dir / f"{stem}_brainiac_{sequence_label}_pc{k}.nii.gz"
             for k in range(n_components)
         ]
-        if all(p.exists() for p in out_paths) and not overwrite:
+        if all(p.exists() for p in out_paths) and not overwrite and stem not in recomputed_embeddings:
             for k, p in enumerate(out_paths):
                 paths_per_component[k].append(str(p))
             continue
@@ -555,6 +579,11 @@ def compute_brainiac_pca_features(
                 mode="trilinear",
                 align_corners=False,
             )[0, 0].numpy()   # (sz_z, sz_y, sz_x) in SimpleITK (z,y,x) order
+
+            # Light Gaussian blur (sigma = half a patch width ≈ 8 mm at 1mm isotropic)
+            # to soften the hard step discontinuities at 16 mm patch boundaries.
+            from scipy.ndimage import gaussian_filter
+            upsampled = gaussian_filter(upsampled, sigma=8.0).astype(np.float32)
 
             saliency_sitk = sitk.GetImageFromArray(upsampled)
             saliency_sitk.CopyInformation(sitk_1mm)
@@ -589,11 +618,12 @@ def _ensure_1mm_isotropic(sitk_img, tol: float = 0.01):
 
 
 def _make_cosine_window(size: int):
-    """3-D raised-cosine taper: weight=1 at the centre, 0 at every edge face.
-    Used to blend overlapping window saliency maps without seam artefacts."""
+    """3-D sine taper: weight=0 at every edge face, 1 at the centre.
+    Uses sin(t) for t in [0, π] — symmetric 0 → 1 → 0 profile — so that
+    overlapping windows blend without directional bias at seam boundaries."""
     import numpy as np
     t = np.linspace(0.0, np.pi, size, dtype=np.float32)
-    w1d = (1.0 - np.cos(t)) / 2.0          # 0 → 1 → 0
+    w1d = np.sin(t)                          # symmetric: 0 → 1 → 0
     return w1d[:, None, None] * w1d[None, :, None] * w1d[None, None, :]
 
 

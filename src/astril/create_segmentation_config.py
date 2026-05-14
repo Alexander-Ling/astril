@@ -171,12 +171,18 @@ def create_segmentation_config(
     def match_pattern(directory, pattern):
         """
         Search for exactly one file in `directory` whose name contains `pattern`.
-        If none or more than one, return None.
+        Pattern may contain '|'-separated fallbacks tried left-to-right
+        (e.g. "_T2f_normalized.nii.gz|_T2f_brain-norm.nii.gz").
+        Returns None if no pattern yields exactly one match.
         """
-        matches = [f for f in directory.iterdir() if pattern in f.name]
-        if len(matches) != 1:
+        if pattern is None:
             return None
-        return matches[0]
+        for pat in pattern.split("|"):
+            pat = pat.strip()
+            matches = [f for f in directory.iterdir() if pat in f.name]
+            if len(matches) == 1:
+                return matches[0]
+        return None
 
     # ------------------------------
     # 3) Loop over subdirectories, match each channel & mask
