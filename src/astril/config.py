@@ -6,6 +6,10 @@ use_mixed_precision = False
 # BrainIAC
 use_brainiac_embeddings = False
 brainiac_weights_path = None        # path to .ckpt if user supplies manually
+brainiac_n_pcs = 3
+brainiac_pca_save_dir = None        # override PCA .pkl save dir; None → {output_dir}/brainiac_features/
+brainiac_pca_t1c_path = None
+brainiac_pca_t2_path = None
 
 # Architecture flags
 use_se_blocks = False

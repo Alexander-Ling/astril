@@ -126,6 +126,13 @@ def _train_config_requires_brainiac(config_path: str) -> bool:
     return cp["DEFAULT"].getboolean("use_brainiac_embeddings", fallback=False)
 
 
+def _train_config_brainiac_embedding_type(config_path: str) -> str:
+    """Returns 'pca_embeddings' or 'saliency_map' (legacy default) from a train cfg."""
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    return cp["DEFAULT"].get("brainiac_embedding_type", "saliency_map")
+
+
 ########################################################################
 # Merging helper functions.
 ########################################################################
@@ -278,19 +285,48 @@ def run_segmentation(
     )
     brainiac_weights_path = None
     brainiac_tmp_dir = None
+    brainiac_mode = None        # "pca" or "saliency"
+    brainiac_n_pcs = 3
+    brainiac_pca_t1c = None
+    brainiac_pca_t2  = None
     if brainiac_needed:
         from .brainiac_utils import (
             ensure_brainiac_weights,
-            compute_brainiac_saliency_maps,
             BrainIACWeightsNotFoundError,
         )
         import tempfile
+        import pickle as _pickle
         try:
             brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
         except BrainIACWeightsNotFoundError as e:
             raise RuntimeError(str(e))
         brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
-        print(f"[brainiac] BrainIAC embeddings required. Saliency maps will be cached at: {brainiac_tmp_dir}")
+
+        brainiac_cfg = next(
+            tc for tc in model_train_config_files if _train_config_requires_brainiac(tc)
+        )
+        brainiac_mode = _train_config_brainiac_embedding_type(brainiac_cfg)
+
+        if brainiac_mode == "pca_embeddings":
+            import configparser as _cparser
+            _cp = _cparser.ConfigParser()
+            _cp.read(brainiac_cfg)
+            brainiac_n_pcs = _cp["DEFAULT"].getint("brainiac_n_pcs", fallback=3)
+            _pca_t1c_path = _cp["DEFAULT"].get("brainiac_pca_t1c_path", "")
+            _pca_t2_path  = _cp["DEFAULT"].get("brainiac_pca_t2_path",  "")
+            if not _pca_t1c_path or not Path(_pca_t1c_path).exists():
+                raise FileNotFoundError(
+                    f"brainiac_pca_t1c_path not found in {brainiac_cfg}: '{_pca_t1c_path}'. "
+                    "Re-run train-model with use_brainiac_embeddings=true to generate PCA models."
+                )
+            with open(_pca_t1c_path, "rb") as _f:
+                brainiac_pca_t1c = _pickle.load(_f)
+            with open(_pca_t2_path, "rb") as _f:
+                brainiac_pca_t2 = _pickle.load(_f)
+            print(f"[brainiac] PCA mode: {brainiac_n_pcs} components per sequence. "
+                  f"Temp cache: {brainiac_tmp_dir}")
+        else:
+            print(f"[brainiac] Saliency mode (legacy). Cache: {brainiac_tmp_dir}")
 
     # --- D) Define merging function ---
     def merge_predictions(volumes_4d, method=merging_method):
@@ -314,17 +350,30 @@ def run_segmentation(
 
         base_name = os.path.basename(mask_path)
 
-        # Compute BrainIAC saliency map for this subject if required
+        # Compute BrainIAC features for this subject if required
         if brainiac_needed:
-            from .brainiac_utils import compute_brainiac_saliency_maps
-            ref_channel_path = volume_paths_list[subj_idx][0]
-            sal_paths = compute_brainiac_saliency_maps(
-                [ref_channel_path],
-                brainiac_weights_path,
-                brainiac_tmp_dir,
-                overwrite=False,
-            )
-            volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + [sal_paths[0]]
+            if brainiac_mode == "pca_embeddings":
+                from .brainiac_utils import compute_brainiac_pca_features
+                t1c_path = volume_paths_list[subj_idx][0]
+                t2_path  = volume_paths_list[subj_idx][1]
+                t1c_pc_paths, _ = compute_brainiac_pca_features(
+                    [t1c_path], brainiac_weights_path,
+                    brainiac_tmp_dir / "t1c", "t1c", brainiac_n_pcs, pca=brainiac_pca_t1c,
+                )
+                t2_pc_paths, _ = compute_brainiac_pca_features(
+                    [t2_path], brainiac_weights_path,
+                    brainiac_tmp_dir / "t2", "t2", brainiac_n_pcs, pca=brainiac_pca_t2,
+                )
+                extra_paths = [t1c_pc_paths[k][0] for k in range(brainiac_n_pcs)] + \
+                              [t2_pc_paths[k][0]  for k in range(brainiac_n_pcs)]
+                volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + extra_paths
+            else:
+                from .brainiac_utils import compute_brainiac_saliency_maps
+                ref_channel_path = volume_paths_list[subj_idx][0]
+                sal_paths = compute_brainiac_saliency_maps(
+                    [ref_channel_path], brainiac_weights_path, brainiac_tmp_dir, overwrite=False,
+                )
+                volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + [sal_paths[0]]
         if ".nii.gz" in maskPattern:
             seg_name = base_name.replace(maskPattern, segmentSuffix)
         else:

@@ -291,6 +291,280 @@ def _load_brainiac_model(weights_path: Path, device: str):
     return model
 
 
+# ---------------------------------------------------------------------------
+# PCA-based patch embedding pipeline (replaces attention-rollout saliency)
+# ---------------------------------------------------------------------------
+
+def _extract_patch_embeddings_for_window(model, tensor, device: str):
+    """Run one BrainIAC forward pass and return the final patch token embeddings.
+
+    Args:
+        tensor: torch.Tensor of shape (1, 1, 96, 96, 96) already on device.
+
+    Returns:
+        np.ndarray of shape (6, 6, 6, 768), float32.
+        Ordering matches MONAI ViT patch flattening: depth-major (D, H, W).
+    """
+    import torch
+    with torch.no_grad():
+        x, _ = model(tensor)   # x: (1, 216, 768)
+    return x[0].reshape(6, 6, 6, 768).cpu().numpy().astype("float32")
+
+
+def _compute_sliding_window_embeddings(
+    sitk_1mm,
+    model,
+    device: str,
+    window_size: int = 96,
+    stride: int = 48,
+):
+    """Tile a 1 mm isotropic volume with overlapping 96^3 windows, extract
+    BrainIAC patch token embeddings for each window, and blend overlapping
+    contributions with a cosine taper.
+
+    Returns:
+        np.ndarray of shape (D_p, H_p, W_p, 768), float32 at patch resolution
+        where D_p = ceil(sz_z / 16), H_p = ceil(sz_y / 16), W_p = ceil(sz_x / 16).
+
+    Global patch mapping: window-local patch (pk, pj, pi) at window origin (sx, sy, sz)
+    maps to global patch grid position gk/gj/gi = round((s_dim + p * 16 + 8) / 16),
+    clipped to [0, dim_p - 1].
+    """
+    import math
+    import numpy as np
+    import SimpleITK as sitk
+    import torch
+
+    sz_x, sz_y, sz_z = sitk_1mm.GetSize()   # SimpleITK: (x, y, z)
+    D_p = math.ceil(sz_z / 16)
+    H_p = math.ceil(sz_y / 16)
+    W_p = math.ceil(sz_x / 16)
+
+    def window_starts(size: int) -> list:
+        if size <= window_size:
+            return [0]
+        starts = list(range(0, size - window_size, stride))
+        if starts[-1] + window_size < size:
+            starts.append(size - window_size)
+        return starts
+
+    xs = window_starts(sz_x)
+    ys = window_starts(sz_y)
+    zs = window_starts(sz_z)
+    total = len(xs) * len(ys) * len(zs)
+    print(f"[brainiac]   sliding-window embeddings: {len(xs)}×{len(ys)}×{len(zs)} = {total} windows")
+
+    embed_accum  = np.zeros((D_p, H_p, W_p, 768), dtype=np.float64)
+    weight_accum = np.zeros((D_p, H_p, W_p),       dtype=np.float64)
+
+    # Cosine blend reduced from voxel-space (96,96,96) to patch-space (6,6,6)
+    blend_full  = _make_cosine_window(window_size)                      # (96,96,96)
+    blend_patch = blend_full.reshape(6, 16, 6, 16, 6, 16).mean(axis=(1, 3, 5))  # (6,6,6)
+
+    roi = sitk.RegionOfInterestImageFilter()
+
+    for sx in xs:
+        for sy in ys:
+            for sz in zs:
+                roi.SetIndex([sx, sy, sz])
+                roi.SetSize([window_size, window_size, window_size])
+                crop = roi.Execute(sitk_1mm)
+
+                arr = sitk.GetArrayFromImage(crop).astype(np.float32)  # (z,y,x)
+                arr = _normalize_volume(arr)
+                tensor = torch.from_numpy(arr[np.newaxis, np.newaxis]).to(device)
+
+                emb = _extract_patch_embeddings_for_window(model, tensor, device)  # (6,6,6,768)
+
+                for pk in range(6):
+                    gk = int(round((sz + pk * 16 + 8) / 16))
+                    gk = max(0, min(D_p - 1, gk))
+                    for pj in range(6):
+                        gj = int(round((sy + pj * 16 + 8) / 16))
+                        gj = max(0, min(H_p - 1, gj))
+                        for pi in range(6):
+                            gi = int(round((sx + pi * 16 + 8) / 16))
+                            gi = max(0, min(W_p - 1, gi))
+                            w = blend_patch[pk, pj, pi]
+                            embed_accum[gk, gj, gi]  += emb[pk, pj, pi] * w
+                            weight_accum[gk, gj, gi] += w
+
+    result = embed_accum / np.maximum(weight_accum[..., np.newaxis], 1e-9)
+    return result.astype(np.float32)
+
+
+def fit_brainiac_pca(embedding_arrays, n_components: int):
+    """Fit a PCA on the pooled patch embeddings from all training subjects.
+
+    Args:
+        embedding_arrays: list of np.ndarray each shaped (D_p, H_p, W_p, 768).
+        n_components: number of principal components to retain.
+
+    Returns:
+        A fitted sklearn.decomposition.PCA object.
+    """
+    import numpy as np
+    from sklearn.decomposition import PCA
+
+    patches = np.concatenate(
+        [a.reshape(-1, 768) for a in embedding_arrays], axis=0
+    )
+    print(f"[brainiac] Fitting PCA ({n_components} components) on "
+          f"{patches.shape[0]:,} patch embeddings × {patches.shape[1]} dims...")
+    pca = PCA(n_components=n_components, svd_solver="randomized", random_state=42)
+    pca.fit(patches)
+    explained = pca.explained_variance_ratio_.sum() * 100
+    print(f"[brainiac] PCA done. Top {n_components} components explain {explained:.1f}% of variance.")
+    return pca
+
+
+def compute_brainiac_pca_features(
+    nifti_paths: List[str],
+    weights_path: Path,
+    output_dir: Path,
+    sequence_label: str,
+    n_components: int,
+    pca=None,
+    device: Optional[str] = None,
+    stride: int = 48,
+    overwrite: bool = False,
+):
+    """Extract BrainIAC PCA features for a list of NIfTI volumes.
+
+    Training mode  (pca=None):
+        Extracts patch embeddings for ALL subjects, fits PCA on the pooled set,
+        projects each subject, saves N NIfTI component maps per subject.
+
+    Inference mode (pca supplied):
+        Applies the pre-fitted PCA to each subject and saves the N component maps.
+
+    Args:
+        nifti_paths:    ordered list of input NIfTI paths.
+        weights_path:   path to BrainIAC .ckpt checkpoint.
+        output_dir:     directory for output NIfTI files and .npy embedding cache.
+        sequence_label: short label for file naming, e.g. "t1c" or "t2".
+                        Outputs: {stem}_brainiac_{sequence_label}_pc{k}.nii.gz
+        n_components:   number of PCA components.
+        pca:            pre-fitted sklearn PCA (inference) or None (training).
+        stride:         sliding-window stride in voxels (default 48 = 50% overlap).
+        overwrite:      if False, skip subjects whose output NIfTIs all exist.
+
+    Returns:
+        (paths_per_component, pca) where paths_per_component[k][i] is the path
+        to PC-k map for subject i, and pca is the fitted PCA object.
+
+    Notes:
+        Raw embeddings are cached as .npy files alongside the NIfTIs so that
+        re-running with a different n_components avoids repeating BrainIAC inference.
+        Component maps are NOT normalised to [0, 1] — raw PCA projection scores
+        are more informative as model inputs.
+    """
+    try:
+        import torch
+        import numpy as np
+        import nibabel as nib
+        import SimpleITK as sitk
+    except ImportError as e:
+        raise ImportError(_MISSING_DEPS_MSG) from e
+    try:
+        from monai.networks.nets import ViT  # noqa: F401
+    except ImportError as e:
+        raise ImportError(_MISSING_DEPS_MSG) from e
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stems = [Path(p).name.replace(".nii.gz", "").replace(".nii", "") for p in nifti_paths]
+
+    # ------------------------------------------------------------------
+    # Phase 1: extract and cache raw patch embeddings
+    # ------------------------------------------------------------------
+    model = _load_brainiac_model(weights_path, device)
+    model.eval()
+
+    embedding_cache: dict = {}
+    full_sizes: dict = {}
+
+    for nifti_path, stem in zip(nifti_paths, stems):
+        cache_path = output_dir / f"{stem}_{sequence_label}_embeddings.npy"
+        size_path  = output_dir / f"{stem}_{sequence_label}_size.npy"
+
+        if cache_path.exists() and size_path.exists() and not overwrite:
+            embedding_cache[stem] = np.load(str(cache_path))
+            full_sizes[stem] = tuple(np.load(str(size_path)).tolist())
+        else:
+            print(f"[brainiac] Extracting {sequence_label} embeddings: {stem}")
+            sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
+            sitk_1mm = _ensure_1mm_isotropic(sitk_img)
+            full_sizes[stem] = sitk_1mm.GetSize()   # (sz_x, sz_y, sz_z)
+            emb = _compute_sliding_window_embeddings(sitk_1mm, model, device, stride=stride)
+            np.save(str(cache_path), emb)
+            np.save(str(size_path), np.array(full_sizes[stem]))
+            embedding_cache[stem] = emb
+
+    del model
+    import gc
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print("[brainiac] Released GPU memory after embedding extraction.")
+
+    # ------------------------------------------------------------------
+    # Phase 2: fit PCA (training mode only)
+    # ------------------------------------------------------------------
+    if pca is None:
+        pca = fit_brainiac_pca([embedding_cache[s] for s in stems], n_components)
+
+    # ------------------------------------------------------------------
+    # Phase 3: project and save NIfTIs
+    # ------------------------------------------------------------------
+    paths_per_component: List[List[str]] = [[] for _ in range(n_components)]
+
+    for nifti_path, stem in zip(nifti_paths, stems):
+        out_paths = [
+            output_dir / f"{stem}_brainiac_{sequence_label}_pc{k}.nii.gz"
+            for k in range(n_components)
+        ]
+        if all(p.exists() for p in out_paths) and not overwrite:
+            for k, p in enumerate(out_paths):
+                paths_per_component[k].append(str(p))
+            continue
+
+        emb = embedding_cache[stem]                     # (D_p, H_p, W_p, 768)
+        D_p, H_p, W_p = emb.shape[:3]
+        projected = pca.transform(emb.reshape(-1, 768)) # (n_patches, n_components)
+        projected = projected.reshape(D_p, H_p, W_p, n_components)
+
+        sz_x, sz_y, sz_z = full_sizes[stem]
+
+        # Reload geometry for LPS→RAS conversion
+        sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
+        sitk_1mm = _ensure_1mm_isotropic(sitk_img)
+
+        for k in range(n_components):
+            comp_k = projected[..., k].astype(np.float32)  # (D_p, H_p, W_p)
+            # Upsample from patch resolution to full voxel resolution
+            t = torch.from_numpy(comp_k[np.newaxis, np.newaxis])  # (1,1,D_p,H_p,W_p)
+            upsampled = torch.nn.functional.interpolate(
+                t.float(),
+                size=(sz_z, sz_y, sz_x),
+                mode="trilinear",
+                align_corners=False,
+            )[0, 0].numpy()   # (sz_z, sz_y, sz_x) in SimpleITK (z,y,x) order
+
+            saliency_sitk = sitk.GetImageFromArray(upsampled)
+            saliency_sitk.CopyInformation(sitk_1mm)
+            nib_img = _sitk_to_nibabel(saliency_sitk)
+            nib.save(nib_img, str(out_paths[k]))
+            paths_per_component[k].append(str(out_paths[k]))
+
+    return paths_per_component, pca
+
+
 def _ensure_1mm_isotropic(sitk_img, tol: float = 0.01):
     """Returns the image unchanged if already 1 mm isotropic (within tol),
     otherwise resamples to 1 mm isotropic preserving the physical FOV."""

@@ -70,8 +70,16 @@ def parse_train_parameters(config_file_path):
     # Mixed precision
     config.use_mixed_precision = cfg_parser.getboolean("DEFAULT", "use_mixed_precision", fallback=False)
 
-    # BrainIAC (informational; main() sets these if --Use_BrainIAC_Embeddings passed)
+    # BrainIAC
     config.use_brainiac_embeddings = cfg_parser.getboolean("DEFAULT", "use_brainiac_embeddings", fallback=False)
+
+    def _none_str(raw):
+        return None if raw in (None, "", "None", "none", "na") else raw
+
+    config.brainiac_n_pcs        = cfg_parser.getint("DEFAULT", "brainiac_n_pcs", fallback=3)
+    config.brainiac_pca_save_dir = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_save_dir", fallback=None))
+    config.brainiac_pca_t1c_path = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_t1c_path", fallback=None))
+    config.brainiac_pca_t2_path  = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_t2_path",  fallback=None))
 
 
 def main():
@@ -107,13 +115,13 @@ def main():
                              "Halves activation VRAM and enables tensor-core utilisation.")
 
     # BrainIAC
-    parser.add_argument("--Use_BrainIAC_Embeddings", action="store_true",
-                        help="Pre-compute BrainIAC saliency maps and use as an extra input channel.")
     parser.add_argument("--BrainIAC_Weights_Path", type=str, default=None,
                         help=(
                             "Optional path to a locally downloaded BrainIAC .ckpt file. "
                             "If not provided, weights are downloaded automatically from Dropbox "
-                            "on first use and cached for subsequent runs."
+                            "on first use and cached for subsequent runs. "
+                            "All other BrainIAC settings (use_brainiac_embeddings, brainiac_n_pcs, "
+                            "etc.) are set in train_parameters.cfg."
                         ))
 
     args = parser.parse_args()
@@ -160,49 +168,107 @@ def main():
     if args.Use_Intensity_Augmentation:
         cfg_updates["use_intensity_augmentation"] = "true"
 
-    # BrainIAC pre-computation (must happen before train_model() so channels are set)
-    if args.Use_BrainIAC_Embeddings:
+    # BrainIAC PCA pre-computation (runs when use_brainiac_embeddings=true in the config)
+    if config.use_brainiac_embeddings:
+        import pickle
         from .brainiac_utils import (
             ensure_brainiac_weights,
-            compute_brainiac_saliency_maps,
+            compute_brainiac_pca_features,
             BrainIACWeightsNotFoundError,
         )
         from .data_loading import read_paths_from_file
 
-        weights_path = ensure_brainiac_weights(
-            weights_path=args.BrainIAC_Weights_Path,
+        weights_path = ensure_brainiac_weights(weights_path=args.BrainIAC_Weights_Path)
+        n_pcs = config.brainiac_n_pcs
+        pca_save_dir = Path(
+            config.brainiac_pca_save_dir
+            if config.brainiac_pca_save_dir
+            else Path(config.output_dir) / "brainiac_features"
         )
-
+        pca_save_dir.mkdir(parents=True, exist_ok=True)
         brainiac_output_dir = Path(config.output_dir) / "brainiac_features"
 
-        # Use first training channel as reference MRI for BrainIAC input
-        first_train_paths = read_paths_from_file(config.image_paths_files[0])
-        print(f"[brainiac] Pre-computing saliency maps for {len(first_train_paths)} training scans...")
-        train_saliency_paths = compute_brainiac_saliency_maps(
-            first_train_paths, weights_path, brainiac_output_dir / "train"
+        # Channels 0 = T1c, 1 = T2 (as set up by create_config_files with T1c+T2)
+        train_t1c_paths = read_paths_from_file(config.image_paths_files[0])
+        train_t2_paths  = read_paths_from_file(config.image_paths_files[1])
+        val_t1c_paths   = read_paths_from_file(config.val_image_paths_files[0])
+        val_t2_paths    = read_paths_from_file(config.val_image_paths_files[1])
+
+        # --- T1c PCA: fit on training, apply to val ---
+        print(f"[brainiac] T1c embeddings → PCA ({n_pcs} components) for "
+              f"{len(train_t1c_paths)} training scans...")
+        train_t1c_pc_paths, pca_t1c = compute_brainiac_pca_features(
+            nifti_paths=train_t1c_paths,
+            weights_path=weights_path,
+            output_dir=brainiac_output_dir / "train" / "t1c",
+            sequence_label="t1c",
+            n_components=n_pcs,
+            pca=None,
+        )
+        pca_t1c_pkl = pca_save_dir / "pca_t1c.pkl"
+        with open(pca_t1c_pkl, "wb") as _f:
+            pickle.dump(pca_t1c, _f)
+
+        print(f"[brainiac] Applying T1c PCA to {len(val_t1c_paths)} validation scans...")
+        val_t1c_pc_paths, _ = compute_brainiac_pca_features(
+            nifti_paths=val_t1c_paths,
+            weights_path=weights_path,
+            output_dir=brainiac_output_dir / "val" / "t1c",
+            sequence_label="t1c",
+            n_components=n_pcs,
+            pca=pca_t1c,
         )
 
-        first_val_paths = read_paths_from_file(config.val_image_paths_files[0])
-        print(f"[brainiac] Pre-computing saliency maps for {len(first_val_paths)} validation scans...")
-        val_saliency_paths = compute_brainiac_saliency_maps(
-            first_val_paths, weights_path, brainiac_output_dir / "val"
+        # --- T2 PCA: fit on training (T2f and/or T2w already in train_t2_paths) ---
+        print(f"[brainiac] T2 embeddings → PCA ({n_pcs} components) for "
+              f"{len(train_t2_paths)} training scans (may include T2f and T2w)...")
+        train_t2_pc_paths, pca_t2 = compute_brainiac_pca_features(
+            nifti_paths=train_t2_paths,
+            weights_path=weights_path,
+            output_dir=brainiac_output_dir / "train" / "t2",
+            sequence_label="t2",
+            n_components=n_pcs,
+            pca=None,
+        )
+        pca_t2_pkl = pca_save_dir / "pca_t2.pkl"
+        with open(pca_t2_pkl, "wb") as _f:
+            pickle.dump(pca_t2, _f)
+
+        print(f"[brainiac] Applying T2 PCA to {len(val_t2_paths)} validation scans...")
+        val_t2_pc_paths, _ = compute_brainiac_pca_features(
+            nifti_paths=val_t2_paths,
+            weights_path=weights_path,
+            output_dir=brainiac_output_dir / "val" / "t2",
+            sequence_label="t2",
+            n_components=n_pcs,
+            pca=pca_t2,
         )
 
-        # Write saliency paths as new channel config files
-        train_sal_cfg = Path(config.output_dir) / "trainChannels_brainiac.cfg"
-        val_sal_cfg = Path(config.output_dir) / "valChannels_brainiac.cfg"
-        train_sal_cfg.write_text("\n".join(train_saliency_paths))
-        val_sal_cfg.write_text("\n".join(val_saliency_paths))
+        # --- Write one cfg file per PC per sequence, append to channel lists ---
+        for k in range(n_pcs):
+            t1c_train_cfg = Path(config.output_dir) / f"trainChannels_brainiac_t1c_pc{k}.cfg"
+            t1c_val_cfg   = Path(config.output_dir) / f"valChannels_brainiac_t1c_pc{k}.cfg"
+            t1c_train_cfg.write_text("\n".join(train_t1c_pc_paths[k]))
+            t1c_val_cfg.write_text("\n".join(val_t1c_pc_paths[k]))
+            config.image_paths_files.append(str(t1c_train_cfg))
+            config.val_image_paths_files.append(str(t1c_val_cfg))
 
-        # Append as the last channel
-        config.image_paths_files.append(str(train_sal_cfg))
-        config.val_image_paths_files.append(str(val_sal_cfg))
-        config.num_channels += 1
-        config.use_brainiac_embeddings = True
+        for k in range(n_pcs):
+            t2_train_cfg = Path(config.output_dir) / f"trainChannels_brainiac_t2_pc{k}.cfg"
+            t2_val_cfg   = Path(config.output_dir) / f"valChannels_brainiac_t2_pc{k}.cfg"
+            t2_train_cfg.write_text("\n".join(train_t2_pc_paths[k]))
+            t2_val_cfg.write_text("\n".join(val_t2_pc_paths[k]))
+            config.image_paths_files.append(str(t2_train_cfg))
+            config.val_image_paths_files.append(str(t2_val_cfg))
+
+        config.num_channels += 2 * n_pcs
         config.brainiac_weights_path = str(weights_path)
 
         cfg_updates["use_brainiac_embeddings"] = "true"
-        cfg_updates["brainiac_embedding_type"] = "saliency_map"
+        cfg_updates["brainiac_embedding_type"] = "pca_embeddings"
+        cfg_updates["brainiac_n_pcs"] = str(n_pcs)
+        cfg_updates["brainiac_pca_t1c_path"] = str(pca_t1c_pkl)
+        cfg_updates["brainiac_pca_t2_path"]  = str(pca_t2_pkl)
 
         print(f"[brainiac] Done. Total input channels: {config.num_channels}")
 

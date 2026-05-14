@@ -55,6 +55,7 @@ def create_segmentation_config(
     inputChannels=None,
     channelPatterns=None,
     maskPattern=None,
+    channel_alt_patterns=None,
     model_paths=None,
     modelTrainConfigFiles=None,
     merging_method="majority_vote",
@@ -126,6 +127,9 @@ def create_segmentation_config(
     if maskPattern is None:
         raise ValueError("maskPattern must be provided.")
 
+    if channel_alt_patterns is not None and len(channel_alt_patterns) != len(inputChannels):
+        raise ValueError("channel_alt_patterns must be the same length as inputChannels.")
+
     if not model_paths or not modelTrainConfigFiles:
         raise ValueError("You must provide both model_paths and modelTrainConfigFiles (one per model).")
     if len(model_paths) != len(modelTrainConfigFiles):
@@ -176,13 +180,17 @@ def create_segmentation_config(
 
     # ------------------------------
     # 3) Loop over subdirectories, match each channel & mask
+    #    For channels with an alt pattern: prefer primary, fall back to alt.
+    #    No doubling — pick one match per subject.
     # ------------------------------
     for d in all_dirs:
         matched_channel_files = []
         skip_this_dir = False
 
-        for chan, pat in zip(inputChannels, channelPatterns):
+        for i, (chan, pat) in enumerate(zip(inputChannels, channelPatterns)):
             fpath = match_pattern(d, pat)
+            if fpath is None and channel_alt_patterns and channel_alt_patterns[i]:
+                fpath = match_pattern(d, channel_alt_patterns[i])
             if fpath is None:
                 skip_this_dir = True
                 break
@@ -285,6 +293,11 @@ if __name__ == "__main__":
                         help="Patterns for each channel's input data (e.g. T1c_brain_norm.nii.gz, T2w_brain_norm.nii.gz, etc.).")
     parser.add_argument("--maskPattern", required=True,
                         help="Pattern to identify mask files (e.g. brainmask.nii.gz).")
+    parser.add_argument("--channel_alt_patterns", nargs="+", default=None,
+                        help="Optional fallback patterns, one per channel. Use 'none' for channels "
+                             "with no fallback (e.g. --channel_alt_patterns none _T2w_brain-norm.nii.gz). "
+                             "Primary pattern is preferred; alt is used when primary is absent. "
+                             "No dataset doubling at inference time.")
     parser.add_argument("--model_paths", nargs="+", required=True,
                         help="Paths to PyTorch .pt model checkpoints. One per slicing plane.")
     parser.add_argument("--modelTrainConfigFiles", nargs="+", required=True,
@@ -302,11 +315,19 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    channel_alt_patterns = None
+    if args.channel_alt_patterns is not None:
+        channel_alt_patterns = [
+            None if p.strip().lower() in ("none", "na", "") else p.strip()
+            for p in args.channel_alt_patterns
+        ]
+
     create_segmentation_config(
         workingDirectory=args.workingDirectory,
         inputChannels=args.inputChannels,
         channelPatterns=args.channelPatterns,
         maskPattern=args.maskPattern,
+        channel_alt_patterns=channel_alt_patterns,
         model_paths=args.model_paths,
         modelTrainConfigFiles=args.modelTrainConfigFiles,
         merging_method=args.merging_method,

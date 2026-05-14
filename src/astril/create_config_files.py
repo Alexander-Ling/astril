@@ -2,6 +2,7 @@ import configparser
 import os
 import argparse
 import glob
+import itertools
 from pathlib import Path
 import multiprocessing
 
@@ -29,6 +30,7 @@ def create_config_files(
     trainPatterns=None,
     gtPattern=None,
     maskPattern=None,
+    channel_alt_patterns=None,
     nCpuCores=None,
     numClasses=None,
     nEpochs=400,
@@ -47,6 +49,13 @@ def create_config_files(
     Creates config files in `workingDirectory/Configs/` for training and validation data.
     Note: Instead of a single data directory and random splitting,
     separate directories for training and validation are now required.
+
+    channel_alt_patterns: optional list of fallback filename patterns, one per channel
+        (use None at a position for channels with no fallback). At training time, subjects
+        that match BOTH the primary and alt pattern for a channel are added twice — once
+        per match — enabling dataset doubling (e.g. T2f and T2w as interchangeable T2
+        channels). At validation time only the primary pattern is used, with the alt as a
+        fallback when the primary is absent (no doubling).
     """
     # Validate inputs
     if trainDataDirectory is None:
@@ -59,6 +68,8 @@ def create_config_files(
         raise ValueError("The number of trainChannels must match the number of trainPatterns.")
     if gtPattern is None or maskPattern is None:
         raise ValueError("gtPattern and maskPattern must be provided.")
+    if channel_alt_patterns is not None and len(channel_alt_patterns) != len(trainChannels):
+        raise ValueError("channel_alt_patterns must be the same length as trainChannels.")
 
     # Determine number of CPU cores
     if nCpuCores is None:
@@ -99,62 +110,95 @@ def create_config_files(
         return matches[0]
 
     # Process training directories
+    # For channels with an alt pattern, subjects matching BOTH primary and alt are added
+    # twice (once per match), enabling automatic dataset doubling.
     train_channel_file_paths = {channel: [] for channel in trainChannels}
     train_gt_file_paths = []
     train_mask_file_paths = []
 
     for timepoint_dir in train_timepoint_dirs:
-        matched_channel_files = []
+        gt_file = match_pattern(timepoint_dir, gtPattern)
+        if gt_file is None:
+            print(f"Warning (train): Missing or ambiguous match for ground truth in {timepoint_dir}. Skipping.")
+            continue
+        mask_file = match_pattern(timepoint_dir, maskPattern)
+        if mask_file is None:
+            print(f"Warning (train): Missing or ambiguous match for mask file in {timepoint_dir}. Skipping.")
+            continue
+
+        # Collect options per channel: list of matched paths (1 or 2 for alt-pattern channels)
+        options_per_channel = []
         skip = False
-        for channel, pattern in zip(trainChannels, trainPatterns):
-            matched_file = match_pattern(timepoint_dir, pattern)
-            if matched_file is None:
-                print(f"Warning (train): Missing or ambiguous match for pattern '{pattern}' in {timepoint_dir}. Skipping.")
-                skip = True
-                break
-            matched_channel_files.append(str(matched_file))
-        if not skip:
-            gt_file = match_pattern(timepoint_dir, gtPattern)
-            if gt_file is None:
-                print(f"Warning (train): Missing or ambiguous match for ground truth in {timepoint_dir}. Skipping.")
-                continue
-            mask_file = match_pattern(timepoint_dir, maskPattern)
-            if mask_file is None:
-                print(f"Warning (train): Missing or ambiguous match for mask file in {timepoint_dir}. Skipping.")
-                continue
-            for channel, file_path in zip(trainChannels, matched_channel_files):
+        for i, (channel, pattern) in enumerate(zip(trainChannels, trainPatterns)):
+            alt_pat = (channel_alt_patterns[i] if channel_alt_patterns else None)
+            primary = match_pattern(timepoint_dir, pattern)
+            alt = match_pattern(timepoint_dir, alt_pat) if alt_pat else None
+
+            if alt_pat:
+                opts = []
+                if primary is not None:
+                    opts.append(str(primary))
+                if alt is not None and str(alt) != str(primary):
+                    opts.append(str(alt))
+                if not opts:
+                    print(f"Warning (train): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
+                    skip = True
+                    break
+                options_per_channel.append(opts)
+            else:
+                if primary is None:
+                    print(f"Warning (train): Missing or ambiguous match for pattern '{pattern}' in {timepoint_dir}. Skipping.")
+                    skip = True
+                    break
+                options_per_channel.append([str(primary)])
+
+        if skip:
+            continue
+
+        # itertools.product produces one row per combination; in practice this is 1 or 2 rows
+        for combo in itertools.product(*options_per_channel):
+            for channel, file_path in zip(trainChannels, combo):
                 train_channel_file_paths[channel].append(file_path)
             train_gt_file_paths.append(str(gt_file))
             train_mask_file_paths.append(str(mask_file))
 
     # Process validation directories
+    # For channels with an alt pattern, prefer primary; fall back to alt if primary absent.
+    # No doubling at validation time.
     val_channel_file_paths = {channel: [] for channel in trainChannels}
     val_gt_file_paths = []
     val_mask_file_paths = []
 
     for timepoint_dir in val_timepoint_dirs:
+        gt_file = match_pattern(timepoint_dir, gtPattern)
+        if gt_file is None:
+            print(f"Warning (val): Missing or ambiguous match for ground truth in {timepoint_dir}. Skipping.")
+            continue
+        mask_file = match_pattern(timepoint_dir, maskPattern)
+        if mask_file is None:
+            print(f"Warning (val): Missing or ambiguous match for mask file in {timepoint_dir}. Skipping.")
+            continue
+
         matched_channel_files = []
         skip = False
-        for channel, pattern in zip(trainChannels, trainPatterns):
-            matched_file = match_pattern(timepoint_dir, pattern)
-            if matched_file is None:
-                print(f"Warning (val): Missing or ambiguous match for pattern '{pattern}' in {timepoint_dir}. Skipping.")
+        for i, (channel, pattern) in enumerate(zip(trainChannels, trainPatterns)):
+            alt_pat = (channel_alt_patterns[i] if channel_alt_patterns else None)
+            matched = match_pattern(timepoint_dir, pattern)
+            if matched is None and alt_pat:
+                matched = match_pattern(timepoint_dir, alt_pat)
+            if matched is None:
+                print(f"Warning (val): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
                 skip = True
                 break
-            matched_channel_files.append(str(matched_file))
-        if not skip:
-            gt_file = match_pattern(timepoint_dir, gtPattern)
-            if gt_file is None:
-                print(f"Warning (val): Missing or ambiguous match for ground truth in {timepoint_dir}. Skipping.")
-                continue
-            mask_file = match_pattern(timepoint_dir, maskPattern)
-            if mask_file is None:
-                print(f"Warning (val): Missing or ambiguous match for mask file in {timepoint_dir}. Skipping.")
-                continue
-            for channel, file_path in zip(trainChannels, matched_channel_files):
-                val_channel_file_paths[channel].append(file_path)
-            val_gt_file_paths.append(str(gt_file))
-            val_mask_file_paths.append(str(mask_file))
+            matched_channel_files.append(str(matched))
+
+        if skip:
+            continue
+
+        for channel, file_path in zip(trainChannels, matched_channel_files):
+            val_channel_file_paths[channel].append(file_path)
+        val_gt_file_paths.append(str(gt_file))
+        val_mask_file_paths.append(str(mask_file))
 
     # Write training channel .cfg files
     for channel, cfg_file in zip(trainChannels, train_channel_cfg_files):
@@ -207,9 +251,13 @@ def create_config_files(
         f.write("use_se_blocks = false\n")
         f.write("use_deep_supervision = false\n")
         f.write("deep_supervision_weights = 0.5,0.25\n")
-        # BrainIAC flags (default off; main.py sets use_brainiac_embeddings=true when used)
+        # BrainIAC flags (default off; set use_brainiac_embeddings=true in this file to enable)
         f.write("use_brainiac_embeddings = false\n")
-        f.write("brainiac_embedding_type = saliency_map\n")
+        f.write("brainiac_embedding_type = pca_embeddings\n")
+        f.write("brainiac_n_pcs = 3\n")
+        f.write("brainiac_pca_save_dir = none\n")
+        f.write("brainiac_pca_t1c_path = none\n")
+        f.write("brainiac_pca_t2_path = none\n")
         # Mixed precision (default off; safe to enable on CUDA hardware)
         f.write("use_mixed_precision = false\n")
         # Augmentation flags (default off; set via --Use_Flip_Augmentation / --Use_Intensity_Augmentation)
@@ -224,6 +272,11 @@ if __name__ == "__main__":
     parser.add_argument("--valDataDirectory", required=True, help="Directory with validation data.")
     parser.add_argument("--trainChannels", nargs="+", required=True, help="Names of training channels.")
     parser.add_argument("--trainPatterns", nargs="+", required=True, help="Patterns for training channels.")
+    parser.add_argument("--channel_alt_patterns", nargs="+", default=None,
+                        help="Optional fallback patterns, one per channel. Use 'none' for channels with no "
+                             "fallback (e.g. --channel_alt_patterns none _T2w_brain-norm.nii.gz). "
+                             "Training: subjects matching both primary and alt are added twice (dataset "
+                             "doubling). Validation: primary preferred, alt used as fallback.")
     parser.add_argument("--gtPattern", required=True, help="Pattern for ground truth files.")
     parser.add_argument("--maskPattern", required=True, help="Pattern for mask files.")
     parser.add_argument("--nCpuCores", type=int, default=None, help="Number of CPU cores to use for data loading.")
@@ -248,6 +301,14 @@ if __name__ == "__main__":
     if args.preTrainedModelPath and not str(args.preTrainedModelPath).lower().endswith(".pt"):
         raise ValueError("--preTrainedModelPath must point to a PyTorch .pt checkpoint.")
 
+    # Convert "none" sentinels to None in channel_alt_patterns
+    channel_alt_patterns = None
+    if args.channel_alt_patterns is not None:
+        channel_alt_patterns = [
+            None if p.strip().lower() in ("none", "na", "") else p.strip()
+            for p in args.channel_alt_patterns
+        ]
+
     create_config_files(
         workingDirectory=args.workingDirectory,
         trainDataDirectory=args.trainDataDirectory,
@@ -256,6 +317,7 @@ if __name__ == "__main__":
         trainPatterns=args.trainPatterns,
         gtPattern=args.gtPattern,
         maskPattern=args.maskPattern,
+        channel_alt_patterns=channel_alt_patterns,
         nCpuCores=args.nCpuCores,
         numClasses=args.numClasses,
         nEpochs=args.nEpochs,

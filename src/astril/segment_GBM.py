@@ -165,11 +165,11 @@ def compute_final_segmentation_path(mask_path, original_mask_pattern, final_mask
 ###############################################################################
 def process_subject_with_models(seg_config_file, subject_index, loaded_models,
                                 slice_batch_size, overwrite, segment_suffix, tiebreaker_model, debug_models,
-                                extra_channel_path=None):
+                                extra_channel_paths=None):
     """
     Process one subject (identified by its mask file in the segmentation config)
     using the provided pre-loaded models (for one segmentation stage).
-    extra_channel_path: optional path to an additional channel NIfTI (e.g. BrainIAC saliency map)
+    extra_channel_paths: optional list of additional channel NIfTI paths (e.g. BrainIAC PCA maps)
     appended to the subject's channel list at inference time.
     """
     # Lazy imports: avoid nibabel/numpy/torch at module import time
@@ -201,9 +201,9 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     volume_paths_list = list(zip(*channel_file_lists))
     volume_paths_list = [list(vp) for vp in volume_paths_list]
 
-    # Append extra channel (e.g. BrainIAC saliency map) if provided
-    if extra_channel_path is not None:
-        volume_paths_list[subject_index] = volume_paths_list[subject_index] + [extra_channel_path]
+    # Append extra channels (e.g. BrainIAC PCA maps) if provided
+    if extra_channel_paths:
+        volume_paths_list[subject_index] = volume_paths_list[subject_index] + list(extra_channel_paths)
 
     # Get subject's mask file.
     mask_path = mask_paths[subject_index]
@@ -432,19 +432,46 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
     print(f"[INFO] Found {num_subjects} exam(s) to process in {input_dir}.")
 
     # Detect BrainIAC dependency from Model 1 training configs
-    from .run_segmentation import _train_config_requires_brainiac
+    from .run_segmentation import (
+        _train_config_requires_brainiac,
+        _train_config_brainiac_embedding_type,
+    )
     brainiac_needed = any(_train_config_requires_brainiac(tc) for tc in model1_train_configs)
     brainiac_weights_path = None
     brainiac_tmp_dir = None
+    brainiac_mode = None
+    brainiac_n_pcs = 3
+    brainiac_pca_t1c = None
+    brainiac_pca_t2  = None
     if brainiac_needed:
         from .brainiac_utils import ensure_brainiac_weights, BrainIACWeightsNotFoundError
-        import tempfile
+        import tempfile, pickle as _pickle
         try:
             brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
         except BrainIACWeightsNotFoundError as e:
             raise RuntimeError(str(e))
         brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
-        print(f"[brainiac] BrainIAC embeddings required. Saliency maps cached at: {brainiac_tmp_dir}")
+
+        _brainiac_cfg = next(tc for tc in model1_train_configs if _train_config_requires_brainiac(tc))
+        brainiac_mode = _train_config_brainiac_embedding_type(_brainiac_cfg)
+
+        if brainiac_mode == "pca_embeddings":
+            import configparser as _cparser
+            _cp = _cparser.ConfigParser()
+            _cp.read(_brainiac_cfg)
+            brainiac_n_pcs = _cp["DEFAULT"].getint("brainiac_n_pcs", fallback=3)
+            _pca_t1c_path = _cp["DEFAULT"].get("brainiac_pca_t1c_path", "")
+            _pca_t2_path  = _cp["DEFAULT"].get("brainiac_pca_t2_path",  "")
+            if not _pca_t1c_path or not Path(_pca_t1c_path).exists():
+                raise FileNotFoundError(
+                    f"brainiac_pca_t1c_path not found: '{_pca_t1c_path}'. "
+                    "Re-run train-model with use_brainiac_embeddings=true."
+                )
+            with open(_pca_t1c_path, "rb") as _f: brainiac_pca_t1c = _pickle.load(_f)
+            with open(_pca_t2_path,  "rb") as _f: brainiac_pca_t2  = _pickle.load(_f)
+            print(f"[brainiac] PCA mode: {brainiac_n_pcs} components per sequence.")
+        else:
+            print("[brainiac] Saliency mode (legacy).")
 
     for subj_idx in range(num_subjects):
         # BEFORE ANY PROCESSING: Check if the final segmentation file already exists.
@@ -455,24 +482,42 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             print(f"[INFO] Skipping subject {subj_idx+1}: final segmentation file {final_seg_path} already exists.")
             continue
 
-        # Compute BrainIAC saliency map for this subject if Model 1 requires it
-        brainiac_sal_path_subj = None
+        # Compute BrainIAC features for this subject if Model 1 requires it
+        brainiac_extra_paths_subj = None
         if brainiac_needed:
-            from .brainiac_utils import compute_brainiac_saliency_maps
-            ref_path = read_paths_from_file(
-                cp_model1["DEFAULT"]["channel_paths_files"].split(",")[0]
-            )[subj_idx]
-            sal_paths = compute_brainiac_saliency_maps(
-                [ref_path], brainiac_weights_path, brainiac_tmp_dir, overwrite=False
-            )
-            brainiac_sal_path_subj = sal_paths[0]
+            if brainiac_mode == "pca_embeddings":
+                from .brainiac_utils import compute_brainiac_pca_features
+                channel_paths = cp_model1["DEFAULT"]["channel_paths_files"].split(",")
+                t1c_path = read_paths_from_file(channel_paths[0])[subj_idx]
+                t2_path  = read_paths_from_file(channel_paths[1])[subj_idx]
+                t1c_pc, _ = compute_brainiac_pca_features(
+                    [t1c_path], brainiac_weights_path,
+                    brainiac_tmp_dir / "t1c", "t1c", brainiac_n_pcs, pca=brainiac_pca_t1c,
+                )
+                t2_pc, _ = compute_brainiac_pca_features(
+                    [t2_path], brainiac_weights_path,
+                    brainiac_tmp_dir / "t2", "t2", brainiac_n_pcs, pca=brainiac_pca_t2,
+                )
+                brainiac_extra_paths_subj = (
+                    [t1c_pc[k][0] for k in range(brainiac_n_pcs)] +
+                    [t2_pc[k][0]  for k in range(brainiac_n_pcs)]
+                )
+            else:
+                from .brainiac_utils import compute_brainiac_saliency_maps
+                ref_path = read_paths_from_file(
+                    cp_model1["DEFAULT"]["channel_paths_files"].split(",")[0]
+                )[subj_idx]
+                sal_paths = compute_brainiac_saliency_maps(
+                    [ref_path], brainiac_weights_path, brainiac_tmp_dir, overwrite=False
+                )
+                brainiac_extra_paths_subj = [sal_paths[0]]
 
         print("\n==============================")
         print(f"[INFO] Processing exam {subj_idx+1} of {num_subjects} with Model 1...")
         process_subject_with_models(seg_config_model1, subj_idx, loaded_models_model1,
                                     slice_batch_size, overwrite_existing_outputs, "_Model_1_seg.nii.gz",
                                     tiebreaker_model=0, debug_models=debug_models,
-                                    extra_channel_path=brainiac_sal_path_subj)
+                                    extra_channel_paths=brainiac_extra_paths_subj)
         # Remap Model 1 segmentation outputs in the subject's directory.
         subject_dir = os.path.dirname(mask_paths[subj_idx])
         print("[INFO] Remapping Model 1 segmentation for Model 2 inputs...")
