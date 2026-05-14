@@ -1,6 +1,6 @@
 """
-Utilities for downloading BrainIAC model weights and extracting saliency maps
-for use as additional input channels during training and inference.
+Utilities for downloading BrainIAC model weights and extracting frozen
+BrainIAC patch-token encoder features for astril encoder-fusion models.
 
 BrainIAC reference:
   "A generalizable foundation model for analysis of human brain MRI"
@@ -145,95 +145,6 @@ def ensure_brainiac_weights(weights_path: Optional[str]) -> Path:
     return download_brainiac_weights()
 
 
-def compute_brainiac_saliency_maps(
-    nifti_paths: List[str],
-    weights_path: Path,
-    output_dir: Path,
-    device: Optional[str] = None,
-    overwrite: bool = False,
-    window_stride: int = 48,
-) -> List[str]:
-    """
-    Runs BrainIAC attention rollout on each NIfTI volume and saves the resulting
-    saliency map as a NIfTI file. Returns the list of output paths in the same
-    order as the inputs.
-
-    Saliency maps are saved as:
-      {output_dir}/{subject_stem}_brainiac_saliency.nii.gz
-
-    Input NIfTIs should be skull-stripped and co-registered (as produced by
-    astril's preprocessing pipeline). Any MRI modality is accepted; only the
-    spatial content matters for attention computation.
-
-    BrainIAC is a ViT with 16^3-voxel patches designed for 96^3 inputs at 1 mm
-    isotropic. To preserve full spatial resolution across the entire volume, the
-    input is tiled with overlapping 96^3 windows (stride=window_stride, default
-    48 voxels = 50% overlap). Attention rollout is computed for each window and
-    results are blended with a 3-D cosine taper to suppress seam artefacts.
-    """
-    # Lazy imports — only needed when this function is called
-    try:
-        import torch
-        import numpy as np
-        import nibabel as nib
-        import SimpleITK as sitk
-    except ImportError as e:
-        raise ImportError(_MISSING_DEPS_MSG) from e
-
-    try:
-        from monai.networks.nets import ViT  # noqa: F401 — confirms monai is present
-    except ImportError as e:
-        raise ImportError(_MISSING_DEPS_MSG) from e
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load BrainIAC model once; reuse across all scans
-    model = _load_brainiac_model(weights_path, device)
-    model.eval()
-
-    output_paths = []
-    for nifti_path in nifti_paths:
-        stem = Path(nifti_path).name.replace(".nii.gz", "").replace(".nii", "")
-        out_path = output_dir / f"{stem}_brainiac_saliency.nii.gz"
-
-        if out_path.exists() and not overwrite:
-            output_paths.append(str(out_path))
-            continue
-
-        print(f"[brainiac] Computing saliency map for: {stem}")
-
-        sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
-        sitk_1mm = _ensure_1mm_isotropic(sitk_img)
-
-        saliency_arr = _compute_sliding_window_saliency(
-            sitk_1mm, model, device, stride=window_stride
-        )
-
-        # Attach 1 mm geometry then convert to RAS NIfTI
-        saliency_sitk = sitk.GetImageFromArray(saliency_arr)
-        saliency_sitk.CopyInformation(sitk_1mm)
-        nib_img = _sitk_to_nibabel(saliency_sitk)
-        nib.save(nib_img, str(out_path))
-        output_paths.append(str(out_path))
-
-    # Explicitly release model and CUDA memory before astril training starts.
-    # PyTorch's caching allocator holds GPU blocks even after Python objects are
-    # freed; empty_cache() returns them before astril training starts.
-    del model
-    import gc
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.synchronize()    # ensure all GPU ops have completed
-        torch.cuda.empty_cache()    # return cached blocks to CUDA/OS
-        print("[brainiac] Released GPU memory back to CUDA.")
-
-    return output_paths
-
-
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -242,9 +153,7 @@ def _load_brainiac_model(weights_path: Path, device: str):
     """Loads the BrainIAC ViT backbone from a .ckpt checkpoint.
 
     MONAI 1.5 renamed pos_embed -> proj_type (patch projection) and added
-    pos_embed_type (position embedding style). save_attn=True stores attention
-    weights on each block's .attn.att_mat after every forward pass, which is
-    used directly by _compute_attention_rollout without needing hooks.
+    pos_embed_type (position embedding style).
     """
     import torch
     from monai.networks.nets import ViT
@@ -261,7 +170,7 @@ def _load_brainiac_model(weights_path: Path, device: str):
         pos_embed_type="learnable", # standard ViT learnable positional embeddings
         classification=False,
         dropout_rate=0.0,
-        save_attn=True,             # stores att_mat on each SABlock after forward
+        save_attn=False,
     ).to(device)
 
     ckpt = torch.load(str(weights_path), map_location=device, weights_only=False)
@@ -281,7 +190,7 @@ def _load_brainiac_model(weights_path: Path, device: str):
     if cross_attn_keys:
         # MONAI added optional cross-attention sub-layers to SABlock in newer versions.
         # These are never invoked in a standard single-input ViT forward pass, so
-        # randomly-initialised weights here have no effect on saliency maps.
+        # randomly-initialised weights here have no effect on standard ViT patch-token extraction.
         print(f"[brainiac] Note: {len(cross_attn_keys)} cross-attention keys not in checkpoint "
               f"(MONAI API addition, unused in standard forward pass — safe to ignore).")
     if other_missing:
@@ -292,7 +201,7 @@ def _load_brainiac_model(weights_path: Path, device: str):
 
 
 # ---------------------------------------------------------------------------
-# PCA-based patch embedding pipeline (replaces attention-rollout saliency)
+# BrainIAC patch-token encoder feature pipeline
 # ---------------------------------------------------------------------------
 
 # Increment when the patch-grid embedding algorithm changes in a way that makes
@@ -394,77 +303,50 @@ def _compute_sliding_window_embeddings(
     return result.astype(np.float32)
 
 
-def fit_brainiac_pca(embedding_arrays, n_components: int):
-    """Fit a PCA on the pooled patch embeddings from all training subjects.
-
-    Args:
-        embedding_arrays: list of np.ndarray each shaped (D_p, H_p, W_p, 768).
-        n_components: number of principal components to retain.
-
-    Returns:
-        A fitted sklearn.decomposition.PCA object.
-    """
+def _sitk_patch_grid_affine(sitk_img, patch_size: float = 16.0):
+    """Return an RAS affine for a patch grid derived from a 1 mm SITK image."""
     import numpy as np
-    from sklearn.decomposition import PCA
 
-    patches = np.concatenate(
-        [a.reshape(-1, 768) for a in embedding_arrays], axis=0
-    )
-    print(f"[brainiac] Fitting PCA ({n_components} components) on "
-          f"{patches.shape[0]:,} patch embeddings × {patches.shape[1]} dims...")
-    pca = PCA(n_components=n_components, svd_solver="randomized", random_state=42)
-    pca.fit(patches)
-    explained = pca.explained_variance_ratio_.sum() * 100
-    per_comp = "  ".join(f"PC{i}={v*100:.1f}%" for i, v in enumerate(pca.explained_variance_ratio_))
-    print(f"[brainiac] PCA done: {per_comp}  |  total={explained:.1f}%")
-    return pca
+    spacing = np.array(sitk_img.GetSpacing(), dtype=float) * float(patch_size)
+    origin = np.array(sitk_img.GetOrigin(), dtype=float)
+    direction = np.array(sitk_img.GetDirection(), dtype=float).reshape(3, 3)
+    lps_to_ras = np.diag([-1.0, -1.0, 1.0])
+    affine = np.eye(4)
+    affine[:3, :3] = (lps_to_ras @ direction) * spacing
+    affine[:3, 3] = lps_to_ras @ origin
+    return affine
 
 
-def compute_brainiac_pca_features(
+def _embedding_grid_to_canonical(emb, sitk_1mm):
+    """Convert embedding grid from SITK (z,y,x,c) order to canonical RAS (x,y,z,c)."""
+    import nibabel as nib
+    import numpy as np
+    from nibabel.funcs import as_closest_canonical
+
+    xyzc = np.transpose(emb, (2, 1, 0, 3))
+    img = nib.Nifti1Image(xyzc, _sitk_patch_grid_affine(sitk_1mm))
+    canonical = as_closest_canonical(img)
+    return np.asarray(canonical.dataobj, dtype=np.float32)
+
+
+def compute_brainiac_encoder_features(
     nifti_paths: List[str],
     weights_path: Path,
     output_dir: Path,
     sequence_label: str,
-    n_components: int,
-    pca=None,
     device: Optional[str] = None,
     stride: int = 48,
     overwrite: bool = False,
-):
-    """Extract BrainIAC PCA features for a list of NIfTI volumes.
+) -> List[str]:
+    """Extract frozen BrainIAC patch-token features for encoder-fusion models.
 
-    Training mode  (pca=None):
-        Extracts patch embeddings for ALL subjects, fits PCA on the pooled set,
-        projects each subject, saves N NIfTI component maps per subject.
-
-    Inference mode (pca supplied):
-        Applies the pre-fitted PCA to each subject and saves the N component maps.
-
-    Args:
-        nifti_paths:    ordered list of input NIfTI paths.
-        weights_path:   path to BrainIAC .ckpt checkpoint.
-        output_dir:     directory for output NIfTI files and .npy embedding cache.
-        sequence_label: short label for file naming, e.g. "t1c" or "t2".
-                        Outputs: {stem}_brainiac_{sequence_label}_pc{k}.nii.gz
-        n_components:   number of PCA components.
-        pca:            pre-fitted sklearn PCA (inference) or None (training).
-        stride:         sliding-window stride in voxels (default 48 = 50% overlap).
-        overwrite:      if False, skip subjects whose output NIfTIs all exist.
-
-    Returns:
-        (paths_per_component, pca) where paths_per_component[k][i] is the path
-        to PC-k map for subject i, and pca is the fitted PCA object.
-
-    Notes:
-        Raw embeddings are cached as .npy files alongside the NIfTIs so that
-        re-running with a different n_components avoids repeating BrainIAC inference.
-        Component maps are NOT normalised to [0, 1] — raw PCA projection scores
-        are more informative as model inputs.
+    Saves one canonical RAS .npy feature grid per input volume. Each array is
+    shaped (X_p, Y_p, Z_p, 768), where spatial axes are patch-resolution analogs
+    of astril's canonical image axes.
     """
     try:
         import torch
         import numpy as np
-        import nibabel as nib
         import SimpleITK as sitk
     except ImportError as e:
         raise ImportError(_MISSING_DEPS_MSG) from e
@@ -479,22 +361,14 @@ def compute_brainiac_pca_features(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stems = [Path(p).name.replace(".nii.gz", "").replace(".nii", "") for p in nifti_paths]
-
-    # ------------------------------------------------------------------
-    # Phase 1: extract and cache raw patch embeddings
-    # ------------------------------------------------------------------
     model = _load_brainiac_model(weights_path, device)
     model.eval()
 
-    embedding_cache: dict = {}
-    full_sizes: dict = {}
-    recomputed_embeddings = set()
-
-    for nifti_path, stem in zip(nifti_paths, stems):
-        cache_path = output_dir / f"{stem}_{sequence_label}_embeddings.npy"
-        size_path  = output_dir / f"{stem}_{sequence_label}_size.npy"
-        version_path = output_dir / f"{stem}_{sequence_label}_cache_version.txt"
+    output_paths: List[str] = []
+    for nifti_path in nifti_paths:
+        stem = Path(nifti_path).name.replace(".nii.gz", "").replace(".nii", "")
+        out_path = output_dir / f"{stem}_{sequence_label}_encoder_embeddings.npy"
+        version_path = output_dir / f"{stem}_{sequence_label}_encoder_cache_version.txt"
 
         cache_version = None
         if version_path.exists():
@@ -503,31 +377,23 @@ def compute_brainiac_pca_features(
             except ValueError:
                 cache_version = None
 
-        cache_is_current = (
-            cache_path.exists()
-            and size_path.exists()
-            and cache_version == BRAINIAC_EMBEDDING_CACHE_VERSION
-        )
+        if out_path.exists() and cache_version == BRAINIAC_EMBEDDING_CACHE_VERSION and not overwrite:
+            output_paths.append(str(out_path))
+            continue
 
-        if cache_is_current and not overwrite:
-            embedding_cache[stem] = np.load(str(cache_path))
-            full_sizes[stem] = tuple(np.load(str(size_path)).tolist())
-        else:
-            if cache_path.exists() and not overwrite:
-                print(
-                    f"[brainiac] Ignoring stale {sequence_label} embedding cache "
-                    f"for {stem}; regenerating."
-                )
-            print(f"[brainiac] Extracting {sequence_label} embeddings: {stem}")
-            sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
-            sitk_1mm = _ensure_1mm_isotropic(sitk_img)
-            full_sizes[stem] = sitk_1mm.GetSize()   # (sz_x, sz_y, sz_z)
-            emb = _compute_sliding_window_embeddings(sitk_1mm, model, device, stride=stride)
-            np.save(str(cache_path), emb)
-            np.save(str(size_path), np.array(full_sizes[stem]))
-            version_path.write_text(f"{BRAINIAC_EMBEDDING_CACHE_VERSION}\n")
-            embedding_cache[stem] = emb
-            recomputed_embeddings.add(stem)
+        if out_path.exists() and not overwrite:
+            print(
+                f"[brainiac] Ignoring stale {sequence_label} encoder cache "
+                f"for {stem}; regenerating."
+            )
+        print(f"[brainiac] Extracting {sequence_label} encoder embeddings: {stem}")
+        sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
+        sitk_1mm = _ensure_1mm_isotropic(sitk_img)
+        emb = _compute_sliding_window_embeddings(sitk_1mm, model, device, stride=stride)
+        emb_canonical = _embedding_grid_to_canonical(emb, sitk_1mm)
+        np.save(str(out_path), emb_canonical.astype(np.float32))
+        version_path.write_text(f"{BRAINIAC_EMBEDDING_CACHE_VERSION}\n")
+        output_paths.append(str(out_path))
 
     del model
     import gc
@@ -535,63 +401,9 @@ def compute_brainiac_pca_features(
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        print("[brainiac] Released GPU memory after embedding extraction.")
+        print("[brainiac] Released GPU memory after encoder embedding extraction.")
 
-    # ------------------------------------------------------------------
-    # Phase 2: fit PCA (training mode only)
-    # ------------------------------------------------------------------
-    if pca is None:
-        pca = fit_brainiac_pca([embedding_cache[s] for s in stems], n_components)
-
-    # ------------------------------------------------------------------
-    # Phase 3: project and save NIfTIs
-    # ------------------------------------------------------------------
-    paths_per_component: List[List[str]] = [[] for _ in range(n_components)]
-
-    for nifti_path, stem in zip(nifti_paths, stems):
-        out_paths = [
-            output_dir / f"{stem}_brainiac_{sequence_label}_pc{k}.nii.gz"
-            for k in range(n_components)
-        ]
-        if all(p.exists() for p in out_paths) and not overwrite and stem not in recomputed_embeddings:
-            for k, p in enumerate(out_paths):
-                paths_per_component[k].append(str(p))
-            continue
-
-        emb = embedding_cache[stem]                     # (D_p, H_p, W_p, 768)
-        D_p, H_p, W_p = emb.shape[:3]
-        projected = pca.transform(emb.reshape(-1, 768)) # (n_patches, n_components)
-        projected = projected.reshape(D_p, H_p, W_p, n_components)
-
-        sz_x, sz_y, sz_z = full_sizes[stem]
-
-        # Reload geometry for LPS→RAS conversion
-        sitk_img = sitk.ReadImage(str(nifti_path), sitk.sitkFloat32)
-        sitk_1mm = _ensure_1mm_isotropic(sitk_img)
-
-        for k in range(n_components):
-            comp_k = projected[..., k].astype(np.float32)  # (D_p, H_p, W_p)
-            # Upsample from patch resolution to full voxel resolution
-            t = torch.from_numpy(comp_k[np.newaxis, np.newaxis])  # (1,1,D_p,H_p,W_p)
-            upsampled = torch.nn.functional.interpolate(
-                t.float(),
-                size=(sz_z, sz_y, sz_x),
-                mode="trilinear",
-                align_corners=False,
-            )[0, 0].numpy()   # (sz_z, sz_y, sz_x) in SimpleITK (z,y,x) order
-
-            # Light Gaussian blur (sigma = half a patch width ≈ 8 mm at 1mm isotropic)
-            # to soften the hard step discontinuities at 16 mm patch boundaries.
-            from scipy.ndimage import gaussian_filter
-            upsampled = gaussian_filter(upsampled, sigma=8.0).astype(np.float32)
-
-            saliency_sitk = sitk.GetImageFromArray(upsampled)
-            saliency_sitk.CopyInformation(sitk_1mm)
-            nib_img = _sitk_to_nibabel(saliency_sitk)
-            nib.save(nib_img, str(out_paths[k]))
-            paths_per_component[k].append(str(out_paths[k]))
-
-    return paths_per_component, pca
+    return output_paths
 
 
 def _ensure_1mm_isotropic(sitk_img, tol: float = 0.01):
@@ -627,74 +439,6 @@ def _make_cosine_window(size: int):
     return w1d[:, None, None] * w1d[None, :, None] * w1d[None, None, :]
 
 
-def _compute_sliding_window_saliency(
-    sitk_1mm,
-    model,
-    device: str,
-    window_size: int = 96,
-    stride: int = 48,
-):
-    """Tile a 1 mm isotropic SimpleITK image with overlapping 96^3 windows,
-    compute BrainIAC attention-rollout saliency for each, and blend with a
-    cosine taper. Returns a float32 numpy array (z, y, x) in SimpleITK order.
-
-    At 50 % overlap (stride=48) a 240×240×155 volume requires 4×4×2 = 32
-    forward passes; each patch covers 16 mm in original space rather than the
-    ~40 mm produced by down-sampling the full FOV to 96^3.
-    """
-    import numpy as np
-    import SimpleITK as sitk
-    import torch
-
-    sz_x, sz_y, sz_z = sitk_1mm.GetSize()   # SimpleITK: (x, y, z)
-
-    def window_starts(size: int) -> list:
-        if size <= window_size:
-            return [0]
-        starts = list(range(0, size - window_size, stride))
-        if starts[-1] + window_size < size:
-            starts.append(size - window_size)
-        return starts
-
-    xs = window_starts(sz_x)
-    ys = window_starts(sz_y)
-    zs = window_starts(sz_z)
-
-    total = len(xs) * len(ys) * len(zs)
-    print(f"[brainiac]   sliding-window saliency: {len(xs)}×{len(ys)}×{len(zs)} = {total} windows")
-
-    # Accumulators in SimpleITK array order (z, y, x)
-    accum   = np.zeros((sz_z, sz_y, sz_x), dtype=np.float64)
-    weights = np.zeros((sz_z, sz_y, sz_x), dtype=np.float64)
-    blend   = _make_cosine_window(window_size)  # (w, w, w) = (z, y, x)
-
-    roi = sitk.RegionOfInterestImageFilter()
-
-    for sx in xs:
-        for sy in ys:
-            for sz in zs:
-                roi.SetIndex([sx, sy, sz])
-                roi.SetSize([window_size, window_size, window_size])
-                crop = roi.Execute(sitk_1mm)
-
-                arr = sitk.GetArrayFromImage(crop).astype(np.float32)  # (z,y,x)
-                arr = _normalize_volume(arr)
-                tensor = torch.from_numpy(arr[np.newaxis, np.newaxis]).to(device)
-
-                sal = _compute_attention_rollout(model, tensor, device)  # (w,w,w)
-
-                accum  [sz:sz+window_size, sy:sy+window_size, sx:sx+window_size] += sal * blend
-                weights[sz:sz+window_size, sy:sy+window_size, sx:sx+window_size] += blend
-
-    saliency = (accum / np.maximum(weights, 1e-9)).astype(np.float32)
-
-    sal_min, sal_max = saliency.min(), saliency.max()
-    if sal_max > sal_min:
-        saliency = (saliency - sal_min) / (sal_max - sal_min)
-
-    return saliency
-
-
 def _normalize_volume(arr):
     """Z-score normalization; returns float32."""
     import numpy as np
@@ -702,85 +446,3 @@ def _normalize_volume(arr):
     if std > 0:
         arr = (arr - arr.mean()) / std
     return arr.astype("float32")
-
-
-def _compute_attention_rollout(model, tensor, device):
-    """
-    Computes a 3D saliency map via attention rollout from BrainIAC's ViT backbone.
-    Returns a float32 numpy array of shape (96, 96, 96).
-
-    MONAI 1.5 ViT (with save_attn=True) stores attention weights directly on
-    each block as block.attn.att_mat with shape (batch, heads, patches, patches).
-    There is no CLS token in MONAI's ViT when classification=False, so rollout
-    produces a (patches, patches) matrix; per-patch importance is the mean
-    attention received across all query positions (column mean of the rollout).
-    """
-    import torch
-    import numpy as np
-
-    num_patches = 6 * 6 * 6  # 216 patches for 96^3 input / 16^3 patch size
-
-    with torch.no_grad():
-        _ = model(tensor)
-
-    # Collect per-layer attention matrices stored by save_attn=True
-    # att_mat shape: (batch, heads, num_patches, num_patches)
-    attentions = [block.attn.att_mat.detach().cpu() for block in model.blocks]
-
-    if not attentions or attentions[0].shape[-1] != num_patches:
-        return np.ones((96, 96, 96), dtype=np.float32)
-
-    # Attention rollout across layers:
-    # For each layer: avg over heads, add residual identity, row-normalise.
-    # Multiply layer matrices together to propagate attention through depth.
-    rollout = torch.eye(num_patches)
-    for attn in attentions:
-        attn_avg = attn[0].mean(0)                         # (P, P) avg over heads
-        attn_avg = attn_avg + torch.eye(num_patches)       # residual connection
-        attn_avg = attn_avg / attn_avg.sum(dim=-1, keepdim=True)  # row-normalise
-        rollout = torch.mm(attn_avg, rollout)
-
-    # Per-patch importance = mean attention received across all query positions
-    # (column mean); equivalent to: how much does each patch get attended to?
-    patch_importance = rollout.mean(dim=0)  # (num_patches,) = (216,)
-
-    # Reshape to spatial grid (6, 6, 6) and upsample to (96, 96, 96)
-    patch_grid = patch_importance.reshape(1, 1, 6, 6, 6).float()
-    saliency_3d = torch.nn.functional.interpolate(
-        patch_grid, size=(96, 96, 96), mode='trilinear', align_corners=False
-    )
-    saliency_arr = saliency_3d[0, 0].numpy()
-
-    # Normalise to [0, 1]
-    sal_min, sal_max = saliency_arr.min(), saliency_arr.max()
-    if sal_max > sal_min:
-        saliency_arr = (saliency_arr - sal_min) / (sal_max - sal_min)
-
-    return saliency_arr.astype(np.float32)
-
-
-def _sitk_to_nibabel(sitk_img):
-    """Converts a SimpleITK image to a nibabel Nifti1Image.
-
-    SimpleITK stores images internally in LPS (DICOM convention); NIfTI/nibabel
-    uses RAS. The LPS→RAS conversion negates the x and y components of both the
-    origin and the direction matrix columns.
-    """
-    import numpy as np
-    import nibabel as nib
-    import SimpleITK as sitk
-
-    arr = sitk.GetArrayFromImage(sitk_img)  # (z, y, x) in SimpleITK
-    arr = np.transpose(arr, (2, 1, 0))      # -> (x, y, z) for nibabel
-
-    spacing = np.array(sitk_img.GetSpacing())
-    origin = np.array(sitk_img.GetOrigin())
-    direction = np.array(sitk_img.GetDirection()).reshape(3, 3)
-
-    # LPS → RAS: negate x and y axes
-    lps_to_ras = np.diag([-1., -1., 1.])
-    affine = np.eye(4)
-    affine[:3, :3] = (lps_to_ras @ direction) * spacing
-    affine[:3, 3] = lps_to_ras @ origin
-
-    return nib.Nifti1Image(arr, affine)

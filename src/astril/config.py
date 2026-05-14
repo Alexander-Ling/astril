@@ -6,10 +6,12 @@ use_mixed_precision = False
 # BrainIAC
 use_brainiac_embeddings = False
 brainiac_weights_path = None        # path to .ckpt if user supplies manually
-brainiac_n_pcs = 3
-brainiac_pca_save_dir = None        # override PCA .pkl save dir; None → {output_dir}/brainiac_features/
-brainiac_pca_t1c_path = None
-brainiac_pca_t2_path = None
+brainiac_embedding_type = "encoder_fusion"
+brainiac_feature_paths_files = None
+val_brainiac_feature_paths_files = None
+brainiac_encoder_input_channels = 0
+brainiac_encode_channels = "all"
+brainiac_encode_channel_indices = None
 
 # Architecture flags
 use_se_blocks = False

@@ -72,14 +72,68 @@ def parse_train_parameters(config_file_path):
 
     # BrainIAC
     config.use_brainiac_embeddings = cfg_parser.getboolean("DEFAULT", "use_brainiac_embeddings", fallback=False)
+    config.brainiac_embedding_type = cfg_parser.get("DEFAULT", "brainiac_embedding_type", fallback="encoder_fusion")
 
     def _none_str(raw):
         return None if raw in (None, "", "None", "none", "na") else raw
 
-    config.brainiac_n_pcs        = cfg_parser.getint("DEFAULT", "brainiac_n_pcs", fallback=3)
-    config.brainiac_pca_save_dir = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_save_dir", fallback=None))
-    config.brainiac_pca_t1c_path = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_t1c_path", fallback=None))
-    config.brainiac_pca_t2_path  = _none_str(cfg_parser.get("DEFAULT", "brainiac_pca_t2_path",  fallback=None))
+    train_bif = _none_str(cfg_parser.get("DEFAULT", "brainiac_feature_paths_files", fallback=None))
+    val_bif = _none_str(cfg_parser.get("DEFAULT", "val_brainiac_feature_paths_files", fallback=None))
+    config.brainiac_feature_paths_files = train_bif.split(",") if train_bif else None
+    config.val_brainiac_feature_paths_files = val_bif.split(",") if val_bif else None
+    config.brainiac_encoder_input_channels = cfg_parser.getint("DEFAULT", "brainiac_encoder_input_channels", fallback=0)
+    config.brainiac_encode_channels = cfg_parser.get("DEFAULT", "brainiac_encode_channels", fallback="all")
+    config.brainiac_encode_channel_indices = None
+
+
+def _brainiac_channel_label(channel_cfg_file, index):
+    """Stable label for per-channel BrainIAC feature caches."""
+    stem = Path(channel_cfg_file).stem.lower()
+    for prefix in ("trainchannels_", "valchannels_", "segchannels_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return f"ch{index}_{safe}" if safe else f"ch{index}"
+
+
+def _resolve_brainiac_channel_indices(channel_cfg_files, selector):
+    """Resolve 'all', comma-separated indices, or channel labels to indices."""
+    if selector is None or str(selector).strip().lower() in {"", "all", "none"}:
+        return list(range(len(channel_cfg_files)))
+
+    labels = {}
+    for idx, cfg_file in enumerate(channel_cfg_files):
+        label = _brainiac_channel_label(cfg_file, idx).lower()
+        short = label.split("_", 1)[1] if "_" in label else label
+        labels[label] = idx
+        labels[short] = idx
+        labels[f"ch{idx}"] = idx
+
+    resolved = []
+    for raw_token in str(selector).split(","):
+        token = raw_token.strip().lower()
+        if not token:
+            continue
+        if token.isdigit():
+            idx = int(token)
+        else:
+            if token not in labels:
+                raise ValueError(
+                    f"Unknown BrainIAC channel selector '{raw_token}'. "
+                    f"Use 'all', numeric indices, or one of: {sorted(labels)}"
+                )
+            idx = labels[token]
+        if idx < 0 or idx >= len(channel_cfg_files):
+            raise ValueError(
+                f"BrainIAC channel index {idx} is out of range for "
+                f"{len(channel_cfg_files)} configured input channels."
+            )
+        if idx not in resolved:
+            resolved.append(idx)
+
+    if not resolved:
+        raise ValueError("brainiac_encode_channels resolved to no input channels.")
+    return resolved
 
 
 def main():
@@ -120,8 +174,7 @@ def main():
                             "Optional path to a locally downloaded BrainIAC .ckpt file. "
                             "If not provided, weights are downloaded automatically from Dropbox "
                             "on first use and cached for subsequent runs. "
-                            "All other BrainIAC settings (use_brainiac_embeddings, brainiac_n_pcs, "
-                            "etc.) are set in train_parameters.cfg."
+                            "All other BrainIAC settings are set in train_parameters.cfg."
                         ))
 
     args = parser.parse_args()
@@ -168,109 +221,79 @@ def main():
     if args.Use_Intensity_Augmentation:
         cfg_updates["use_intensity_augmentation"] = "true"
 
-    # BrainIAC PCA pre-computation (runs when use_brainiac_embeddings=true in the config)
+    # BrainIAC pre-computation (runs when use_brainiac_embeddings=true in the config)
     if config.use_brainiac_embeddings:
-        import pickle
         from .brainiac_utils import (
             ensure_brainiac_weights,
-            compute_brainiac_pca_features,
+            compute_brainiac_encoder_features,
             BrainIACWeightsNotFoundError,
         )
         from .data_loading import read_paths_from_file
 
+        if config.brainiac_embedding_type != "encoder_fusion":
+            raise ValueError(
+                "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+                f"Found: {config.brainiac_embedding_type}"
+            )
+
         weights_path = ensure_brainiac_weights(weights_path=args.BrainIAC_Weights_Path)
-        n_pcs = config.brainiac_n_pcs
-        pca_save_dir = Path(
-            config.brainiac_pca_save_dir
-            if config.brainiac_pca_save_dir
-            else Path(config.output_dir) / "brainiac_features"
-        )
-        pca_save_dir.mkdir(parents=True, exist_ok=True)
         brainiac_output_dir = Path(config.output_dir) / "brainiac_features"
-
-        # Channels 0 = T1c, 1 = T2 (as set up by create_config_files with T1c+T2)
-        train_t1c_paths = read_paths_from_file(config.image_paths_files[0])
-        train_t2_paths  = read_paths_from_file(config.image_paths_files[1])
-        val_t1c_paths   = read_paths_from_file(config.val_image_paths_files[0])
-        val_t2_paths    = read_paths_from_file(config.val_image_paths_files[1])
-
-        # --- T1c PCA: fit on training, apply to val ---
-        print(f"[brainiac] T1c embeddings → PCA ({n_pcs} components) for "
-              f"{len(train_t1c_paths)} training scans...")
-        train_t1c_pc_paths, pca_t1c = compute_brainiac_pca_features(
-            nifti_paths=train_t1c_paths,
-            weights_path=weights_path,
-            output_dir=brainiac_output_dir / "train" / "t1c",
-            sequence_label="t1c",
-            n_components=n_pcs,
-            pca=None,
+        if len(config.image_paths_files) != len(config.val_image_paths_files):
+            raise ValueError(
+                "BrainIAC encoder fusion requires the same number of training and "
+                "validation image channel cfg files."
+            )
+        selected_indices = _resolve_brainiac_channel_indices(
+            config.image_paths_files,
+            config.brainiac_encode_channels,
         )
-        pca_t1c_pkl = pca_save_dir / "pca_t1c.pkl"
-        with open(pca_t1c_pkl, "wb") as _f:
-            pickle.dump(pca_t1c, _f)
+        config.brainiac_encode_channel_indices = selected_indices
+        print(f"[brainiac] Encoding input channel indices: {selected_indices}")
 
-        print(f"[brainiac] Applying T1c PCA to {len(val_t1c_paths)} validation scans...")
-        val_t1c_pc_paths, _ = compute_brainiac_pca_features(
-            nifti_paths=val_t1c_paths,
-            weights_path=weights_path,
-            output_dir=brainiac_output_dir / "val" / "t1c",
-            sequence_label="t1c",
-            n_components=n_pcs,
-            pca=pca_t1c,
-        )
+        train_feature_cfgs = []
+        val_feature_cfgs = []
+        for idx in selected_indices:
+            train_cfg = config.image_paths_files[idx]
+            val_cfg = config.val_image_paths_files[idx]
+            label = _brainiac_channel_label(train_cfg, idx)
+            train_paths = read_paths_from_file(train_cfg)
+            val_paths = read_paths_from_file(val_cfg)
+            print(f"[brainiac] Encoder-fusion embeddings for channel '{label}' "
+                  f"({len(train_paths)} train, {len(val_paths)} val scans)...")
 
-        # --- T2 PCA: fit on training (T2f and/or T2w already in train_t2_paths) ---
-        print(f"[brainiac] T2 embeddings → PCA ({n_pcs} components) for "
-              f"{len(train_t2_paths)} training scans (may include T2f and T2w)...")
-        train_t2_pc_paths, pca_t2 = compute_brainiac_pca_features(
-            nifti_paths=train_t2_paths,
-            weights_path=weights_path,
-            output_dir=brainiac_output_dir / "train" / "t2",
-            sequence_label="t2",
-            n_components=n_pcs,
-            pca=None,
-        )
-        pca_t2_pkl = pca_save_dir / "pca_t2.pkl"
-        with open(pca_t2_pkl, "wb") as _f:
-            pickle.dump(pca_t2, _f)
+            train_features = compute_brainiac_encoder_features(
+                nifti_paths=train_paths,
+                weights_path=weights_path,
+                output_dir=brainiac_output_dir / "train" / f"{label}_encoder",
+                sequence_label=label,
+            )
+            val_features = compute_brainiac_encoder_features(
+                nifti_paths=val_paths,
+                weights_path=weights_path,
+                output_dir=brainiac_output_dir / "val" / f"{label}_encoder",
+                sequence_label=label,
+            )
 
-        print(f"[brainiac] Applying T2 PCA to {len(val_t2_paths)} validation scans...")
-        val_t2_pc_paths, _ = compute_brainiac_pca_features(
-            nifti_paths=val_t2_paths,
-            weights_path=weights_path,
-            output_dir=brainiac_output_dir / "val" / "t2",
-            sequence_label="t2",
-            n_components=n_pcs,
-            pca=pca_t2,
-        )
+            train_feature_cfg = Path(config.output_dir) / f"trainBrainIAC_encoder_{label}.cfg"
+            val_feature_cfg = Path(config.output_dir) / f"valBrainIAC_encoder_{label}.cfg"
+            train_feature_cfg.write_text("\n".join(train_features))
+            val_feature_cfg.write_text("\n".join(val_features))
+            train_feature_cfgs.append(str(train_feature_cfg))
+            val_feature_cfgs.append(str(val_feature_cfg))
 
-        # --- Write one cfg file per PC per sequence, append to channel lists ---
-        for k in range(n_pcs):
-            t1c_train_cfg = Path(config.output_dir) / f"trainChannels_brainiac_t1c_pc{k}.cfg"
-            t1c_val_cfg   = Path(config.output_dir) / f"valChannels_brainiac_t1c_pc{k}.cfg"
-            t1c_train_cfg.write_text("\n".join(train_t1c_pc_paths[k]))
-            t1c_val_cfg.write_text("\n".join(val_t1c_pc_paths[k]))
-            config.image_paths_files.append(str(t1c_train_cfg))
-            config.val_image_paths_files.append(str(t1c_val_cfg))
-
-        for k in range(n_pcs):
-            t2_train_cfg = Path(config.output_dir) / f"trainChannels_brainiac_t2_pc{k}.cfg"
-            t2_val_cfg   = Path(config.output_dir) / f"valChannels_brainiac_t2_pc{k}.cfg"
-            t2_train_cfg.write_text("\n".join(train_t2_pc_paths[k]))
-            t2_val_cfg.write_text("\n".join(val_t2_pc_paths[k]))
-            config.image_paths_files.append(str(t2_train_cfg))
-            config.val_image_paths_files.append(str(t2_val_cfg))
-
-        config.num_channels += 2 * n_pcs
+        config.brainiac_feature_paths_files = train_feature_cfgs
+        config.val_brainiac_feature_paths_files = val_feature_cfgs
+        config.brainiac_encoder_input_channels = len(train_feature_cfgs) * 768
         config.brainiac_weights_path = str(weights_path)
 
         cfg_updates["use_brainiac_embeddings"] = "true"
-        cfg_updates["brainiac_embedding_type"] = "pca_embeddings"
-        cfg_updates["brainiac_n_pcs"] = str(n_pcs)
-        cfg_updates["brainiac_pca_t1c_path"] = str(pca_t1c_pkl)
-        cfg_updates["brainiac_pca_t2_path"]  = str(pca_t2_pkl)
+        cfg_updates["brainiac_embedding_type"] = "encoder_fusion"
+        cfg_updates["brainiac_encode_channels"] = ",".join(str(i) for i in selected_indices)
+        cfg_updates["brainiac_feature_paths_files"] = ",".join(config.brainiac_feature_paths_files)
+        cfg_updates["val_brainiac_feature_paths_files"] = ",".join(config.val_brainiac_feature_paths_files)
+        cfg_updates["brainiac_encoder_input_channels"] = str(config.brainiac_encoder_input_channels)
 
-        print(f"[brainiac] Done. Total input channels: {config.num_channels}")
+        print(f"[brainiac] Done. Encoder-fusion input channels: {config.brainiac_encoder_input_channels}")
 
     # Persist flag changes to the .cfg so the saved model config reflects reality
     if cfg_updates:

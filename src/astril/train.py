@@ -32,6 +32,10 @@ from .config import (
     use_deep_supervision,
     deep_supervision_weights,
     use_mixed_precision,
+    use_brainiac_embeddings,
+    brainiac_embedding_type,
+    brainiac_feature_paths_files,
+    val_brainiac_feature_paths_files,
 )
 from .data_loading import (
     read_paths_from_file,
@@ -72,6 +76,11 @@ def _select_device():
 def _to_input_tensor(x_batch, device):
     x = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
     return x.permute(0, 3, 1, 2).contiguous()
+
+
+def _to_brainiac_tensor(b_batch, device):
+    b = torch.as_tensor(b_batch, dtype=torch.float32, device=device)
+    return b.permute(0, 3, 1, 2).contiguous()
 
 
 def _to_target_tensors(y_batch, mask_batch, device):
@@ -202,6 +211,27 @@ def train_model():
     val_mask_paths = read_paths_from_file(val_mask_paths_file)
     val_gt_paths = read_paths_from_file(val_gt_paths_file)
 
+    if use_brainiac_embeddings and brainiac_embedding_type != "encoder_fusion":
+        raise ValueError(
+            "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+            f"Found: {brainiac_embedding_type}"
+        )
+    use_brainiac_fusion = bool(use_brainiac_embeddings)
+    train_brainiac_paths_list = None
+    val_brainiac_paths_list = None
+    if use_brainiac_fusion:
+        if not brainiac_feature_paths_files or not val_brainiac_feature_paths_files:
+            raise ValueError("BrainIAC encoder-fusion requires train and validation BrainIAC feature path cfg files.")
+        train_brainiac_paths = [read_paths_from_file(path) for path in brainiac_feature_paths_files]
+        val_brainiac_paths = [read_paths_from_file(path) for path in val_brainiac_feature_paths_files]
+        assert all(len(train_brainiac_paths[0]) == len(p) for p in train_brainiac_paths), \
+            "Mismatch in the number of paths across training BrainIAC feature channels"
+        assert all(len(val_brainiac_paths[0]) == len(p) for p in val_brainiac_paths), \
+            "Mismatch in the number of paths across validation BrainIAC feature channels"
+        train_brainiac_paths_list = [list(scan) for scan in zip(*train_brainiac_paths)]
+        val_brainiac_paths_list = [list(scan) for scan in zip(*val_brainiac_paths)]
+        print(f"BrainIAC encoder fusion enabled with {len(train_brainiac_paths)} embedding sources.")
+
     input_shape, original_shape = detect_input_shape(
         sample_file_path=train_mask_paths[0],
         slicing_plane=slicing_plane,
@@ -248,7 +278,17 @@ def train_model():
 
     dummy_input_shape = (1, num_channels * num_input_slices, minimum_height_width, minimum_height_width)
     with torch.no_grad():
-        _ = model(torch.zeros(dummy_input_shape, dtype=torch.float32, device=device))
+        dummy_x = torch.zeros(dummy_input_shape, dtype=torch.float32, device=device)
+        if use_brainiac_fusion:
+            brainiac_ch = model.architecture_config()["brainiac_input_channels"]
+            dummy_b = torch.zeros(
+                (1, brainiac_ch, max(1, minimum_height_width // 16), max(1, minimum_height_width // 16)),
+                dtype=torch.float32,
+                device=device,
+            )
+            _ = model(dummy_x, dummy_b)
+        else:
+            _ = model(dummy_x)
     print("Model built with dummy input shape:", dummy_input_shape)
 
     train_indexes = np.arange(len(train_mask_paths))
@@ -304,8 +344,9 @@ def train_model():
             mem = psutil.virtual_memory()
             print(f"System RAM usage before data load: {mem.percent:.2f}%")
             t0_data = time.perf_counter()
-            X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = load_epoch_data(
-                scan_indexes=np.random.choice(train_indexes, scan_batch_size, replace=False),
+            selected_train_indexes = np.random.choice(train_indexes, scan_batch_size, replace=False)
+            epoch_data = load_epoch_data(
+                scan_indexes=selected_train_indexes,
                 volume_paths_list=train_volume_paths_list,
                 mask_paths=train_mask_paths,
                 gt_paths=train_gt_paths,
@@ -318,7 +359,14 @@ def train_model():
                 use_flip_augmentation=use_flip_augmentation,
                 use_intensity_augmentation=use_intensity_augmentation,
                 intensity_augmentation_strength=intensity_augmentation_strength,
+                brainiac_paths_list=train_brainiac_paths_list if use_brainiac_fusion else None,
+                target_height=minimum_height_width,
+                target_width=minimum_height_width,
             )
+            if use_brainiac_fusion:
+                X_epoch_data, B_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = epoch_data
+            else:
+                X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = epoch_data
             data_load_s = time.perf_counter() - t0_data
             print(f"Data loaded in {data_load_s:.1f}s.")
         else:
@@ -358,14 +406,16 @@ def train_model():
         for batch_counter, start in enumerate(range(0, _n, _bs), start=1):
             end = min(start + _bs, _n)
             x_batch_np = X_epoch_data[start:end]
+            b_batch_np = B_epoch_data[start:end] if use_brainiac_fusion else None
             y_batch_np = y_epoch_data[start:end]
             mask_batch_np = _mask_f32[start:end]
 
             x_batch = _to_input_tensor(x_batch_np, device)
+            b_batch = _to_brainiac_tensor(b_batch_np, device) if use_brainiac_fusion else None
             y_batch, y_onehot, mask_batch = _to_target_tensors(y_batch_np, mask_batch_np, device)
 
             with _autocast_context(device, use_amp):
-                output = model(x_batch)
+                output = model(x_batch, b_batch) if use_brainiac_fusion else model(x_batch)
                 if use_deep_supervision:
                     logits, aux_outputs = output
                 else:
@@ -470,7 +520,7 @@ def train_model():
                     start_idx = batch_num * scan_batch_size
                     end_idx = min((batch_num + 1) * scan_batch_size, num_val_scans)
                     batch_indexes = np.arange(start_idx, end_idx)
-                    X_val_data, y_val_data, mask_val_data, _ = load_val_data(
+                    val_data = load_val_data(
                         scan_indexes=batch_indexes,
                         volume_paths_list=val_volume_paths_list,
                         mask_paths=val_mask_paths,
@@ -479,13 +529,26 @@ def train_model():
                         num_input_slices=num_input_slices,
                         num_output_slices=num_output_slices,
                         return_transform_info=False,
+                        brainiac_paths_list=val_brainiac_paths_list if use_brainiac_fusion else None,
+                        target_height=minimum_height_width,
+                        target_width=minimum_height_width,
                     )
-                    val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size)
-                    for x_val_np, y_val_np, mask_val_np in val_gen:
+                    if use_brainiac_fusion:
+                        X_val_data, B_val_data, y_val_data, mask_val_data, _ = val_data
+                        val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size, brainiac_data=B_val_data)
+                    else:
+                        X_val_data, y_val_data, mask_val_data, _ = val_data
+                        val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size)
+                    for val_batch in val_gen:
+                        if use_brainiac_fusion:
+                            x_val_np, b_val_np, y_val_np, mask_val_np = val_batch
+                        else:
+                            x_val_np, y_val_np, mask_val_np = val_batch
                         x_val = _to_input_tensor(x_val_np, device)
+                        b_val = _to_brainiac_tensor(b_val_np, device) if use_brainiac_fusion else None
                         _, y_val_onehot, mask_val = _to_target_tensors(y_val_np, mask_val_np, device)
                         with _autocast_context(device, use_amp):
-                            val_logits = model(x_val)
+                            val_logits = model(x_val, b_val) if use_brainiac_fusion else model(x_val)
                             if isinstance(val_logits, tuple):
                                 val_logits = val_logits[0]
                             loss_val, loss_per_class_val = combined_focal_tversky_wce_loss(
@@ -503,6 +566,8 @@ def train_model():
                         val_probabilities = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
                         _update_prediction_metrics(val_acc, val_probabilities, y_val_np, mask_val_np)
                     X_val_data, y_val_data, mask_val_data = None, None, None
+                    if use_brainiac_fusion:
+                        B_val_data = None
                     del val_gen
                     gc.collect()
 

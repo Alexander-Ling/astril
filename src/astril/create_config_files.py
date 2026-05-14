@@ -43,7 +43,10 @@ def create_config_files(
     minimum_height_width=240,
     base_num_filters=32,
     center_depth=1,
-    encoder_level_factors=[1, 2, 4, 8]
+    encoder_level_factors=[1, 2, 4, 8],
+    use_brainiac_embeddings=False,
+    brainiac_embedding_type="encoder_fusion",
+    brainiac_encode_channels="all",
 ):
     """
     Creates config files in `workingDirectory/Configs/` for training and validation data.
@@ -257,13 +260,13 @@ def create_config_files(
         f.write("use_se_blocks = false\n")
         f.write("use_deep_supervision = false\n")
         f.write("deep_supervision_weights = 0.5,0.25\n")
-        # BrainIAC flags (default off; set use_brainiac_embeddings=true in this file to enable)
-        f.write("use_brainiac_embeddings = false\n")
-        f.write("brainiac_embedding_type = pca_embeddings\n")
-        f.write("brainiac_n_pcs = 3\n")
-        f.write("brainiac_pca_save_dir = none\n")
-        f.write("brainiac_pca_t1c_path = none\n")
-        f.write("brainiac_pca_t2_path = none\n")
+        # BrainIAC flags. When enabled, BrainIAC is used as a frozen encoder-fusion branch.
+        f.write(f"use_brainiac_embeddings = {str(bool(use_brainiac_embeddings)).lower()}\n")
+        f.write(f"brainiac_embedding_type = {brainiac_embedding_type}\n")
+        f.write(f"brainiac_encode_channels = {brainiac_encode_channels}\n")
+        f.write("brainiac_feature_paths_files = none\n")
+        f.write("val_brainiac_feature_paths_files = none\n")
+        f.write("brainiac_encoder_input_channels = 0\n")
         # Mixed precision (default off; safe to enable on CUDA hardware)
         f.write("use_mixed_precision = false\n")
         # Augmentation flags (default off; set via --Use_Flip_Augmentation / --Use_Intensity_Augmentation)
@@ -299,6 +302,13 @@ def main():
     parser.add_argument("--center_depth", type=int, default=1, help="Number of center bottleneck blocks to include in UNET model.")
     parser.add_argument("--encoder_level_factors", type=str, default="1,2,4,8",
                         help="Comma-separated expansions for each encoder level (e.g. 1,2,4,8).")
+    parser.add_argument("--use_brainiac_embeddings", action="store_true",
+                        help="Enable BrainIAC feature integration in the generated training config.")
+    parser.add_argument("--brainiac_embedding_type", default="encoder_fusion",
+                        choices=["encoder_fusion"],
+                        help="BrainIAC integration mode to write when --use_brainiac_embeddings is set.")
+    parser.add_argument("--brainiac_encode_channels", default="all",
+                        help="Comma-separated channel indices or names to encode with BrainIAC, or 'all'.")
 
     args = parser.parse_args()
 
@@ -336,7 +346,10 @@ def main():
         minimum_height_width=args.minimum_height_width,
         base_num_filters=args.base_num_filters,
         center_depth=args.center_depth,
-        encoder_level_factors=encoder_level_factors
+        encoder_level_factors=encoder_level_factors,
+        use_brainiac_embeddings=args.use_brainiac_embeddings,
+        brainiac_embedding_type=args.brainiac_embedding_type,
+        brainiac_encode_channels=args.brainiac_encode_channels,
     )
 
 

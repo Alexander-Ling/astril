@@ -72,7 +72,7 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
     Reads a model training config file (INI format) and builds a U-Net model
     with the parameters specified.
     """
-    from .model_architecture import DynamicAttentionResUNet
+    from .model_architecture import DynamicAttentionResUNet, BrainIACEncoderFusionUNet
     cp = configparser.ConfigParser()
     cp.read(config_path)
     cfg = cp["DEFAULT"]
@@ -105,8 +105,23 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
 
     use_se_blocks = cfg.getboolean("use_se_blocks", fallback=False)
     use_deep_supervision = cfg.getboolean("use_deep_supervision", fallback=False)
+    use_brainiac_embeddings = cfg.getboolean("use_brainiac_embeddings", fallback=False)
+    brainiac_embedding_type = cfg.get("brainiac_embedding_type", fallback="encoder_fusion")
+    if use_brainiac_embeddings and brainiac_embedding_type != "encoder_fusion":
+        raise ValueError(
+            "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+            f"Found: {brainiac_embedding_type}"
+        )
 
-    model = DynamicAttentionResUNet(
+    model_cls = BrainIACEncoderFusionUNet if use_brainiac_embeddings else DynamicAttentionResUNet
+    model_kwargs = {}
+    if model_cls is BrainIACEncoderFusionUNet:
+        brainiac_input_channels = cfg.getint("brainiac_encoder_input_channels", fallback=0)
+        if brainiac_input_channels <= 0:
+            raise ValueError("brainiac_encoder_input_channels must be set for encoder_fusion configs.")
+        model_kwargs["brainiac_input_channels"] = brainiac_input_channels
+
+    model = model_cls(
         input_channels=input_channels,
         base_num_filters=base_num_filters,
         encoder_level_factors=encoder_level_factors,
@@ -115,6 +130,7 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
         center_depth=center_depth,
         use_se_blocks=use_se_blocks,
         use_deep_supervision=use_deep_supervision,
+        **model_kwargs,
     )
     return model
 
@@ -127,10 +143,44 @@ def _train_config_requires_brainiac(config_path: str) -> bool:
 
 
 def _train_config_brainiac_embedding_type(config_path: str) -> str:
-    """Returns 'pca_embeddings' or 'saliency_map' (legacy default) from a train cfg."""
+    """Returns the BrainIAC integration mode from a train cfg."""
     cp = configparser.ConfigParser()
     cp.read(config_path)
-    return cp["DEFAULT"].get("brainiac_embedding_type", "saliency_map")
+    return cp["DEFAULT"].get("brainiac_embedding_type", "encoder_fusion")
+
+
+def _brainiac_inference_label(index: int) -> str:
+    return f"ch{index}"
+
+
+def _train_config_brainiac_channel_indices(config_path: str, num_modal_channels: int) -> list[int]:
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    raw = cp["DEFAULT"].get("brainiac_encode_channels", "all").strip()
+    if raw.lower() in {"", "all", "none"}:
+        return list(range(num_modal_channels))
+
+    indices = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(
+                f"Segmentation requires numeric brainiac_encode_channels in {config_path}; "
+                f"found '{raw}'. Re-run train-model so the config is normalized."
+            )
+        idx = int(token)
+        if idx < 0 or idx >= num_modal_channels:
+            raise ValueError(
+                f"BrainIAC channel index {idx} in {config_path} is out of range for "
+                f"{num_modal_channels} segmentation input channels."
+            )
+        if idx not in indices:
+            indices.append(idx)
+    if not indices:
+        raise ValueError(f"brainiac_encode_channels in {config_path} selected no channels.")
+    return indices
 
 
 ########################################################################
@@ -285,17 +335,14 @@ def run_segmentation(
     )
     brainiac_weights_path = None
     brainiac_tmp_dir = None
-    brainiac_mode = None        # "pca" or "saliency"
-    brainiac_n_pcs = 3
-    brainiac_pca_t1c = None
-    brainiac_pca_t2  = None
+    brainiac_mode = None
+    brainiac_channel_indices = None
     if brainiac_needed:
         from .brainiac_utils import (
             ensure_brainiac_weights,
             BrainIACWeightsNotFoundError,
         )
         import tempfile
-        import pickle as _pickle
         try:
             brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
         except BrainIACWeightsNotFoundError as e:
@@ -306,27 +353,16 @@ def run_segmentation(
             tc for tc in model_train_config_files if _train_config_requires_brainiac(tc)
         )
         brainiac_mode = _train_config_brainiac_embedding_type(brainiac_cfg)
-
-        if brainiac_mode == "pca_embeddings":
-            import configparser as _cparser
-            _cp = _cparser.ConfigParser()
-            _cp.read(brainiac_cfg)
-            brainiac_n_pcs = _cp["DEFAULT"].getint("brainiac_n_pcs", fallback=3)
-            _pca_t1c_path = _cp["DEFAULT"].get("brainiac_pca_t1c_path", "")
-            _pca_t2_path  = _cp["DEFAULT"].get("brainiac_pca_t2_path",  "")
-            if not _pca_t1c_path or not Path(_pca_t1c_path).exists():
-                raise FileNotFoundError(
-                    f"brainiac_pca_t1c_path not found in {brainiac_cfg}: '{_pca_t1c_path}'. "
-                    "Re-run train-model with use_brainiac_embeddings=true to generate PCA models."
-                )
-            with open(_pca_t1c_path, "rb") as _f:
-                brainiac_pca_t1c = _pickle.load(_f)
-            with open(_pca_t2_path, "rb") as _f:
-                brainiac_pca_t2 = _pickle.load(_f)
-            print(f"[brainiac] PCA mode: {brainiac_n_pcs} components per sequence. "
-                  f"Temp cache: {brainiac_tmp_dir}")
-        else:
-            print(f"[brainiac] Saliency mode (legacy). Cache: {brainiac_tmp_dir}")
+        if brainiac_mode != "encoder_fusion":
+            raise ValueError(
+                "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+                f"Found {brainiac_mode} in {brainiac_cfg}."
+            )
+        brainiac_channel_indices = _train_config_brainiac_channel_indices(
+            brainiac_cfg,
+            num_modal_channels,
+        )
+        print(f"[brainiac] Encoder-fusion mode. Channels={brainiac_channel_indices}. Temp cache: {brainiac_tmp_dir}")
 
     # --- D) Define merging function ---
     def merge_predictions(volumes_4d, method=merging_method):
@@ -351,29 +387,20 @@ def run_segmentation(
         base_name = os.path.basename(mask_path)
 
         # Compute BrainIAC features for this subject if required
+        brainiac_encoder_paths_list = None
         if brainiac_needed:
-            if brainiac_mode == "pca_embeddings":
-                from .brainiac_utils import compute_brainiac_pca_features
-                t1c_path = volume_paths_list[subj_idx][0]
-                t2_path  = volume_paths_list[subj_idx][1]
-                t1c_pc_paths, _ = compute_brainiac_pca_features(
-                    [t1c_path], brainiac_weights_path,
-                    brainiac_tmp_dir / "t1c", "t1c", brainiac_n_pcs, pca=brainiac_pca_t1c,
+            from .brainiac_utils import compute_brainiac_encoder_features
+            subject_features = []
+            for ch_idx in brainiac_channel_indices:
+                channel_path = volume_paths_list[subj_idx][ch_idx]
+                label = _brainiac_inference_label(ch_idx)
+                features = compute_brainiac_encoder_features(
+                    [channel_path], brainiac_weights_path,
+                    brainiac_tmp_dir / f"{label}_encoder", label,
                 )
-                t2_pc_paths, _ = compute_brainiac_pca_features(
-                    [t2_path], brainiac_weights_path,
-                    brainiac_tmp_dir / "t2", "t2", brainiac_n_pcs, pca=brainiac_pca_t2,
-                )
-                extra_paths = [t1c_pc_paths[k][0] for k in range(brainiac_n_pcs)] + \
-                              [t2_pc_paths[k][0]  for k in range(brainiac_n_pcs)]
-                volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + extra_paths
-            else:
-                from .brainiac_utils import compute_brainiac_saliency_maps
-                ref_channel_path = volume_paths_list[subj_idx][0]
-                sal_paths = compute_brainiac_saliency_maps(
-                    [ref_channel_path], brainiac_weights_path, brainiac_tmp_dir, overwrite=False,
-                )
-                volume_paths_list[subj_idx] = list(volume_paths_list[subj_idx]) + [sal_paths[0]]
+                subject_features.append(features[0])
+            brainiac_encoder_paths_list = [None] * num_subjects
+            brainiac_encoder_paths_list[subj_idx] = subject_features
         if ".nii.gz" in maskPattern:
             seg_name = base_name.replace(maskPattern, segmentSuffix)
         else:
@@ -401,7 +428,8 @@ def run_segmentation(
 
             print(f"  [Model {m_idx+1}] plane={plane}, in={in_sl}, out={out_sl}, classes={n_cls}, minHW={min_HW}")
 
-            (X_data, _, M_data, z_indices, transform_infos) = load_val_data(
+            model_uses_brainiac_fusion = getattr(model, "brainiac_input_channels", 0) > 0
+            val_data = load_val_data(
                 scan_indexes=[subj_idx],
                 volume_paths_list=volume_paths_list,
                 mask_paths=mask_paths,
@@ -411,16 +439,33 @@ def run_segmentation(
                 num_output_slices=out_sl,
                 return_transform_info=True,
                 target_height=min_HW,
-                target_width=min_HW
+                target_width=min_HW,
+                brainiac_paths_list=brainiac_encoder_paths_list if model_uses_brainiac_fusion else None,
             )
+            if model_uses_brainiac_fusion:
+                (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
+            else:
+                (X_data, _, M_data, z_indices, transform_infos) = val_data
             mask_info = transform_infos[0]
-            val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
+            val_gen = ValDataGenerator(
+                X_data, None, M_data, slice_batch_size,
+                brainiac_data=B_data if model_uses_brainiac_fusion else None,
+            )
             all_preds = []
             with torch.no_grad():
-                for x_batch, m_batch in val_gen:
+                for batch in val_gen:
+                    if model_uses_brainiac_fusion:
+                        x_batch, b_batch, m_batch = batch
+                    else:
+                        x_batch, m_batch = batch
                     x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
                     x_tensor = x_tensor.permute(0, 3, 1, 2).contiguous()
-                    batch_logits = model(x_tensor)
+                    if model_uses_brainiac_fusion:
+                        b_tensor = torch.as_tensor(b_batch, dtype=torch.float32, device=device)
+                        b_tensor = b_tensor.permute(0, 3, 1, 2).contiguous()
+                        batch_logits = model(x_tensor, b_tensor)
+                    else:
+                        batch_logits = model(x_tensor)
                     if isinstance(batch_logits, tuple):
                         batch_logits = batch_logits[0]
                     batch_pred = F.softmax(batch_logits, dim=-1).cpu().numpy()
