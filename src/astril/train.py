@@ -1,4 +1,5 @@
 import gc
+import atexit
 import math
 import os
 import shutil
@@ -41,6 +42,9 @@ from .config import (
     brainiac_embedding_type,
     brainiac_feature_paths_files,
     val_brainiac_feature_paths_files,
+    channel_names,
+    optional_channels,
+    channel_dropout_probabilities,
 )
 from .data_loading import (
     read_paths_from_file,
@@ -183,6 +187,11 @@ def _save_checkpoint(path, model, optimizer, epoch):
         {
             "epoch": epoch,
             "architecture": model.architecture_config(),
+            "channel_metadata": {
+                "channel_names": list(channel_names or []),
+                "optional_channels": list(optional_channels or []),
+                "channel_dropout_probabilities": dict(channel_dropout_probabilities or {}),
+            },
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
@@ -206,6 +215,13 @@ def _autocast_context(device, enabled):
 def _cleanup_temp_dirs(temp_dirs):
     for d in temp_dirs:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _reset_temp_base_dir(temp_base_dir):
+    if os.path.exists(temp_base_dir):
+        print(f"Removing stale training temp cache: {temp_base_dir}")
+        shutil.rmtree(temp_base_dir, ignore_errors=True)
+    os.makedirs(temp_base_dir, exist_ok=True)
 
 
 def _loader_kwargs(num_workers, prefetch_factor, persistent_workers, device):
@@ -233,6 +249,15 @@ def train_model():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     training_schedule = pd.read_csv(training_schedule_file, sep="\t")
+    optional_channel_indices = [
+        channel_names.index(name) for name in optional_channels if name in channel_names
+    ]
+    dropout_by_index = {
+        channel_names.index(name): prob
+        for name, prob in dict(channel_dropout_probabilities or {}).items()
+        if name in channel_names
+    }
+    brainiac_channel_indices = None
 
     train_channel_paths = [read_paths_from_file(path) for path in image_paths_files]
     assert all(len(train_channel_paths[0]) == len(p) for p in train_channel_paths), \
@@ -267,6 +292,8 @@ def train_model():
             "Mismatch in the number of paths across validation BrainIAC feature channels"
         train_brainiac_paths_list = [list(scan) for scan in zip(*train_brainiac_paths)]
         val_brainiac_paths_list = [list(scan) for scan in zip(*val_brainiac_paths)]
+        from .config import brainiac_encode_channel_indices
+        brainiac_channel_indices = list(brainiac_encode_channel_indices or range(len(train_brainiac_paths)))
         print(f"BrainIAC encoder fusion enabled with {len(train_brainiac_paths)} embedding sources.")
 
     input_shape, original_shape = detect_input_shape(
@@ -346,13 +373,19 @@ def train_model():
     # Temp files live alongside the output directory so they stay on the same drive
     # as the input data, avoiding slow cross-drive writes via system %TEMP%.
     _temp_base_dir = os.path.join(output_dir, "_astril_temp")
-    os.makedirs(_temp_base_dir, exist_ok=True)
+    _reset_temp_base_dir(_temp_base_dir)
 
     # Streaming state: temp dirs + dataset are owned here and cleaned up on reload/exit
     _train_temp_dirs = []
     _train_dataset = None
     train_loader = None
     epoch_class_weights = None
+
+    def _cleanup_training_temp_cache():
+        _cleanup_temp_dirs(_train_temp_dirs)
+        shutil.rmtree(_temp_base_dir, ignore_errors=True)
+
+    atexit.register(_cleanup_training_temp_cache)
 
     data_loading_counter = 0
     for epoch in range(starting_epoch, epochs):
@@ -434,6 +467,9 @@ def train_model():
                 target_width=minimum_height_width,
                 executor=_worker_pool,
                 temp_base_dir=_temp_base_dir,
+                optional_channel_indices=optional_channel_indices,
+                channel_dropout_probabilities=dropout_by_index,
+                brainiac_channel_indices=brainiac_channel_indices,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
 
@@ -457,6 +493,9 @@ def train_model():
                 use_rotation_augmentation=use_rotation_augmentation,
                 rotation_degrees=rotation_degrees,
                 has_brainiac=use_brainiac_fusion,
+                optional_channel_indices=optional_channel_indices,
+                channel_dropout_probabilities=dropout_by_index,
+                brainiac_channel_indices=brainiac_channel_indices,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
             data_load_s = 0.0
@@ -646,6 +685,8 @@ def train_model():
                 target_width=minimum_height_width,
                 executor=_worker_pool,
                 temp_base_dir=_temp_base_dir,
+                optional_channel_indices=optional_channel_indices,
+                brainiac_channel_indices=brainiac_channel_indices,
             )
             val_loader = torch.utils.data.DataLoader(
                 val_dataset,
@@ -737,8 +778,8 @@ def train_model():
     # End-of-training cleanup
     if train_loader is not None:
         del train_loader
-    _cleanup_temp_dirs(_train_temp_dirs)
-    shutil.rmtree(_temp_base_dir, ignore_errors=True)
+    _cleanup_training_temp_cache()
+    atexit.unregister(_cleanup_training_temp_cache)
     _worker_pool.shutdown(wait=False)
     print("Training completed.")
     log_file.close()

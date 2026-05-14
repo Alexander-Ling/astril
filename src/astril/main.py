@@ -41,6 +41,51 @@ def parse_train_parameters(config_file_path):
     config.print_every_n_subbatches = cfg_parser.getint("DEFAULT", "print_every_n_subbatches")
     config.minimum_height_width = cfg_parser.getint("DEFAULT", "minimum_height_width")
     config.num_channels = len(config.image_paths_files)
+    config.channel_names = [
+        x.strip()
+        for x in cfg_parser.get("DEFAULT", "channel_names", fallback="").split(",")
+        if x.strip()
+    ]
+    if not config.channel_names:
+        config.channel_names = [f"ch{i}" for i in range(config.num_channels)]
+    if len(config.channel_names) != config.num_channels:
+        raise ValueError(
+            "channel_names must match the number of configured image_paths_files "
+            f"({len(config.channel_names)} != {config.num_channels})."
+        )
+    config.optional_channels = [
+        x.strip()
+        for x in cfg_parser.get("DEFAULT", "optional_channels", fallback="").split(",")
+        if x.strip()
+    ]
+    unknown_optional = sorted(set(config.optional_channels) - set(config.channel_names))
+    if unknown_optional:
+        raise ValueError(f"optional_channels contains unknown channel(s): {unknown_optional}")
+    config.allow_missing_optional_channels = cfg_parser.getboolean(
+        "DEFAULT", "allow_missing_optional_channels", fallback=bool(config.optional_channels)
+    )
+    config.missing_channel_fill = cfg_parser.get("DEFAULT", "missing_channel_fill", fallback="zero").strip().lower()
+    if config.missing_channel_fill != "zero":
+        raise ValueError("Only missing_channel_fill = zero is currently supported.")
+    dropout_raw = cfg_parser.get("DEFAULT", "channel_dropout_probabilities", fallback="")
+    dropout_probs = {}
+    for item in dropout_raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                "channel_dropout_probabilities must be formatted like 't1n:0.15,t2f:0.20'."
+            )
+        name, value = item.split(":", 1)
+        name = name.strip()
+        if name not in config.channel_names:
+            raise ValueError(f"Dropout probability references unknown channel '{name}'.")
+        prob = float(value)
+        if prob < 0.0 or prob > 1.0:
+            raise ValueError(f"Dropout probability for channel '{name}' must be in [0, 1].")
+        dropout_probs[name] = prob
+    config.channel_dropout_probabilities = dropout_probs
 
     if cfg_parser.has_option("DEFAULT", "base_num_filters"):
         config.base_num_filters = cfg_parser.getint("DEFAULT", "base_num_filters")

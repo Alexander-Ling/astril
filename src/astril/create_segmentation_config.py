@@ -4,6 +4,8 @@ import glob
 from pathlib import Path
 import configparser
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
 def parse_train_config_for_model_parameters(train_config_path):
     """
     Reads a train_parameters.cfg (created by create_config_files)
@@ -63,7 +65,9 @@ def create_segmentation_config(
     outputVolumeDirectory=None,
     segmentSuffix="_seg.nii.gz",
     output_config_filename="segmentation_parameters.cfg",
-    silent=False
+    silent=False,
+    optional_channels=None,
+    allow_missing_optional_channels=None,
 ):
     """
     Creates config files for segmentation in `workingDirectory/Configs/`.
@@ -129,11 +133,31 @@ def create_segmentation_config(
 
     if channel_alt_patterns is not None and len(channel_alt_patterns) != len(inputChannels):
         raise ValueError("channel_alt_patterns must be the same length as inputChannels.")
-
     if not model_paths or not modelTrainConfigFiles:
         raise ValueError("You must provide both model_paths and modelTrainConfigFiles (one per model).")
     if len(model_paths) != len(modelTrainConfigFiles):
         raise ValueError("Mismatch: the number of model_paths must match the number of modelTrainConfigFiles.")
+
+    if optional_channels is None:
+        inferred_optional = []
+        for cfg_path in modelTrainConfigFiles:
+            cp = configparser.ConfigParser()
+            cp.read(str(cfg_path))
+            raw = cp["DEFAULT"].get("optional_channels", "")
+            for token in raw.split(","):
+                token = token.strip()
+                if token and token not in inferred_optional:
+                    inferred_optional.append(token)
+        optional_channels = inferred_optional
+    else:
+        optional_channels = list(optional_channels or [])
+    unknown_optional = sorted(set(optional_channels) - set(inputChannels))
+    if unknown_optional:
+        raise ValueError(f"optional_channels contains unknown channel(s): {unknown_optional}")
+    optional_channel_set = set(optional_channels)
+    if allow_missing_optional_channels is None:
+        allow_missing_optional_channels = bool(optional_channel_set)
+
     invalid_model_paths = [m for m in model_paths if not str(m).lower().endswith(".pt")]
     if invalid_model_paths:
         raise ValueError(
@@ -208,8 +232,12 @@ def create_segmentation_config(
             if fpath is None and channel_alt_patterns and channel_alt_patterns[i]:
                 fpath = match_pattern(d, channel_alt_patterns[i])
             if fpath is None:
-                skip_this_dir = True
-                break
+                if allow_missing_optional_channels and chan in optional_channel_set:
+                    matched_channel_files.append(MISSING_CHANNEL_SENTINEL)
+                    continue
+                else:
+                    skip_this_dir = True
+                    break
             matched_channel_files.append(str(fpath))
 
         if skip_this_dir:
@@ -268,6 +296,10 @@ def create_segmentation_config(
     # (a) References to newly created .cfg files
     config_parser["DEFAULT"]["channel_paths_files"] = ",".join(channel_cfg_files)
     config_parser["DEFAULT"]["mask_paths_file"] = str(mask_cfg_file)
+    config_parser["DEFAULT"]["channel_names"] = ",".join(inputChannels)
+    config_parser["DEFAULT"]["optional_channels"] = ",".join(optional_channels)
+    config_parser["DEFAULT"]["allow_missing_optional_channels"] = str(bool(allow_missing_optional_channels)).lower()
+    config_parser["DEFAULT"]["missing_channel_fill"] = "zero"
 
     # (b) Model paths
     config_parser["DEFAULT"]["model_paths"] = ",".join(str(Path(m).resolve()) for m in model_paths)
@@ -327,6 +359,10 @@ if __name__ == "__main__":
     parser.add_argument("--segmentSuffix", default="_seg.nii.gz", help="Suffix to use when saving segmentation volumes--will replace maskPattern in mask file names if maskPattern includes .nii.gz. Otherwise, will be appended to end of mask filenames.")
     parser.add_argument("--output_config_filename", default="segmentation_parameters.cfg",
                         help="Name of the segmentation config file to produce (in Configs/).")
+    parser.add_argument("--optional_channels", nargs="*", default=None,
+                        help="Channel names that may be missing at inference time.")
+    parser.add_argument("--allow_missing_optional_channels", action="store_true",
+                        help="Allow optional channels to be absent and zero-filled at inference time.")
     parser.add_argument("--silent", action="store_true", help="Suppress output messages.")
     
     args = parser.parse_args()
@@ -351,5 +387,7 @@ if __name__ == "__main__":
         outputVolumeDirectory=args.outputVolumeDirectory,
         segmentSuffix=args.segmentSuffix,
         output_config_filename=args.output_config_filename,
-        silent=args.silent
+        silent=args.silent,
+        optional_channels=args.optional_channels,
+        allow_missing_optional_channels=args.allow_missing_optional_channels or bool(args.optional_channels),
     )

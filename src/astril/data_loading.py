@@ -16,12 +16,45 @@ from nibabel.funcs import as_closest_canonical
 from .config import n_cores, minimum_height_width
 
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
+
+def is_missing_channel_path(path):
+    return path is None or str(path).strip() == MISSING_CHANNEL_SENTINEL
+
+
 class Sequence:
     """Minimal sequence protocol used by astril's NumPy batch generators."""
 
     def __iter__(self):
         for index in range(len(self)):
             yield self[index]
+
+
+class ValDataGenerator(Sequence):
+    """Small NumPy batch generator used by inference code paths."""
+
+    def __init__(self, x_data, y_data, mask_data, batch_size, brainiac_data=None):
+        self.x_data = x_data
+        self.y_data = y_data
+        self.mask_data = mask_data
+        self.batch_size = int(batch_size)
+        self.brainiac_data = brainiac_data
+
+    def __len__(self):
+        if not self.x_data:
+            return 0
+        return int(np.ceil(len(self.x_data) / float(self.batch_size)))
+
+    def __getitem__(self, index):
+        start = index * self.batch_size
+        end = min(start + self.batch_size, len(self.x_data))
+        x_batch = np.stack(self.x_data[start:end], axis=0).astype(np.float32)
+        m_batch = np.stack(self.mask_data[start:end], axis=0).astype(np.float32)
+        if self.brainiac_data is not None:
+            b_batch = np.stack(self.brainiac_data[start:end], axis=0).astype(np.float32)
+            return x_batch, b_batch, m_batch
+        return x_batch, m_batch
 
 # -------------------------------------------------
 # Basic I/O
@@ -370,12 +403,28 @@ def load_brainiac_feature_volumes(
 
     target_h = int(np.ceil(target_height / 16.0))
     target_w = int(np.ceil(target_width / 16.0))
-    volumes = []
+    prepared = []
+    first_shape = None
     for path in brainiac_paths:
+        if is_missing_channel_path(path):
+            prepared.append(None)
+            continue
         feat = np.load(path).astype(np.float32)  # (X_p,Y_p,Z_p,C)
         feat = _reorder_brainiac_axes(feat, plane)
         feat = _pad_brainiac_hw(feat, target_h, target_w)
-        volumes.append(feat)
+        first_shape = feat.shape if first_shape is None else first_shape
+        prepared.append(feat)
+
+    if first_shape is None:
+        image_depth = int(image_shape[2]) if len(image_shape) >= 3 else 1
+        unpadded_depth = max(image_depth - 2 * int(pad_amt), 1)
+        patch_depth = max(1, int(np.ceil(unpadded_depth / 16.0)))
+        first_shape = (target_h, target_w, patch_depth, 768)
+
+    volumes = [
+        np.zeros(first_shape, dtype=np.float32) if feat is None else feat
+        for feat in prepared
+    ]
     return np.concatenate(volumes, axis=-1)
 
 
@@ -503,14 +552,17 @@ def load_val_slices(
     # 2) Robustly load + orient all channels
     channel_volumes = []
     for ch_path in volume_paths_list[idx]:
-        ch_data, _ = robust_align_volume(
-            ch_path,
-            plane=slicing_plane,
-            pad_amt=pad_amt,
-            enforce_canonical=True,
-            target_height=target_height,
-            target_width=target_width
-        )
+        if is_missing_channel_path(ch_path):
+            ch_data = np.zeros_like(mask_data, dtype=np.float32)
+        else:
+            ch_data, _ = robust_align_volume(
+                ch_path,
+                plane=slicing_plane,
+                pad_amt=pad_amt,
+                enforce_canonical=True,
+                target_height=target_height,
+                target_width=target_width
+            )
         channel_volumes.append(ch_data)
     brainiac_volume = None
     if brainiac_paths_list is not None:
@@ -586,6 +638,9 @@ def load_val_slices(
         return X_scan_data, y_scan_data, mask_scan_data, z_indices_used, mask_info
 
 
+load_val_data = load_val_slices
+
+
 # -------------------------------------------------
 # Streaming infrastructure (replaces load_epoch_data / load_val_data)
 # -------------------------------------------------
@@ -633,10 +688,13 @@ def _save_scan_volumes_to_temp(
     # Load all channels and stack to (num_channels, H, W, D)
     ch_vols = []
     for ch_path in volume_paths_list[idx]:
-        ch, _ = robust_align_volume(
-            ch_path, plane=slicing_plane, pad_amt=pad_amt,
-            enforce_canonical=True, target_height=target_height, target_width=target_width,
-        )
+        if is_missing_channel_path(ch_path):
+            ch = np.zeros_like(mask_vol, dtype=np.float32)
+        else:
+            ch, _ = robust_align_volume(
+                ch_path, plane=slicing_plane, pad_amt=pad_amt,
+                enforce_canonical=True, target_height=target_height, target_width=target_width,
+            )
         ch_vols.append(ch)
     vols = np.stack(ch_vols, axis=0).astype(np.float32)  # (C, H, W, D)
 
@@ -697,6 +755,9 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         use_rotation_augmentation,
         rotation_degrees,
         has_brainiac,
+        optional_channel_indices=None,
+        channel_dropout_probabilities=None,
+        brainiac_channel_indices=None,
     ):
         self.scan_temp_dirs               = list(scan_temp_dirs)
         self.num_input_slices             = num_input_slices
@@ -710,6 +771,11 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         self.use_rotation_augmentation    = use_rotation_augmentation
         self.rotation_degrees             = float(rotation_degrees)
         self.has_brainiac                 = has_brainiac
+        self.optional_channel_indices     = set(int(i) for i in (optional_channel_indices or []))
+        self.channel_dropout_probabilities = {
+            int(k): float(v) for k, v in dict(channel_dropout_probabilities or {}).items()
+        }
+        self.brainiac_channel_indices     = [int(i) for i in (brainiac_channel_indices or [])]
         self._index = []          # list of (scan_idx, z_center)
         self._scan_cache = {}
         self.class_weights = None
@@ -837,6 +903,21 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
 
         # Augmentation (training only)
         if self.is_training:
+            dropped_channels = []
+            for ch_idx in self.optional_channel_indices:
+                prob = self.channel_dropout_probabilities.get(ch_idx, 0.0)
+                if prob > 0.0 and random.random() < prob:
+                    dropped_channels.append(ch_idx)
+            if dropped_channels:
+                for ch_idx in dropped_channels:
+                    X_window[..., ch_idx::num_channels] = 0.0
+                    if self.has_brainiac and B_window.ndim > 1 and ch_idx in self.brainiac_channel_indices:
+                        b_slot = self.brainiac_channel_indices.index(ch_idx)
+                        start = b_slot * 768
+                        end = start + 768
+                        if B_window.shape[-1] >= end:
+                            B_window[..., start:end] = 0.0
+
             if self.use_rotation_augmentation and self.rotation_degrees > 0:
                 angle = float(np.random.uniform(-self.rotation_degrees, self.rotation_degrees))
                 X_window = scipy_rotate(
@@ -907,6 +988,9 @@ def load_epoch_dataset(
     target_width,
     executor,
     temp_base_dir=None,
+    optional_channel_indices=None,
+    channel_dropout_probabilities=None,
+    brainiac_channel_indices=None,
 ):
     """
     Phase 1: load scan volumes in parallel via ProcessPoolExecutor into temp dirs.
@@ -946,6 +1030,9 @@ def load_epoch_dataset(
         use_rotation_augmentation=use_rotation_augmentation,
         rotation_degrees=rotation_degrees,
         has_brainiac=has_brainiac,
+        optional_channel_indices=optional_channel_indices,
+        channel_dropout_probabilities=channel_dropout_probabilities,
+        brainiac_channel_indices=brainiac_channel_indices,
     )
     return dataset, temp_dirs
 
@@ -963,6 +1050,8 @@ def load_val_dataset(
     target_width,
     executor,
     temp_base_dir=None,
+    optional_channel_indices=None,
+    brainiac_channel_indices=None,
 ):
     """Parallel volume loading for validation; returns (AstrilSliceDataset, temp_dirs)."""
     has_brainiac = brainiac_paths_list is not None
@@ -997,6 +1086,9 @@ def load_val_dataset(
         use_rotation_augmentation=False,
         rotation_degrees=0.0,
         has_brainiac=has_brainiac,
+        optional_channel_indices=optional_channel_indices,
+        channel_dropout_probabilities={},
+        brainiac_channel_indices=brainiac_channel_indices,
     )
     return dataset, temp_dirs
 

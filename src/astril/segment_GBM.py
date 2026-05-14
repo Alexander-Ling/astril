@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     import nibabel as nib  # noqa: F401
     import numpy as np     # noqa: F401
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
 # ------------------------------------------------------------
 # Model set specification (single source of truth)
 # ------------------------------------------------------------
@@ -195,6 +197,12 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     channel_cfg_files = cfg["channel_paths_files"].split(",")
     mask_cfg_file = cfg["mask_paths_file"]
     channel_file_lists = [read_paths_from_file(f) for f in channel_cfg_files]
+    channel_names = [
+        x.strip() for x in cfg.get("channel_names", "").split(",") if x.strip()
+    ] or [f"ch{i}" for i in range(len(channel_cfg_files))]
+    optional_channels = {
+        x.strip() for x in cfg.get("optional_channels", "").split(",") if x.strip()
+    }
     mask_paths = read_paths_from_file(mask_cfg_file)
     if subject_index >= len(mask_paths):
         raise ValueError("Exam index out of range!")
@@ -204,6 +212,16 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     # Append extra channels (e.g. BrainIAC PCA maps) if provided
     if extra_channel_paths:
         volume_paths_list[subject_index] = volume_paths_list[subject_index] + list(extra_channel_paths)
+    missing_channels = [
+        channel_names[i]
+        for i, path in enumerate(volume_paths_list[subject_index][:len(channel_names)])
+        if str(path).strip() == MISSING_CHANNEL_SENTINEL
+    ]
+    missing_required = [ch for ch in missing_channels if ch not in optional_channels]
+    if missing_required:
+        raise ValueError(f"Exam {subject_index+1} has missing required channel(s): {missing_required}")
+    if missing_channels:
+        print(f"[INFO] Missing optional channel(s) zero-filled: {missing_channels}")
 
     # Get subject's mask file.
     mask_path = mask_paths[subject_index]
@@ -346,7 +364,8 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
 def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
                              overwrite_existing_outputs=False,
                              channel_patterns=None, brainmask_pattern="_brainmask.nii.gz",
-                             segment_suffix="_GBM-seg.nii.gz", debug_models=False):
+                             segment_suffix="_GBM-seg.nii.gz", debug_models=False,
+                             optional_channels=None):
     """
     Implements the GBM segmentation pipeline per subject:
       1. Create and use a Model 1 segmentation config for all subjects.
@@ -372,6 +391,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
                             "_T2f_brain-norm.nii.gz",
                             "_T2w_brain-norm.nii.gz"]
     channels = ["t1c", "t1n", "t2f", "t2w"]
+    optional_channels = list(optional_channels or [])
     
     working_dir = os.path.join(input_dir, "Segmentation_Configs")
     Path(working_dir).mkdir(parents=True, exist_ok=True)
@@ -393,7 +413,9 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         outputVolumeDirectory="in_place",
         segmentSuffix="_Model_1_seg.nii.gz",
         output_config_filename="model_1_parameters.cfg",
-        silent=False
+        silent=False,
+        optional_channels=optional_channels,
+        allow_missing_optional_channels=bool(optional_channels),
     )
     print("-------------------------")
     print("[INFO] Prepared segmentation config for Model 1.")
@@ -503,11 +525,14 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
                 channel_cfg = channel_paths[ch_idx]
                 source_path = read_paths_from_file(channel_cfg)[subj_idx]
                 label = f"ch{ch_idx}"
-                features = compute_brainiac_encoder_features(
-                    [source_path], brainiac_weights_path,
-                    brainiac_tmp_dir / f"{label}_encoder", label,
-                )
-                subject_features.append(features[0])
+                if str(source_path).strip() == MISSING_CHANNEL_SENTINEL:
+                    subject_features.append(MISSING_CHANNEL_SENTINEL)
+                else:
+                    features = compute_brainiac_encoder_features(
+                        [source_path], brainiac_weights_path,
+                        brainiac_tmp_dir / f"{label}_encoder", label,
+                    )
+                    subject_features.append(features[0])
             brainiac_encoder_paths_subjects = [None] * num_subjects
             brainiac_encoder_paths_subjects[subj_idx] = subject_features
 
@@ -546,7 +571,9 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             outputVolumeDirectory="in_place",
             segmentSuffix=segment_suffix,
             output_config_filename="model_2_parameters.cfg",
-            silent=True
+            silent=True,
+            optional_channels=[ch for ch in optional_channels if ch in {"t1c", "t2f"}],
+            allow_missing_optional_channels=any(ch in {"t1c", "t2f"} for ch in optional_channels),
         )
         print(f"[INFO] Processing exam {subj_idx+1} with Model 2...")
         # Since the generated Model 2 config corresponds to a single subject, use index 0.
@@ -567,13 +594,15 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
 
 
 def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_outputs=False,
-                channel_patterns=None, brainmask_pattern="_brainmask.nii.gz", segment_suffix="_GBM-seg.nii.gz"):
+                channel_patterns=None, brainmask_pattern="_brainmask.nii.gz", segment_suffix="_GBM-seg.nii.gz",
+                optional_channels=None):
     """
     Runs the full GBM segmentation pipeline per subject.
     """
     segment_GBM_per_subject(input_dir, slice_batch_size, n_threads,
                             overwrite_existing_outputs, channel_patterns,
-                            brainmask_pattern, segment_suffix, debug_models=False)
+                            brainmask_pattern, segment_suffix, debug_models=False,
+                            optional_channels=optional_channels)
 
 
 def main():
@@ -599,6 +628,8 @@ def main():
                         help="Brainmask pattern for Model 1 (default: _brainmask.nii.gz)")
     parser.add_argument("--segment_suffix", type=str, default="_GBM-seg.nii.gz",
                         help="Suffix to use in the final segmentation file names (default: _GBM-seg.nii.gz)")
+    parser.add_argument("--optional_channels", nargs="*", default=None,
+                        help="Model 1 channel names that may be absent and zero-filled, e.g. t1n t2f t2w.")
     args = parser.parse_args()
 
     # Fail early with a clear instruction if user hasn't fetched models yet
@@ -611,7 +642,8 @@ def main():
         overwrite_existing_outputs=args.overwrite_existing_outputs,
         channel_patterns=args.channel_patterns,
         brainmask_pattern=args.brainmask_pattern,
-        segment_suffix=args.segment_suffix
+        segment_suffix=args.segment_suffix,
+        optional_channels=args.optional_channels,
     )
 
 

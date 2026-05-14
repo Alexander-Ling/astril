@@ -13,6 +13,8 @@ import argparse
 import configparser
 from pathlib import Path
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
 ########################################################################
 # Shared helper: load a list of models given config-derived arrays
 ########################################################################
@@ -278,6 +280,16 @@ def run_segmentation(
     channel_cfg_files_str = config_parser["DEFAULT"]["channel_paths_files"]
     channel_cfg_files = channel_cfg_files_str.split(",")
     mask_cfg_file = config_parser["DEFAULT"]["mask_paths_file"]
+    channel_names = [
+        x.strip()
+        for x in config_parser["DEFAULT"].get("channel_names", "").split(",")
+        if x.strip()
+    ]
+    optional_channels = {
+        x.strip()
+        for x in config_parser["DEFAULT"].get("optional_channels", "").split(",")
+        if x.strip()
+    }
 
     model_paths_str = config_parser["DEFAULT"]["model_paths"]
     merging_method = config_parser["DEFAULT"].get("merging_method", "majority_vote")
@@ -313,6 +325,8 @@ def run_segmentation(
     for cfiles in channel_file_lists:
         if len(cfiles) != num_subjects:
             raise ValueError("Mismatch in number of lines across channel cfg and mask cfg.")
+    if not channel_names:
+        channel_names = [f"ch{i}" for i in range(len(channel_file_lists))]
 
     volume_paths_list = list(zip(*channel_file_lists))
     volume_paths_list = [list(vp) for vp in volume_paths_list]
@@ -385,6 +399,16 @@ def run_segmentation(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         base_name = os.path.basename(mask_path)
+        missing_channels = [
+            channel_names[i]
+            for i, path in enumerate(volume_paths_list[subj_idx])
+            if str(path).strip() == MISSING_CHANNEL_SENTINEL
+        ]
+        missing_required = [ch for ch in missing_channels if ch not in optional_channels]
+        if missing_required:
+            raise ValueError(f"Exam {subj_idx+1} has missing required channel(s): {missing_required}")
+        if missing_channels:
+            print(f"[INFO] Missing optional channel(s) zero-filled: {missing_channels}")
 
         # Compute BrainIAC features for this subject if required
         brainiac_encoder_paths_list = None
@@ -394,11 +418,14 @@ def run_segmentation(
             for ch_idx in brainiac_channel_indices:
                 channel_path = volume_paths_list[subj_idx][ch_idx]
                 label = _brainiac_inference_label(ch_idx)
-                features = compute_brainiac_encoder_features(
-                    [channel_path], brainiac_weights_path,
-                    brainiac_tmp_dir / f"{label}_encoder", label,
-                )
-                subject_features.append(features[0])
+                if str(channel_path).strip() == MISSING_CHANNEL_SENTINEL:
+                    subject_features.append(MISSING_CHANNEL_SENTINEL)
+                else:
+                    features = compute_brainiac_encoder_features(
+                        [channel_path], brainiac_weights_path,
+                        brainiac_tmp_dir / f"{label}_encoder", label,
+                    )
+                    subject_features.append(features[0])
             brainiac_encoder_paths_list = [None] * num_subjects
             brainiac_encoder_paths_list[subj_idx] = subject_features
         if ".nii.gz" in maskPattern:

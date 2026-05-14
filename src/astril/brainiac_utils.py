@@ -50,6 +50,7 @@ _MISSING_DEPS_MSG = (
     "or manually:\n\n"
     "  pip install torch>=2.0 monai>=1.3.2 einops>=0.7"
 )
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
 
 
 class BrainIACWeightsNotFoundError(RuntimeError):
@@ -366,6 +367,9 @@ def compute_brainiac_encoder_features(
 
     output_paths: List[str] = []
     for nifti_path in nifti_paths:
+        if nifti_path is None or str(nifti_path).strip() == MISSING_CHANNEL_SENTINEL:
+            output_paths.append(MISSING_CHANNEL_SENTINEL)
+            continue
         stem = Path(nifti_path).name.replace(".nii.gz", "").replace(".nii", "")
         out_path = output_dir / f"{stem}_{sequence_label}_encoder_embeddings.npy"
         version_path = output_dir / f"{stem}_{sequence_label}_encoder_cache_version.txt"

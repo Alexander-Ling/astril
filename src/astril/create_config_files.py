@@ -7,6 +7,9 @@ from pathlib import Path
 import multiprocessing
 
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
+
 MODEL1_AXIAL_4MRI_CHANNELS = ["t1c", "t1n", "t2f", "t2w"]
 MODEL1_AXIAL_4MRI_PATTERNS = [
     "_T1c_brain-norm.nii.gz|_T1c_normalized.nii.gz",
@@ -106,6 +109,9 @@ def create_config_files(
     intensity_augmentation_strength=0.1,
     use_rotation_augmentation=False,
     rotation_degrees=10.0,
+    optional_channels=None,
+    channel_dropout_probabilities=None,
+    allow_missing_optional_channels=None,
 ):
     """
     Creates config files in `workingDirectory/Configs/` for training and validation data.
@@ -132,6 +138,34 @@ def create_config_files(
         raise ValueError("gtPattern and maskPattern must be provided.")
     if channel_alt_patterns is not None and len(channel_alt_patterns) != len(trainChannels):
         raise ValueError("channel_alt_patterns must be the same length as trainChannels.")
+    optional_channels = list(optional_channels or [])
+    unknown_optional = sorted(set(optional_channels) - set(trainChannels))
+    if unknown_optional:
+        raise ValueError(f"optional_channels contains unknown channel(s): {unknown_optional}")
+    optional_channel_set = set(optional_channels)
+    if allow_missing_optional_channels is None:
+        allow_missing_optional_channels = bool(optional_channel_set)
+    dropout_map = {}
+    if channel_dropout_probabilities:
+        if isinstance(channel_dropout_probabilities, str):
+            for item in channel_dropout_probabilities.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                if ":" not in item:
+                    raise ValueError(
+                        "channel_dropout_probabilities must be formatted like 't1n:0.15,t2f:0.20'."
+                    )
+                name, value = item.split(":", 1)
+                dropout_map[name.strip()] = float(value)
+        else:
+            dropout_map = {str(k): float(v) for k, v in dict(channel_dropout_probabilities).items()}
+    unknown_dropout = sorted(set(dropout_map) - set(trainChannels))
+    if unknown_dropout:
+        raise ValueError(f"channel_dropout_probabilities references unknown channel(s): {unknown_dropout}")
+    for name, prob in dropout_map.items():
+        if prob < 0.0 or prob > 1.0:
+            raise ValueError(f"Dropout probability for channel '{name}' must be in [0, 1].")
 
     # Determine number of CPU cores
     if nCpuCores is None:
@@ -220,15 +254,22 @@ def create_config_files(
                 if alt is not None and str(alt) != str(primary):
                     opts.append(str(alt))
                 if not opts:
-                    print(f"Warning (train): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
-                    skip = True
-                    break
+                    if allow_missing_optional_channels and channel in optional_channel_set:
+                        opts.append(MISSING_CHANNEL_SENTINEL)
+                    else:
+                        print(f"Warning (train): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
+                        skip = True
+                        break
                 options_per_channel.append(opts)
             else:
                 if primary is None:
-                    print(f"Warning (train): Missing or ambiguous match for pattern '{pattern}' in {timepoint_dir}. Skipping.")
-                    skip = True
-                    break
+                    if allow_missing_optional_channels and channel in optional_channel_set:
+                        options_per_channel.append([MISSING_CHANNEL_SENTINEL])
+                        continue
+                    else:
+                        print(f"Warning (train): Missing or ambiguous match for pattern '{pattern}' in {timepoint_dir}. Skipping.")
+                        skip = True
+                        break
                 options_per_channel.append([str(primary)])
 
         if skip:
@@ -266,9 +307,13 @@ def create_config_files(
             if matched is None and alt_pat:
                 matched = match_pattern(timepoint_dir, alt_pat)
             if matched is None:
-                print(f"Warning (val): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
-                skip = True
-                break
+                if allow_missing_optional_channels and channel in optional_channel_set:
+                    matched_channel_files.append(MISSING_CHANNEL_SENTINEL)
+                    continue
+                else:
+                    print(f"Warning (val): No match for channel '{channel}' (primary or alt) in {timepoint_dir}. Skipping.")
+                    skip = True
+                    break
             matched_channel_files.append(str(matched))
 
         if skip:
@@ -322,6 +367,12 @@ def create_config_files(
         f.write(f"num_input_slices = {numInputSlices}\n")
         f.write(f"num_output_slices = {numOutputSlices}\n")
         f.write(f"minimum_height_width = {minimum_height_width}\n")
+        f.write(f"channel_names = {','.join(trainChannels)}\n")
+        f.write(f"optional_channels = {','.join(optional_channels)}\n")
+        dropout_str = ",".join(f"{k}:{v:g}" for k, v in dropout_map.items())
+        f.write(f"channel_dropout_probabilities = {dropout_str}\n")
+        f.write(f"allow_missing_optional_channels = {str(bool(allow_missing_optional_channels)).lower()}\n")
+        f.write("missing_channel_fill = zero\n")
         f.write(f"training_schedule_file = {trainingSchedulePath}\n")
         f.write(f"pretrained_model_path = {preTrainedModelPath}\n")
         f.write(f"print_every_n_subbatches = {subbatchLogFrequency}\n")
@@ -386,6 +437,12 @@ def main():
                         help="BrainIAC integration mode to write when --use_brainiac_embeddings is set.")
     parser.add_argument("--brainiac_encode_channels", default="all",
                         help="Comma-separated channel indices or names to encode with BrainIAC, or 'all'.")
+    parser.add_argument("--optional_channels", nargs="*", default=None,
+                        help="Channel names that may be missing and may be randomly zero-dropped during training.")
+    parser.add_argument("--channel_dropout_probabilities", default="",
+                        help="Comma-separated per-channel dropout probabilities, e.g. t1n:0.15,t2f:0.2.")
+    parser.add_argument("--allow_missing_optional_channels", action="store_true",
+                        help="Allow optional channels to be absent and write zero-fill sentinels in cfg files.")
     parser.add_argument("--Use_Flip_Augmentation", action="store_true",
                         help="Enable random horizontal/vertical flip augmentation in the generated config.")
     parser.add_argument("--Use_Intensity_Augmentation", action="store_true",
@@ -467,6 +524,9 @@ def main():
         intensity_augmentation_strength=args.intensity_augmentation_strength,
         use_rotation_augmentation=args.Use_Rotation_Augmentation,
         rotation_degrees=args.rotation_degrees,
+        optional_channels=args.optional_channels,
+        channel_dropout_probabilities=args.channel_dropout_probabilities,
+        allow_missing_optional_channels=args.allow_missing_optional_channels or bool(args.optional_channels),
     )
 
 
