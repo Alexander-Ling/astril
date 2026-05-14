@@ -1,12 +1,14 @@
 import gc
 import math
 import os
+import shutil
 import time
 import numpy as np
 import pandas as pd
 import psutil
 import torch
 import torch.nn.functional as F
+import torch.utils.data
 from concurrent.futures import ProcessPoolExecutor
 
 from .config import (
@@ -41,9 +43,11 @@ from .config import (
 from .data_loading import (
     read_paths_from_file,
     detect_input_shape,
-    load_epoch_data,
-    load_val_data,
-    ValDataGenerator,
+    load_epoch_dataset,
+    load_val_dataset,
+    compute_class_weights_from_dataset,
+    AstrilSliceDataset,
+    _dataloader_worker_init,
 )
 from .model_architecture import (
     create_dynamic_unet_from_config,
@@ -185,6 +189,11 @@ def _autocast_context(device, enabled):
     return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled)
 
 
+def _cleanup_temp_dirs(temp_dirs):
+    for d in temp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def train_model():
     log_file, log_file_path = init_logging(output_dir)
     print(f"Logging to: {log_file_path}")
@@ -299,8 +308,14 @@ def train_model():
     val_metrics_file_path = os.path.join(output_dir, "val_metrics.tsv")
     training_stats_file_path = os.path.join(output_dir, "training_stats.tsv")
 
-    from .config import n_cores
+    from .config import n_cores, dataloader_num_workers
     _worker_pool = ProcessPoolExecutor(max_workers=n_cores)
+
+    # Streaming state: temp dirs + dataset are owned here and cleaned up on reload/exit
+    _train_temp_dirs = []
+    _train_dataset = None
+    train_loader = None
+    epoch_class_weights = None
 
     data_loading_counter = 0
     for epoch in range(starting_epoch, epochs):
@@ -341,24 +356,28 @@ def train_model():
             group["lr"] = learning_rate
         print(f"  Effective LR: {learning_rate:.6f}")
 
+        # --- Data loading / reuse decision ---
         data_loading_counter += 1
-        if "X_epoch_data" not in locals() or (data_loading_counter % epochs_per_data == 0):
+        need_reload = _train_dataset is None or (data_loading_counter % epochs_per_data == 0)
+
+        if need_reload:
             data_loading_counter = 0
-            if "X_epoch_data" in locals():
-                del X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names
-                if use_brainiac_fusion and "B_epoch_data" in locals():
-                    del B_epoch_data
-                if "epoch_class_weights" in locals():
-                    del epoch_class_weights
-                if "epoch_data" in locals():
-                    del epoch_data
+            # Join DataLoader workers before deleting temp files (Windows file locking)
+            if train_loader is not None:
+                del train_loader
+                train_loader = None
                 gc.collect()
-            print("Loading training data (2.5D) for this epoch...")
+            _cleanup_temp_dirs(_train_temp_dirs)
+            _train_temp_dirs = []
+            _train_dataset = None
+
+            print("Loading training volumes for this epoch...")
             mem = psutil.virtual_memory()
             print(f"System RAM usage before data load: {mem.percent:.2f}%")
             t0_data = time.perf_counter()
+
             selected_train_indexes = np.random.choice(train_indexes, scan_batch_size, replace=False)
-            epoch_data = load_epoch_data(
+            _train_dataset, _train_temp_dirs = load_epoch_dataset(
                 scan_indexes=selected_train_indexes,
                 volume_paths_list=train_volume_paths_list,
                 mask_paths=train_mask_paths,
@@ -366,7 +385,6 @@ def train_model():
                 slicing_plane=slicing_plane,
                 num_input_slices=num_input_slices,
                 num_output_slices=num_output_slices,
-                num_classes=num_classes,
                 class_multiplication_factors=class_multiplication_factors,
                 require_classes=require_classes,
                 use_flip_augmentation=use_flip_augmentation,
@@ -377,15 +395,31 @@ def train_model():
                 target_width=minimum_height_width,
                 executor=_worker_pool,
             )
-            if use_brainiac_fusion:
-                X_epoch_data, B_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = epoch_data
-            else:
-                X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = epoch_data
+            epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
+
             data_load_s = time.perf_counter() - t0_data
-            print(f"Data loaded in {data_load_s:.1f}s.")
+            print(f"Volumes loaded in {data_load_s:.1f}s. Slice entries: {len(_train_dataset)}.")
+            mem = psutil.virtual_memory()
+            print(f"System RAM usage after data load: {mem.percent:.2f}%")
+
         else:
+            # Reuse same temp dirs — rebuild Dataset cheaply (re-runs _build_index with same volumes)
+            _train_dataset = AstrilSliceDataset(
+                scan_temp_dirs=_train_temp_dirs,
+                num_input_slices=num_input_slices,
+                num_output_slices=num_output_slices,
+                class_multiplication_factors=class_multiplication_factors,
+                require_classes=require_classes,
+                is_training=True,
+                use_flip_augmentation=use_flip_augmentation,
+                use_intensity_augmentation=use_intensity_augmentation,
+                intensity_augmentation_strength=intensity_augmentation_strength,
+                has_brainiac=use_brainiac_fusion,
+            )
+            epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
             data_load_s = 0.0
 
+        # --- Class weights ---
         if class_weights is not None:
             final_class_weights = [
                 epoch_class_weights[i] if math.isnan(class_weights[i]) else class_weights[i]
@@ -396,17 +430,24 @@ def train_model():
             final_class_weights = epoch_class_weights
             print(f"Using dynamic class weights: {final_class_weights}")
 
-        cw_t = _tensor_params(final_class_weights, device)
+        cw_t    = _tensor_params(final_class_weights, device)
         alpha_t = _tensor_params(alpha_vals_list, device)
-        beta_t = _tensor_params(beta_vals_list, device)
+        beta_t  = _tensor_params(beta_vals_list, device)
 
-        _n = len(X_epoch_data)
-        _bs = slice_sub_batch_size
-        total_batches = math.ceil(_n / _bs)
-        _mask_f32 = mask_epoch_data.astype(np.float32)
+        # --- DataLoader ---
+        train_loader = torch.utils.data.DataLoader(
+            _train_dataset,
+            batch_size=slice_sub_batch_size,
+            shuffle=True,
+            num_workers=dataloader_num_workers,
+            pin_memory=(device.type == "cuda"),
+            prefetch_factor=2 if dataloader_num_workers > 0 else None,
+            persistent_workers=False,
+            worker_init_fn=_dataloader_worker_init,
+            drop_last=False,
+        )
+        total_batches = len(train_loader)
 
-        mem = psutil.virtual_memory()
-        print(f"System RAM usage after data load: {mem.percent:.2f}%")
         print("Training model...")
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -417,15 +458,18 @@ def train_model():
         total_train_slices = 0
         grad_norms = []
 
-        for batch_counter, start in enumerate(range(0, _n, _bs), start=1):
-            end = min(start + _bs, _n)
-            x_batch_np = X_epoch_data[start:end]
-            b_batch_np = B_epoch_data[start:end] if use_brainiac_fusion else None
-            y_batch_np = y_epoch_data[start:end]
-            mask_batch_np = _mask_f32[start:end]
+        for batch_counter, batch in enumerate(train_loader, start=1):
+            # Unpack: (X, B_or_sentinel, Y, M, sample_name)
+            x_np, b_np, y_np, mask_np, _ = batch
+            x_batch_np   = x_np.numpy()
+            y_batch_np   = y_np.numpy()
+            mask_batch_np = mask_np.numpy().astype(np.float32)
 
             x_batch = _to_input_tensor(x_batch_np, device)
-            b_batch = _to_brainiac_tensor(b_batch_np, device) if use_brainiac_fusion else None
+            if use_brainiac_fusion:
+                b_batch = _to_brainiac_tensor(b_np.numpy(), device)
+            else:
+                b_batch = None
             y_batch, y_onehot, mask_batch = _to_target_tensors(y_batch_np, mask_batch_np, device)
 
             with _autocast_context(device, use_amp):
@@ -525,66 +569,65 @@ def train_model():
             print("Conducting validation (2.5D)...")
             t0_val = time.perf_counter()
             val_acc = _empty_metric_accumulators()
-            num_val_scans = len(val_mask_paths)
-            num_val_batches = int(np.ceil(num_val_scans / scan_batch_size))
             model.eval()
+
+            val_dataset, val_temp_dirs = load_val_dataset(
+                scan_indexes=val_indexes,
+                volume_paths_list=val_volume_paths_list,
+                mask_paths=val_mask_paths,
+                gt_paths=val_gt_paths,
+                slicing_plane=slicing_plane,
+                num_input_slices=num_input_slices,
+                num_output_slices=num_output_slices,
+                brainiac_paths_list=val_brainiac_paths_list if use_brainiac_fusion else None,
+                target_height=minimum_height_width,
+                target_width=minimum_height_width,
+                executor=_worker_pool,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=slice_sub_batch_size,
+                shuffle=False,
+                num_workers=dataloader_num_workers,
+                pin_memory=(device.type == "cuda"),
+                prefetch_factor=2 if dataloader_num_workers > 0 else None,
+                persistent_workers=False,
+                worker_init_fn=_dataloader_worker_init,
+            )
+
             with torch.no_grad():
-                for batch_num in range(num_val_batches):
-                    print(f"Validation batch {batch_num+1}/{num_val_batches}...")
-                    start_idx = batch_num * scan_batch_size
-                    end_idx = min((batch_num + 1) * scan_batch_size, num_val_scans)
-                    batch_indexes = np.arange(start_idx, end_idx)
-                    val_data = load_val_data(
-                        scan_indexes=batch_indexes,
-                        volume_paths_list=val_volume_paths_list,
-                        mask_paths=val_mask_paths,
-                        gt_paths=val_gt_paths,
-                        slicing_plane=slicing_plane,
-                        num_input_slices=num_input_slices,
-                        num_output_slices=num_output_slices,
-                        return_transform_info=False,
-                        brainiac_paths_list=val_brainiac_paths_list if use_brainiac_fusion else None,
-                        target_height=minimum_height_width,
-                        target_width=minimum_height_width,
-                        executor=_worker_pool,
-                    )
-                    if use_brainiac_fusion:
-                        X_val_data, B_val_data, y_val_data, mask_val_data, _ = val_data
-                        val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size, brainiac_data=B_val_data)
-                    else:
-                        X_val_data, y_val_data, mask_val_data, _ = val_data
-                        val_gen = ValDataGenerator(X_val_data, y_val_data, mask_val_data, slice_sub_batch_size)
-                    for val_batch in val_gen:
-                        if use_brainiac_fusion:
-                            x_val_np, b_val_np, y_val_np, mask_val_np = val_batch
-                        else:
-                            x_val_np, y_val_np, mask_val_np = val_batch
-                        x_val = _to_input_tensor(x_val_np, device)
-                        b_val = _to_brainiac_tensor(b_val_np, device) if use_brainiac_fusion else None
-                        _, y_val_onehot, mask_val = _to_target_tensors(y_val_np, mask_val_np, device)
-                        with _autocast_context(device, use_amp):
-                            val_logits = model(x_val, b_val) if use_brainiac_fusion else model(x_val)
-                            if isinstance(val_logits, tuple):
-                                val_logits = val_logits[0]
-                            loss_val, loss_per_class_val = combined_focal_tversky_wce_loss(
-                                y_val_onehot,
-                                val_logits,
-                                mask_val,
-                                cw_t,
-                                alpha_t,
-                                beta_t,
-                                gamma=tversky_gamma,
-                                wce_weight=wce_weight,
-                                label_smoothing=label_smoothing,
-                            )
-                        _update_loss_metrics(val_acc, loss_val.detach().float().cpu(), loss_per_class_val.detach().float())
-                        val_probabilities = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
-                        _update_prediction_metrics(val_acc, val_probabilities, y_val_np, mask_val_np)
-                    X_val_data, y_val_data, mask_val_data = None, None, None
-                    if use_brainiac_fusion:
-                        B_val_data = None
-                    del val_gen
-                    gc.collect()
+                for val_batch in val_loader:
+                    x_np, b_np, y_np, mask_np, _ = val_batch
+                    x_val_np   = x_np.numpy()
+                    y_val_np   = y_np.numpy()
+                    mask_val_np = mask_np.numpy().astype(np.float32)
+
+                    x_val = _to_input_tensor(x_val_np, device)
+                    b_val = _to_brainiac_tensor(b_np.numpy(), device) if use_brainiac_fusion else None
+                    _, y_val_onehot, mask_val = _to_target_tensors(y_val_np, mask_val_np, device)
+
+                    with _autocast_context(device, use_amp):
+                        val_logits = model(x_val, b_val) if use_brainiac_fusion else model(x_val)
+                        if isinstance(val_logits, tuple):
+                            val_logits = val_logits[0]
+                        loss_val, loss_per_class_val = combined_focal_tversky_wce_loss(
+                            y_val_onehot,
+                            val_logits,
+                            mask_val,
+                            cw_t,
+                            alpha_t,
+                            beta_t,
+                            gamma=tversky_gamma,
+                            wce_weight=wce_weight,
+                            label_smoothing=label_smoothing,
+                        )
+                    _update_loss_metrics(val_acc, loss_val.detach().float().cpu(), loss_per_class_val.detach().float())
+                    val_probabilities = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
+                    _update_prediction_metrics(val_acc, val_probabilities, y_val_np, mask_val_np)
+
+            del val_loader
+            _cleanup_temp_dirs(val_temp_dirs)
+            gc.collect()
 
             val_s = time.perf_counter() - t0_val
             val_class_metrics, val_all_classes_metrics = _metrics_for_logging(val_acc)
@@ -623,6 +666,10 @@ def train_model():
             vram_peak_mb=vram_peak_mb,
         )
 
+    # End-of-training cleanup
+    if train_loader is not None:
+        del train_loader
+    _cleanup_temp_dirs(_train_temp_dirs)
     _worker_pool.shutdown(wait=False)
     print("Training completed.")
     log_file.close()

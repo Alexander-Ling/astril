@@ -25,6 +25,7 @@ intensity_augmentation_strength = 0.1
 
 output_dir = None
 n_cores = None
+dataloader_num_workers = 2
 slicing_plane = None
 image_paths_files = None         # training channels file list (comma?separated list from create_config_files)
 gt_paths_file = None             # training ground truth file
