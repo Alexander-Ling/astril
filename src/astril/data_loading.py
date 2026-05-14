@@ -841,29 +841,36 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
 
     def _get_scan_arrays(self, scan_idx):
         import os as _os
-        cached = self._scan_cache.get(scan_idx)
-        if cached is not None:
-            return cached
-
         tmp_dir = self.scan_temp_dirs[scan_idx]
-        meta = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
-        cached = {
-            "tmp_dir": tmp_dir,
-            "meta": meta,
-            "pad_amt": int(meta['pad_amt']),
-            "num_channels": int(meta['num_channels']),
-            "sample_name": str(meta['sample_name'][0]),
-            "vols": np.load(_os.path.join(tmp_dir, 'vols.npy'), mmap_mode='r'),
-            "gt": np.load(_os.path.join(tmp_dir, 'gt.npy'), mmap_mode='r'),
-            "mask": np.load(_os.path.join(tmp_dir, 'mask.npy'), mmap_mode='r'),
-            "brainiac": None,
-        }
-        if self.has_brainiac:
-            b_path = _os.path.join(tmp_dir, 'brainiac.npy')
-            if _os.path.exists(b_path):
-                cached["brainiac"] = np.load(b_path, mmap_mode='r')
-        self._scan_cache[scan_idx] = cached
-        return cached
+
+        # Cache only scalar metadata. Mmap handles are intentionally NOT cached:
+        # persistent handles in worker processes block shutil.rmtree on Windows
+        # (open mmaps hold a file lock), causing temp dirs to accumulate on disk.
+        cached_meta = self._scan_cache.get(scan_idx)
+        if cached_meta is None:
+            meta = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
+            cached_meta = {
+                "pad_amt":    int(meta['pad_amt']),
+                "num_channels": int(meta['num_channels']),
+                "sample_name":  str(meta['sample_name'][0]),
+                "has_brainiac_file": (
+                    self.has_brainiac
+                    and _os.path.exists(_os.path.join(tmp_dir, 'brainiac.npy'))
+                ),
+            }
+            self._scan_cache[scan_idx] = cached_meta
+
+        result = dict(cached_meta)
+        result["tmp_dir"] = tmp_dir
+        result["vols"]    = np.load(_os.path.join(tmp_dir, 'vols.npy'),  mmap_mode='r')
+        result["gt"]      = np.load(_os.path.join(tmp_dir, 'gt.npy'),    mmap_mode='r')
+        result["mask"]    = np.load(_os.path.join(tmp_dir, 'mask.npy'),  mmap_mode='r')
+        result["brainiac"] = None
+        if cached_meta["has_brainiac_file"]:
+            result["brainiac"] = np.load(
+                _os.path.join(tmp_dir, 'brainiac.npy'), mmap_mode='r'
+            )
+        return result
 
     def __getitem__(self, i):
         scan_idx, z_center = self._index[i]
