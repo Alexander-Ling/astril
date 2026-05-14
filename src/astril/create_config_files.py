@@ -7,6 +7,60 @@ from pathlib import Path
 import multiprocessing
 
 
+MODEL1_AXIAL_4MRI_CHANNELS = ["t1c", "t1n", "t2f", "t2w"]
+MODEL1_AXIAL_4MRI_PATTERNS = [
+    "_T1c_brain-norm.nii.gz|_T1c_normalized.nii.gz",
+    "_T1n_brain-norm.nii.gz|_T1n_normalized.nii.gz",
+    "_T2f_brain-norm.nii.gz|_T2f_normalized.nii.gz",
+    "_T2w_brain-norm.nii.gz|_T2w_normalized.nii.gz",
+]
+
+
+def write_model1_axial_short_schedule(path):
+    """
+    Write a conservative 60-epoch axial Model 1 schedule.
+
+    Validation begins at epoch 10, runs every 2 epochs through epoch 30, then
+    every 5 epochs. Learning rate warms up at epochs 1 and 5, then decays at
+    epochs 30, 40, and 50.
+    """
+    columns = [
+        "epoch",
+        "scan_batch_size",
+        "slice_sub_batch_size",
+        "accumulate_n_sub_batches",
+        "conduct_validation",
+        "validation_frequency",
+        "learning_rate",
+        "wce_loss_weight",
+        "tversky_gamma",
+        "class_weights",
+        "epochs_per_new_training_data",
+        "class_multiplication_factors",
+        "require_classes",
+        "tversky_alpha_values",
+        "gradient_clip_norm",
+        "label_smoothing",
+        "deep_supervision_loss_weight",
+    ]
+    rows = [
+        [1, "NA", 16, 1, "FALSE", "NA", 0.0001, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [5, "NA", 16, 1, "FALSE", "NA", 0.0010, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [10, "NA", 16, 1, "TRUE", 2, 0.0010, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [30, "NA", 16, 1, "TRUE", 2, 0.0005, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [31, "NA", 16, 1, "TRUE", 5, 0.0005, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [40, "NA", 16, 1, "TRUE", 5, 0.0002, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+        [50, "NA", 16, 1, "TRUE", 5, 0.0001, 0.5, 1.0, "NA", 1, "NA", "NA", "NA", 1.0, 0.0, 0.5],
+    ]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        f.write("\t".join(columns) + "\n")
+        for row in rows:
+            f.write("\t".join(str(v) for v in row) + "\n")
+    return path
+
+
 def update_train_config_flags(config_path, **flags):
     """
     Update boolean/string flags in an existing train_parameters.cfg file.
@@ -47,6 +101,11 @@ def create_config_files(
     use_brainiac_embeddings=False,
     brainiac_embedding_type="encoder_fusion",
     brainiac_encode_channels="all",
+    use_flip_augmentation=False,
+    use_intensity_augmentation=False,
+    intensity_augmentation_strength=0.1,
+    use_rotation_augmentation=False,
+    rotation_degrees=10.0,
 ):
     """
     Creates config files in `workingDirectory/Configs/` for training and validation data.
@@ -106,7 +165,10 @@ def create_config_files(
         Matches a pattern in the given directory, returning the first unambiguous hit.
         Pattern may contain '|'-separated fallbacks tried left-to-right
         (e.g. "_T2f_normalized.nii.gz|_T2f_brain-norm.nii.gz").
-        Returns None if no pattern yields exactly one match.
+        If multiple files match, prefer a NIfTI whose name starts with the
+        current exam directory name. This preserves legacy DFCI folders that
+        contain duplicate numeric-ID and DFCI-prefixed masks/labels.
+        Returns None if no pattern yields a usable match.
         """
         if pattern is None:
             return None
@@ -116,6 +178,13 @@ def create_config_files(
             matches = [f for f in all_files if pat in f.name]
             if len(matches) == 1:
                 return matches[0]
+            if len(matches) > 1:
+                nii_matches = [f for f in matches if f.name.endswith((".nii.gz", ".nii"))]
+                if len(nii_matches) == 1:
+                    return nii_matches[0]
+                prefix_matches = [f for f in nii_matches if f.name.startswith(directory.name)]
+                if len(prefix_matches) == 1:
+                    return prefix_matches[0]
         return None
 
     # Process training directories
@@ -269,18 +338,22 @@ def create_config_files(
         f.write("brainiac_encoder_input_channels = 0\n")
         # Mixed precision (default off; safe to enable on CUDA hardware)
         f.write("use_mixed_precision = false\n")
-        # Augmentation flags (default off; set via --Use_Flip_Augmentation / --Use_Intensity_Augmentation)
-        f.write("use_flip_augmentation = false\n")
-        f.write("use_intensity_augmentation = false\n")
-        f.write("intensity_augmentation_strength = 0.1\n")
+        # Augmentation flags
+        f.write(f"use_flip_augmentation = {str(bool(use_flip_augmentation)).lower()}\n")
+        f.write(f"use_intensity_augmentation = {str(bool(use_intensity_augmentation)).lower()}\n")
+        f.write(f"intensity_augmentation_strength = {float(intensity_augmentation_strength)}\n")
+        f.write(f"use_rotation_augmentation = {str(bool(use_rotation_augmentation)).lower()}\n")
+        f.write(f"rotation_degrees = {float(rotation_degrees)}\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate configuration files for MRI segmentation training.")
     parser.add_argument("--workingDirectory", default=".", help="Directory to store generated config files.")
     parser.add_argument("--trainDataDirectory", required=True, help="Directory with training data.")
     parser.add_argument("--valDataDirectory", required=True, help="Directory with validation data.")
-    parser.add_argument("--trainChannels", nargs="+", required=True, help="Names of training channels.")
-    parser.add_argument("--trainPatterns", nargs="+", required=True, help="Patterns for training channels.")
+    parser.add_argument("--model1_axial_4mri_no_brainiac_recipe", action="store_true",
+                        help="Use the axial Model 1 T1c/T1n/T2f/T2w no-BrainIAC overfit-reduction recipe.")
+    parser.add_argument("--trainChannels", nargs="+", default=None, help="Names of training channels.")
+    parser.add_argument("--trainPatterns", nargs="+", default=None, help="Patterns for training channels.")
     parser.add_argument("--channel_alt_patterns", nargs="+", default=None,
                         help="Optional fallback patterns, one per channel. Use 'none' for channels with no "
                              "fallback (e.g. --channel_alt_patterns none _T2w_brain-norm.nii.gz). "
@@ -291,7 +364,7 @@ def main():
     parser.add_argument("--nCpuCores", type=int, default=None, help="Number of CPU cores to use for data loading.")
     parser.add_argument("--numClasses", type=int, required=True, help="Number of segmentation classes, including background.")
     parser.add_argument("--nEpochs", type=int, default=400, help="Number of training epochs.")
-    parser.add_argument("--trainingSchedulePath", required=True, help="Path to training schedule file.")
+    parser.add_argument("--trainingSchedulePath", default=None, help="Path to training schedule file.")
     parser.add_argument("--preTrainedModelPath", default=None, help="Optional path to a migrated PyTorch .pt checkpoint.")
     parser.add_argument("--subbatchLogFrequency", type=int, default=10, help="Log training outputs every this many sub-batches.")
     parser.add_argument("--numInputSlices", type=int, default=3, help="Number of adjacent slices input to cnn model each cycle.")
@@ -309,8 +382,43 @@ def main():
                         help="BrainIAC integration mode to write when --use_brainiac_embeddings is set.")
     parser.add_argument("--brainiac_encode_channels", default="all",
                         help="Comma-separated channel indices or names to encode with BrainIAC, or 'all'.")
+    parser.add_argument("--Use_Flip_Augmentation", action="store_true",
+                        help="Enable random horizontal/vertical flip augmentation in the generated config.")
+    parser.add_argument("--Use_Intensity_Augmentation", action="store_true",
+                        help="Enable random intensity augmentation in the generated config.")
+    parser.add_argument("--intensity_augmentation_strength", type=float, default=0.1,
+                        help="Noise/contrast strength for intensity augmentation.")
+    parser.add_argument("--Use_Rotation_Augmentation", action="store_true",
+                        help="Enable random in-plane rotation augmentation in the generated config.")
+    parser.add_argument("--rotation_degrees", type=float, default=10.0,
+                        help="Maximum absolute random in-plane rotation angle in degrees.")
 
     args = parser.parse_args()
+
+    if args.model1_axial_4mri_no_brainiac_recipe:
+        args.trainChannels = args.trainChannels or MODEL1_AXIAL_4MRI_CHANNELS
+        args.trainPatterns = args.trainPatterns or MODEL1_AXIAL_4MRI_PATTERNS
+        args.slicingPlane = "axial"
+        args.nEpochs = 60 if args.nEpochs == parser.get_default("nEpochs") else args.nEpochs
+        args.Use_Flip_Augmentation = True
+        args.Use_Intensity_Augmentation = True
+        args.Use_Rotation_Augmentation = True
+        args.use_brainiac_embeddings = False
+        if args.trainingSchedulePath is None:
+            args.trainingSchedulePath = str(
+                Path(args.workingDirectory).resolve()
+                / "Configs"
+                / "model1_axial_short_schedule.tsv"
+            )
+            write_model1_axial_short_schedule(args.trainingSchedulePath)
+
+    if args.trainChannels is None or args.trainPatterns is None:
+        raise ValueError(
+            "--trainChannels and --trainPatterns are required unless "
+            "--model1_axial_4mri_no_brainiac_recipe is used."
+        )
+    if args.trainingSchedulePath is None:
+        raise ValueError("--trainingSchedulePath is required unless a recipe writes a default schedule.")
 
     encoder_level_factors = [int(x) for x in args.encoder_level_factors.split(",") if x.strip()]
 
@@ -350,6 +458,11 @@ def main():
         use_brainiac_embeddings=args.use_brainiac_embeddings,
         brainiac_embedding_type=args.brainiac_embedding_type,
         brainiac_encode_channels=args.brainiac_encode_channels,
+        use_flip_augmentation=args.Use_Flip_Augmentation,
+        use_intensity_augmentation=args.Use_Intensity_Augmentation,
+        intensity_augmentation_strength=args.intensity_augmentation_strength,
+        use_rotation_augmentation=args.Use_Rotation_Augmentation,
+        rotation_degrees=args.rotation_degrees,
     )
 
 

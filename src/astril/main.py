@@ -67,6 +67,8 @@ def parse_train_parameters(config_file_path):
     config.use_flip_augmentation = cfg_parser.getboolean("DEFAULT", "use_flip_augmentation", fallback=False)
     config.use_intensity_augmentation = cfg_parser.getboolean("DEFAULT", "use_intensity_augmentation", fallback=False)
     config.intensity_augmentation_strength = cfg_parser.getfloat("DEFAULT", "intensity_augmentation_strength", fallback=0.1)
+    config.use_rotation_augmentation = cfg_parser.getboolean("DEFAULT", "use_rotation_augmentation", fallback=False)
+    config.rotation_degrees = cfg_parser.getfloat("DEFAULT", "rotation_degrees", fallback=10.0)
 
     # Mixed precision
     config.use_mixed_precision = cfg_parser.getboolean("DEFAULT", "use_mixed_precision", fallback=False)
@@ -163,6 +165,10 @@ def main():
                         help="Enable random horizontal/vertical flip augmentation.")
     parser.add_argument("--Use_Intensity_Augmentation", action="store_true",
                         help="Enable random intensity (noise + contrast) augmentation.")
+    parser.add_argument("--Use_Rotation_Augmentation", action="store_true",
+                        help="Enable random in-plane rotation augmentation.")
+    parser.add_argument("--rotation_degrees", type=float,
+                        help="Maximum absolute random in-plane rotation angle in degrees.")
 
     # Mixed precision
     parser.add_argument("--Use_Mixed_Precision", action="store_true",
@@ -206,6 +212,10 @@ def main():
         config.use_flip_augmentation = True
     if args.Use_Intensity_Augmentation:
         config.use_intensity_augmentation = True
+    if args.Use_Rotation_Augmentation:
+        config.use_rotation_augmentation = True
+    if args.rotation_degrees is not None:
+        config.rotation_degrees = args.rotation_degrees
 
     # Write any CLI-overridden architecture/augmentation flags back to the .cfg
     # so the saved config accurately reflects what was actually used for training.
@@ -221,6 +231,10 @@ def main():
         cfg_updates["use_flip_augmentation"] = "true"
     if args.Use_Intensity_Augmentation:
         cfg_updates["use_intensity_augmentation"] = "true"
+    if args.Use_Rotation_Augmentation:
+        cfg_updates["use_rotation_augmentation"] = "true"
+    if args.rotation_degrees is not None:
+        cfg_updates["rotation_degrees"] = str(args.rotation_degrees)
 
     # BrainIAC pre-computation (runs when use_brainiac_embeddings=true in the config)
     if config.use_brainiac_embeddings:

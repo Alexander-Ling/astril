@@ -32,6 +32,8 @@ from .config import (
     use_flip_augmentation,
     use_intensity_augmentation,
     intensity_augmentation_strength,
+    use_rotation_augmentation,
+    rotation_degrees,
     use_deep_supervision,
     deep_supervision_weights,
     use_mixed_precision,
@@ -395,6 +397,8 @@ def train_model():
                 use_flip_augmentation=use_flip_augmentation,
                 use_intensity_augmentation=use_intensity_augmentation,
                 intensity_augmentation_strength=intensity_augmentation_strength,
+                use_rotation_augmentation=use_rotation_augmentation,
+                rotation_degrees=rotation_degrees,
                 brainiac_paths_list=train_brainiac_paths_list if use_brainiac_fusion else None,
                 target_height=minimum_height_width,
                 target_width=minimum_height_width,
@@ -420,6 +424,8 @@ def train_model():
                 use_flip_augmentation=use_flip_augmentation,
                 use_intensity_augmentation=use_intensity_augmentation,
                 intensity_augmentation_strength=intensity_augmentation_strength,
+                use_rotation_augmentation=use_rotation_augmentation,
+                rotation_degrees=rotation_degrees,
                 has_brainiac=use_brainiac_fusion,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
@@ -571,7 +577,7 @@ def train_model():
         )
 
         val_s = None
-        if conduct_validation and (epoch % validation_frequency == 0):
+        if conduct_validation and ((epoch + 1) % validation_frequency == 0):
             print("Conducting validation (2.5D)...")
             t0_val = time.perf_counter()
             val_acc = _empty_metric_accumulators()

@@ -22,6 +22,8 @@ deep_supervision_weights = None     # list of floats e.g. [0.5, 0.25]
 use_flip_augmentation = False
 use_intensity_augmentation = False
 intensity_augmentation_strength = 0.1
+use_rotation_augmentation = False
+rotation_degrees = 10.0
 
 output_dir = None
 n_cores = None

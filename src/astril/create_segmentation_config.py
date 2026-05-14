@@ -173,7 +173,10 @@ def create_segmentation_config(
         Search for exactly one file in `directory` whose name contains `pattern`.
         Pattern may contain '|'-separated fallbacks tried left-to-right
         (e.g. "_T2f_normalized.nii.gz|_T2f_brain-norm.nii.gz").
-        Returns None if no pattern yields exactly one match.
+        If multiple files match, prefer a NIfTI whose name starts with the
+        current exam directory name. This keeps legacy DFCI folders with
+        duplicate numeric-ID and DFCI-prefixed masks from being skipped.
+        Returns None if no pattern yields a usable match.
         """
         if pattern is None:
             return None
@@ -182,6 +185,13 @@ def create_segmentation_config(
             matches = [f for f in directory.iterdir() if pat in f.name]
             if len(matches) == 1:
                 return matches[0]
+            if len(matches) > 1:
+                nii_matches = [f for f in matches if f.name.endswith((".nii.gz", ".nii"))]
+                if len(nii_matches) == 1:
+                    return nii_matches[0]
+                prefix_matches = [f for f in nii_matches if f.name.startswith(directory.name)]
+                if len(prefix_matches) == 1:
+                    return prefix_matches[0]
         return None
 
     # ------------------------------

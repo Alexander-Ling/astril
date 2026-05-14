@@ -7,6 +7,7 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import torch
 from concurrent.futures import ThreadPoolExecutor
+from scipy.ndimage import rotate as scipy_rotate
 
 # Nibabel orientation imports:
 from nibabel.orientations import io_orientation, ornt_transform, apply_orientation
@@ -693,6 +694,8 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         use_flip_augmentation,
         use_intensity_augmentation,
         intensity_augmentation_strength,
+        use_rotation_augmentation,
+        rotation_degrees,
         has_brainiac,
     ):
         self.scan_temp_dirs               = list(scan_temp_dirs)
@@ -704,6 +707,8 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         self.use_flip_augmentation        = use_flip_augmentation
         self.use_intensity_augmentation   = use_intensity_augmentation
         self.intensity_augmentation_strength = intensity_augmentation_strength
+        self.use_rotation_augmentation    = use_rotation_augmentation
+        self.rotation_degrees             = float(rotation_degrees)
         self.has_brainiac                 = has_brainiac
         self._index = []          # list of (scan_idx, z_center)
         self.class_weights = None
@@ -806,6 +811,26 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
 
         # Augmentation (training only)
         if self.is_training:
+            if self.use_rotation_augmentation and self.rotation_degrees > 0:
+                angle = float(np.random.uniform(-self.rotation_degrees, self.rotation_degrees))
+                X_window = scipy_rotate(
+                    X_window, angle, axes=(0, 1), reshape=False, order=1,
+                    mode="constant", cval=0.0,
+                ).astype(np.float32)
+                Y_window = scipy_rotate(
+                    Y_window, angle, axes=(0, 1), reshape=False, order=0,
+                    mode="constant", cval=0,
+                ).astype(np.int32)
+                M_window = scipy_rotate(
+                    M_window, angle, axes=(0, 1), reshape=False, order=0,
+                    mode="constant", cval=0,
+                ).astype(np.int32)
+                if self.has_brainiac and B_window.ndim > 1:
+                    B_window = scipy_rotate(
+                        B_window, angle, axes=(0, 1), reshape=False, order=1,
+                        mode="constant", cval=0.0,
+                    ).astype(np.float32)
+
             if self.use_flip_augmentation:
                 for flip_axis in (0, 1):
                     if random.random() > 0.5:
@@ -849,6 +874,8 @@ def load_epoch_dataset(
     use_flip_augmentation,
     use_intensity_augmentation,
     intensity_augmentation_strength,
+    use_rotation_augmentation,
+    rotation_degrees,
     brainiac_paths_list,
     target_height,
     target_width,
@@ -890,6 +917,8 @@ def load_epoch_dataset(
         use_flip_augmentation=use_flip_augmentation,
         use_intensity_augmentation=use_intensity_augmentation,
         intensity_augmentation_strength=intensity_augmentation_strength,
+        use_rotation_augmentation=use_rotation_augmentation,
+        rotation_degrees=rotation_degrees,
         has_brainiac=has_brainiac,
     )
     return dataset, temp_dirs
@@ -939,6 +968,8 @@ def load_val_dataset(
         use_flip_augmentation=False,
         use_intensity_augmentation=False,
         intensity_augmentation_strength=0.0,
+        use_rotation_augmentation=False,
+        rotation_degrees=0.0,
         has_brainiac=has_brainiac,
     )
     return dataset, temp_dirs
