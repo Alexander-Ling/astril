@@ -340,6 +340,11 @@ def train_model():
         data_loading_counter += 1
         if "X_epoch_data" not in locals() or (data_loading_counter % epochs_per_data == 0):
             data_loading_counter = 0
+            if "X_epoch_data" in locals():
+                del X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names
+                if use_brainiac_fusion and "B_epoch_data" in locals():
+                    del B_epoch_data
+                gc.collect()
             print("Loading training data (2.5D) for this epoch...")
             mem = psutil.virtual_memory()
             print(f"System RAM usage before data load: {mem.percent:.2f}%")
