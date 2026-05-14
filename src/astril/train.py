@@ -344,6 +344,10 @@ def train_model():
                 del X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names
                 if use_brainiac_fusion and "B_epoch_data" in locals():
                     del B_epoch_data
+                if "epoch_class_weights" in locals():
+                    del epoch_class_weights
+                if "epoch_data" in locals():
+                    del epoch_data
                 gc.collect()
             print("Loading training data (2.5D) for this epoch...")
             mem = psutil.virtual_memory()
