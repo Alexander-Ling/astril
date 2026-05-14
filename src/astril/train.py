@@ -81,18 +81,30 @@ def _select_device():
 
 
 def _to_input_tensor(x_batch, device):
-    x = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
+    if torch.is_tensor(x_batch):
+        x = x_batch.to(device=device, dtype=torch.float32, non_blocking=True)
+    else:
+        x = torch.as_tensor(x_batch, dtype=torch.float32).to(device=device, non_blocking=True)
     return x.permute(0, 3, 1, 2).contiguous()
 
 
 def _to_brainiac_tensor(b_batch, device):
-    b = torch.as_tensor(b_batch, dtype=torch.float32, device=device)
+    if torch.is_tensor(b_batch):
+        b = b_batch.to(device=device, dtype=torch.float32, non_blocking=True)
+    else:
+        b = torch.as_tensor(b_batch, dtype=torch.float32).to(device=device, non_blocking=True)
     return b.permute(0, 3, 1, 2).contiguous()
 
 
 def _to_target_tensors(y_batch, mask_batch, device):
-    y = torch.as_tensor(y_batch, dtype=torch.long, device=device)
-    mask = torch.as_tensor(mask_batch, dtype=torch.float32, device=device)
+    if torch.is_tensor(y_batch):
+        y = y_batch.to(device=device, dtype=torch.long, non_blocking=True)
+    else:
+        y = torch.as_tensor(y_batch, dtype=torch.long).to(device=device, non_blocking=True)
+    if torch.is_tensor(mask_batch):
+        mask = mask_batch.to(device=device, dtype=torch.float32, non_blocking=True)
+    else:
+        mask = torch.as_tensor(mask_batch, dtype=torch.float32).to(device=device, non_blocking=True)
     y_onehot = F.one_hot(y.squeeze(-1), num_classes=num_classes).to(dtype=torch.float32)
     return y, y_onehot, mask
 
@@ -194,6 +206,19 @@ def _autocast_context(device, enabled):
 def _cleanup_temp_dirs(temp_dirs):
     for d in temp_dirs:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _loader_kwargs(num_workers, prefetch_factor, persistent_workers, device):
+    num_workers = max(int(num_workers or 0), 0)
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": (device.type == "cuda"),
+        "worker_init_fn": _dataloader_worker_init,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = max(int(prefetch_factor or 2), 1)
+        kwargs["persistent_workers"] = bool(persistent_workers)
+    return kwargs
 
 
 def train_model():
@@ -310,7 +335,12 @@ def train_model():
     val_metrics_file_path = os.path.join(output_dir, "val_metrics.tsv")
     training_stats_file_path = os.path.join(output_dir, "training_stats.tsv")
 
-    from .config import n_cores, dataloader_num_workers
+    from .config import (
+        n_cores,
+        dataloader_num_workers,
+        dataloader_prefetch_factor,
+        dataloader_persistent_workers,
+    )
     _worker_pool = ProcessPoolExecutor(max_workers=n_cores)
 
     # Temp files live alongside the output directory so they stay on the same drive
@@ -447,16 +477,22 @@ def train_model():
         beta_t  = _tensor_params(beta_vals_list, device)
 
         # --- DataLoader ---
+        print(
+            "DataLoader settings: "
+            f"workers={dataloader_num_workers}, prefetch={dataloader_prefetch_factor}, "
+            f"persistent={bool(dataloader_persistent_workers and dataloader_num_workers > 0)}"
+        )
         train_loader = torch.utils.data.DataLoader(
             _train_dataset,
             batch_size=slice_sub_batch_size,
             shuffle=True,
-            num_workers=dataloader_num_workers,
-            pin_memory=(device.type == "cuda"),
-            prefetch_factor=2 if dataloader_num_workers > 0 else None,
-            persistent_workers=False,
-            worker_init_fn=_dataloader_worker_init,
             drop_last=False,
+            **_loader_kwargs(
+                dataloader_num_workers,
+                dataloader_prefetch_factor,
+                dataloader_persistent_workers,
+                device,
+            ),
         )
         total_batches = len(train_loader)
 
@@ -469,20 +505,30 @@ def train_model():
         t0_train = time.perf_counter()
         total_train_slices = 0
         grad_norms = []
+        dataloader_wait_times = []
+        batch_compute_times = []
 
-        for batch_counter, batch in enumerate(train_loader, start=1):
+        train_iter = iter(train_loader)
+        next_batch_t0 = time.perf_counter()
+        for batch_counter in range(1, total_batches + 1):
+            batch = next(train_iter)
+            batch_t0 = time.perf_counter()
+            dataloader_wait_times.append(batch_t0 - next_batch_t0)
             # Unpack: (X, B_or_sentinel, Y, M, sample_name)
-            x_np, b_np, y_np, mask_np, _ = batch
-            x_batch_np   = x_np.numpy()
-            y_batch_np   = y_np.numpy()
-            mask_batch_np = mask_np.numpy().astype(np.float32)
+            x_cpu, b_cpu, y_cpu, mask_cpu, _ = batch
+            y_batch_np = y_cpu.numpy() if torch.is_tensor(y_cpu) else np.asarray(y_cpu)
+            if torch.is_tensor(mask_cpu):
+                mask_batch_np = mask_cpu.numpy().astype(np.float32)
+            else:
+                mask_batch_np = np.asarray(mask_cpu, dtype=np.float32)
 
-            x_batch = _to_input_tensor(x_batch_np, device)
+            x_batch = _to_input_tensor(x_cpu, device)
             if use_brainiac_fusion:
-                b_batch = _to_brainiac_tensor(b_np.numpy(), device)
+                b_batch = _to_brainiac_tensor(b_cpu, device)
             else:
                 b_batch = None
-            y_batch, y_onehot, mask_batch = _to_target_tensors(y_batch_np, mask_batch_np, device)
+            y_batch, y_onehot, mask_batch = _to_target_tensors(y_cpu, mask_cpu, device)
+            total_train_slices += int(x_batch.shape[0])
 
             with _autocast_context(device, use_amp):
                 output = model(x_batch, b_batch) if use_brainiac_fusion else model(x_batch)
@@ -531,21 +577,25 @@ def train_model():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 grad_norms.append(float(grad_norm.detach().cpu()))
-                total_train_slices += int(x_batch.shape[0])
 
                 probabilities = F.softmax(logits.detach(), dim=-1).cpu().numpy()
                 _update_prediction_metrics(train_acc, probabilities, y_batch_np, mask_batch_np)
 
             if (batch_counter % print_every_n_subbatches == 0) or (batch_counter == total_batches):
                 print(f"Completed {batch_counter}/{total_batches} training batches.")
+            batch_compute_times.append(time.perf_counter() - batch_t0)
+            next_batch_t0 = time.perf_counter()
 
         train_s = time.perf_counter() - t0_train
         slices_per_sec = total_train_slices / max(train_s, 1e-6)
         mean_grad_norm = float(np.mean(grad_norms)) if grad_norms else 0.0
+        mean_dataloader_wait_s = float(np.mean(dataloader_wait_times)) if dataloader_wait_times else 0.0
+        mean_batch_compute_s = float(np.mean(batch_compute_times)) if batch_compute_times else 0.0
         vram_used_mb, vram_peak_mb = get_vram_stats_mb()
         print(
             f"Epoch {epoch+1} training: {train_s:.1f}s, {slices_per_sec:.0f} slices/s, "
-            f"grad_norm={mean_grad_norm:.4f}, VRAM={vram_used_mb:.0f}/{vram_peak_mb:.0f} MB"
+            f"grad_norm={mean_grad_norm:.4f}, VRAM={vram_used_mb:.0f}/{vram_peak_mb:.0f} MB, "
+            f"loader_wait={mean_dataloader_wait_s:.4f}s, batch_compute={mean_batch_compute_s:.4f}s"
         )
 
         checkpoint_filename = get_checkpoint_name(epoch + 1)
@@ -601,23 +651,26 @@ def train_model():
                 val_dataset,
                 batch_size=slice_sub_batch_size,
                 shuffle=False,
-                num_workers=dataloader_num_workers,
-                pin_memory=(device.type == "cuda"),
-                prefetch_factor=2 if dataloader_num_workers > 0 else None,
-                persistent_workers=False,
-                worker_init_fn=_dataloader_worker_init,
+                **_loader_kwargs(
+                    dataloader_num_workers,
+                    dataloader_prefetch_factor,
+                    dataloader_persistent_workers,
+                    device,
+                ),
             )
 
             with torch.no_grad():
                 for val_batch in val_loader:
-                    x_np, b_np, y_np, mask_np, _ = val_batch
-                    x_val_np   = x_np.numpy()
-                    y_val_np   = y_np.numpy()
-                    mask_val_np = mask_np.numpy().astype(np.float32)
+                    x_cpu, b_cpu, y_cpu, mask_cpu, _ = val_batch
+                    y_val_np = y_cpu.numpy() if torch.is_tensor(y_cpu) else np.asarray(y_cpu)
+                    if torch.is_tensor(mask_cpu):
+                        mask_val_np = mask_cpu.numpy().astype(np.float32)
+                    else:
+                        mask_val_np = np.asarray(mask_cpu, dtype=np.float32)
 
-                    x_val = _to_input_tensor(x_val_np, device)
-                    b_val = _to_brainiac_tensor(b_np.numpy(), device) if use_brainiac_fusion else None
-                    _, y_val_onehot, mask_val = _to_target_tensors(y_val_np, mask_val_np, device)
+                    x_val = _to_input_tensor(x_cpu, device)
+                    b_val = _to_brainiac_tensor(b_cpu, device) if use_brainiac_fusion else None
+                    _, y_val_onehot, mask_val = _to_target_tensors(y_cpu, mask_cpu, device)
 
                     with _autocast_context(device, use_amp):
                         val_logits = model(x_val, b_val) if use_brainiac_fusion else model(x_val)
@@ -677,6 +730,8 @@ def train_model():
             learning_rate=learning_rate,
             vram_used_mb=vram_used_mb,
             vram_peak_mb=vram_peak_mb,
+            dataloader_wait_s=mean_dataloader_wait_s,
+            batch_compute_s=mean_batch_compute_s,
         )
 
     # End-of-training cleanup

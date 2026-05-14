@@ -14,7 +14,16 @@ def parse_train_parameters(config_file_path):
 
     config.output_dir = cfg_parser.get("DEFAULT", "output_dir")
     config.n_cores = cfg_parser.getint("DEFAULT", "n_cores")
-    config.dataloader_num_workers = cfg_parser.getint("DEFAULT", "dataloader_num_workers", fallback=2)
+    default_loader_workers = min(8, max(int(config.n_cores), 0)) if config.n_cores is not None else 2
+    config.dataloader_num_workers = cfg_parser.getint(
+        "DEFAULT", "dataloader_num_workers", fallback=default_loader_workers
+    )
+    config.dataloader_prefetch_factor = cfg_parser.getint(
+        "DEFAULT", "dataloader_prefetch_factor", fallback=4
+    )
+    config.dataloader_persistent_workers = cfg_parser.getboolean(
+        "DEFAULT", "dataloader_persistent_workers", fallback=(config.dataloader_num_workers > 0)
+    )
     config.slicing_plane = cfg_parser.get("DEFAULT", "slicing_plane")
     config.image_paths_files = cfg_parser.get("DEFAULT", "image_paths_files").split(',')
     config.gt_paths_file = cfg_parser.get("DEFAULT", "ground_truth_paths_files")

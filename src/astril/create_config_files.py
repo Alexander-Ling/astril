@@ -136,6 +136,7 @@ def create_config_files(
     # Determine number of CPU cores
     if nCpuCores is None:
         nCpuCores = max(multiprocessing.cpu_count() - 1, 1)
+    dataloader_num_workers = min(8, max(int(nCpuCores), 0))
 
     # Create directories
     workingDirectory = Path(workingDirectory).resolve()
@@ -306,6 +307,9 @@ def create_config_files(
         f.write("[DEFAULT]\n")
         f.write(f"output_dir = {workingDirectory}\n")
         f.write(f"n_cores = {nCpuCores}\n")
+        f.write(f"dataloader_num_workers = {dataloader_num_workers}\n")
+        f.write("dataloader_prefetch_factor = 4\n")
+        f.write("dataloader_persistent_workers = true\n")
         f.write(f"slicing_plane = {slicingPlane}\n")
         f.write(f"image_paths_files = {','.join(map(str, train_channel_cfg_files))}\n")
         f.write(f"ground_truth_paths_files = {train_gt_cfg_file}\n")

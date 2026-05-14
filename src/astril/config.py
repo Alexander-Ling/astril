@@ -27,7 +27,9 @@ rotation_degrees = 10.0
 
 output_dir = None
 n_cores = None
-dataloader_num_workers = 2
+dataloader_num_workers = None
+dataloader_prefetch_factor = 4
+dataloader_persistent_workers = True
 slicing_plane = None
 image_paths_files = None         # training channels file list (comma?separated list from create_config_files)
 gt_paths_file = None             # training ground truth file

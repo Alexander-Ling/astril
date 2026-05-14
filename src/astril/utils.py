@@ -853,22 +853,40 @@ def append_training_stats(
     learning_rate,
     vram_used_mb,
     vram_peak_mb,
+    dataloader_wait_s=None,
+    batch_compute_s=None,
 ):
     """
     Appends one row per epoch to training_stats.tsv.
     Writes header on first call (when file does not yet exist).
     """
-    mode = 'a' if os.path.exists(file_path) else 'w'
     header = (
         "Epoch\tDataLoad_s\tTrain_s\tVal_s\t"
-        "Slices_Per_Sec\tMean_Grad_Norm\tLR\tVRAM_Used_MB\tVRAM_Peak_MB\n"
+        "Slices_Per_Sec\tMean_Grad_Norm\tLR\tVRAM_Used_MB\tVRAM_Peak_MB\t"
+        "Mean_DataLoader_Wait_s\tMean_Batch_Compute_s\n"
     )
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+        existing_header = lines[0].rstrip("\n")
+        if "Mean_DataLoader_Wait_s" not in existing_header:
+            upgraded = [
+                existing_header + "\tMean_DataLoader_Wait_s\tMean_Batch_Compute_s\n"
+            ]
+            for line in lines[1:]:
+                upgraded.append(line.rstrip("\n") + "\tNA\tNA\n")
+            with open(file_path, "w") as f:
+                f.writelines(upgraded)
+
+    mode = 'a' if os.path.exists(file_path) else 'w'
     val_s_str = f"{val_s:.1f}" if val_s is not None else "NA"
+    wait_s_str = f"{dataloader_wait_s:.4f}" if dataloader_wait_s is not None else "NA"
+    compute_s_str = f"{batch_compute_s:.4f}" if batch_compute_s is not None else "NA"
     with open(file_path, mode) as f:
         if mode == 'w':
             f.write(header)
         f.write(
             f"{epoch}\t{data_load_s:.1f}\t{train_s:.1f}\t{val_s_str}\t"
             f"{slices_per_sec:.0f}\t{mean_grad_norm:.4f}\t{learning_rate:.6f}\t"
-            f"{vram_used_mb:.0f}\t{vram_peak_mb:.0f}\n"
+            f"{vram_used_mb:.0f}\t{vram_peak_mb:.0f}\t{wait_s_str}\t{compute_s_str}\n"
         )

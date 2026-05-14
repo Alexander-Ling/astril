@@ -711,6 +711,7 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         self.rotation_degrees             = float(rotation_degrees)
         self.has_brainiac                 = has_brainiac
         self._index = []          # list of (scan_idx, z_center)
+        self._scan_cache = {}
         self.class_weights = None
         self._build_index()
 
@@ -767,19 +768,46 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._index)
 
-    def __getitem__(self, i):
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_scan_cache"] = {}
+        return state
+
+    def _get_scan_arrays(self, scan_idx):
         import os as _os
-        scan_idx, z_center = self._index[i]
+        cached = self._scan_cache.get(scan_idx)
+        if cached is not None:
+            return cached
+
         tmp_dir = self.scan_temp_dirs[scan_idx]
+        meta = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
+        cached = {
+            "tmp_dir": tmp_dir,
+            "meta": meta,
+            "pad_amt": int(meta['pad_amt']),
+            "num_channels": int(meta['num_channels']),
+            "sample_name": str(meta['sample_name'][0]),
+            "vols": np.load(_os.path.join(tmp_dir, 'vols.npy'), mmap_mode='r'),
+            "gt": np.load(_os.path.join(tmp_dir, 'gt.npy'), mmap_mode='r'),
+            "mask": np.load(_os.path.join(tmp_dir, 'mask.npy'), mmap_mode='r'),
+            "brainiac": None,
+        }
+        if self.has_brainiac:
+            b_path = _os.path.join(tmp_dir, 'brainiac.npy')
+            if _os.path.exists(b_path):
+                cached["brainiac"] = np.load(b_path, mmap_mode='r')
+        self._scan_cache[scan_idx] = cached
+        return cached
 
-        meta         = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
-        pad_amt      = int(meta['pad_amt'])
-        num_channels = int(meta['num_channels'])
-        sample_name  = str(meta['sample_name'][0])
-
-        vols     = np.load(_os.path.join(tmp_dir, 'vols.npy'),  mmap_mode='r')  # (C, H, W, D)
-        gt_vol   = np.load(_os.path.join(tmp_dir, 'gt.npy'),    mmap_mode='r')
-        mask_vol = np.load(_os.path.join(tmp_dir, 'mask.npy'),  mmap_mode='r')
+    def __getitem__(self, i):
+        scan_idx, z_center = self._index[i]
+        arrays = self._get_scan_arrays(scan_idx)
+        pad_amt      = arrays["pad_amt"]
+        num_channels = arrays["num_channels"]
+        sample_name  = arrays["sample_name"]
+        vols         = arrays["vols"]  # (C, H, W, D)
+        gt_vol       = arrays["gt"]
+        mask_vol     = arrays["mask"]
 
         half_in  = self.num_input_slices  // 2
         half_out = self.num_output_slices // 2
@@ -803,11 +831,9 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
 
         # BrainIAC: sentinel zeros when absent so the tuple arity is always 5
         B_window = np.zeros((1,), dtype=np.float32)
-        if self.has_brainiac:
-            b_path = _os.path.join(tmp_dir, 'brainiac.npy')
-            if _os.path.exists(b_path):
-                brainiac_vol = np.load(b_path, mmap_mode='r')
-                B_window = brainiac_slice_for_center(brainiac_vol, z_center, pad_amt).copy()
+        brainiac_vol = arrays["brainiac"]
+        if self.has_brainiac and brainiac_vol is not None:
+            B_window = brainiac_slice_for_center(brainiac_vol, z_center, pad_amt).copy()
 
         # Augmentation (training only)
         if self.is_training:
