@@ -311,6 +311,11 @@ def train_model():
     from .config import n_cores, dataloader_num_workers
     _worker_pool = ProcessPoolExecutor(max_workers=n_cores)
 
+    # Temp files live alongside the output directory so they stay on the same drive
+    # as the input data, avoiding slow cross-drive writes via system %TEMP%.
+    _temp_base_dir = os.path.join(output_dir, "_astril_temp")
+    os.makedirs(_temp_base_dir, exist_ok=True)
+
     # Streaming state: temp dirs + dataset are owned here and cleaned up on reload/exit
     _train_temp_dirs = []
     _train_dataset = None
@@ -394,6 +399,7 @@ def train_model():
                 target_height=minimum_height_width,
                 target_width=minimum_height_width,
                 executor=_worker_pool,
+                temp_base_dir=_temp_base_dir,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
 
@@ -583,6 +589,7 @@ def train_model():
                 target_height=minimum_height_width,
                 target_width=minimum_height_width,
                 executor=_worker_pool,
+                temp_base_dir=_temp_base_dir,
             )
             val_loader = torch.utils.data.DataLoader(
                 val_dataset,
@@ -670,6 +677,7 @@ def train_model():
     if train_loader is not None:
         del train_loader
     _cleanup_temp_dirs(_train_temp_dirs)
+    shutil.rmtree(_temp_base_dir, ignore_errors=True)
     _worker_pool.shutdown(wait=False)
     print("Training completed.")
     log_file.close()

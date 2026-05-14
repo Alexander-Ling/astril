@@ -601,6 +601,7 @@ def _save_scan_volumes_to_temp(
     target_height,
     target_width,
     prefix="astril_vol_",
+    temp_base_dir=None,
 ):
     """
     Load and orient all NIfTI volumes for one scan, then write them to a temp
@@ -623,7 +624,7 @@ def _save_scan_volumes_to_temp(
     )
     relevant_z = np.where(np.any(mask_vol > 0, axis=(0, 1)))[0].astype(np.int32)
 
-    tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    tmp_dir = tempfile.mkdtemp(prefix=prefix, dir=temp_base_dir)
 
     if len(relevant_z) == 0:
         return tmp_dir, False, has_brainiac
@@ -852,11 +853,13 @@ def load_epoch_dataset(
     target_height,
     target_width,
     executor,
+    temp_base_dir=None,
 ):
     """
     Phase 1: load scan volumes in parallel via ProcessPoolExecutor into temp dirs.
     Phase 2: construct AstrilSliceDataset wrapping those dirs.
     Returns (dataset, temp_dirs).  Caller is responsible for shutil.rmtree on temp_dirs.
+    temp_base_dir: parent directory for temp scan dirs (defaults to system temp).
     """
     has_brainiac = brainiac_paths_list is not None
     futures = [
@@ -865,7 +868,7 @@ def load_epoch_dataset(
             idx, volume_paths_list, mask_paths, gt_paths,
             slicing_plane, num_input_slices, num_output_slices,
             brainiac_paths_list, target_height, target_width,
-            "astril_vol_train_",
+            "astril_vol_train_", temp_base_dir,
         )
         for idx in scan_indexes
     ]
@@ -904,6 +907,7 @@ def load_val_dataset(
     target_height,
     target_width,
     executor,
+    temp_base_dir=None,
 ):
     """Parallel volume loading for validation; returns (AstrilSliceDataset, temp_dirs)."""
     has_brainiac = brainiac_paths_list is not None
@@ -913,7 +917,7 @@ def load_val_dataset(
             idx, volume_paths_list, mask_paths, gt_paths,
             slicing_plane, num_input_slices, num_output_slices,
             brainiac_paths_list, target_height, target_width,
-            "astril_vol_val_",
+            "astril_vol_val_", temp_base_dir,
         )
         for idx in scan_indexes
     ]
