@@ -1,6 +1,8 @@
 import os
 import gc
 import random
+import shutil
+import tempfile
 import numpy as np
 import nibabel as nib
 import psutil
@@ -883,6 +885,73 @@ def load_val_slices(
         return X_scan_data, y_scan_data, mask_scan_data, z_indices_used, mask_info
 
 # -------------------------------------------------
+# Temp-file wrappers for ProcessPoolExecutor
+# (avoids Windows WinError 1450 caused by large IPC pipe transfers)
+# -------------------------------------------------
+def _load_train_slices_to_temp(
+    idx, volume_paths_list, mask_paths, gt_paths, slicing_plane,
+    num_input_slices, num_output_slices, class_multiplication_factors,
+    require_classes, use_flip_augmentation, use_intensity_augmentation,
+    intensity_augmentation_strength, brainiac_paths_list, target_height, target_width,
+):
+    result = load_train_slices(
+        idx, volume_paths_list, mask_paths, gt_paths, slicing_plane,
+        num_input_slices, num_output_slices, class_multiplication_factors,
+        require_classes, use_flip_augmentation, use_intensity_augmentation,
+        intensity_augmentation_strength, brainiac_paths_list, target_height, target_width,
+    )
+    use_brainiac = brainiac_paths_list is not None
+    if use_brainiac:
+        X_scan, B_scan, y_scan, m_scan, names_scan = result
+    else:
+        X_scan, y_scan, m_scan, names_scan = result
+        B_scan = []
+    tmp_dir = tempfile.mkdtemp(prefix="astril_scan_")
+    if X_scan:
+        np.save(os.path.join(tmp_dir, 'X.npy'), np.array(X_scan, dtype=np.float32))
+        np.save(os.path.join(tmp_dir, 'y.npy'), np.array(y_scan))
+        np.save(os.path.join(tmp_dir, 'm.npy'), np.array(m_scan))
+        np.save(os.path.join(tmp_dir, 'n.npy'), np.array(names_scan, dtype=object), allow_pickle=True)
+        if use_brainiac and B_scan:
+            np.save(os.path.join(tmp_dir, 'B.npy'), np.array(B_scan, dtype=np.float32))
+    return tmp_dir, bool(X_scan), use_brainiac
+
+
+def _load_val_slices_to_temp(
+    idx, volume_paths_list, mask_paths, gt_paths, slicing_plane,
+    num_input_slices, num_output_slices, return_transform_info,
+    target_height, target_width, brainiac_paths_list,
+):
+    result = load_val_slices(
+        idx, volume_paths_list, mask_paths, gt_paths, slicing_plane,
+        num_input_slices, num_output_slices, return_transform_info,
+        target_height=target_height, target_width=target_width,
+        brainiac_paths_list=brainiac_paths_list,
+    )
+    use_brainiac = brainiac_paths_list is not None
+    t_info = None
+    if use_brainiac and return_transform_info:
+        X_scan, B_scan, y_scan, m_scan, z_inds, t_info = result
+    elif use_brainiac:
+        X_scan, B_scan, y_scan, m_scan, z_inds = result
+    elif return_transform_info:
+        X_scan, y_scan, m_scan, z_inds, t_info = result
+        B_scan = []
+    else:
+        X_scan, y_scan, m_scan, z_inds = result
+        B_scan = []
+    tmp_dir = tempfile.mkdtemp(prefix="astril_val_")
+    if X_scan:
+        np.save(os.path.join(tmp_dir, 'X.npy'), np.array(X_scan, dtype=np.float32))
+        np.save(os.path.join(tmp_dir, 'y.npy'), np.array(y_scan))
+        np.save(os.path.join(tmp_dir, 'm.npy'), np.array(m_scan))
+        np.save(os.path.join(tmp_dir, 'z.npy'), np.array(z_inds, dtype=np.int32))
+        if use_brainiac and B_scan:
+            np.save(os.path.join(tmp_dir, 'B.npy'), np.array(B_scan, dtype=np.float32))
+    return tmp_dir, bool(X_scan), use_brainiac, t_info
+
+
+# -------------------------------------------------
 # Multi-threaded loaders for an epoch
 # -------------------------------------------------
 def load_epoch_data(
@@ -915,9 +984,10 @@ def load_epoch_data(
     if _own_executor:
         executor = ThreadPoolExecutor(max_workers=n_cores)
 
+    _submit_fn = load_train_slices if _own_executor else _load_train_slices_to_temp
     futures = [
         executor.submit(
-            load_train_slices,
+            _submit_fn,
             idx,
             volume_paths_list,
             mask_paths,
@@ -937,17 +1007,31 @@ def load_epoch_data(
         for idx in scan_indexes
     ]
     try:
-        for future in futures:
-            result = future.result()
-            if brainiac_paths_list is not None:
-                X_scan, B_scan, y_scan, m_scan, names_scan = result
-                B_epoch_list.extend(B_scan)
-            else:
-                X_scan, y_scan, m_scan, names_scan = result
-            X_epoch_list.extend(X_scan)
-            y_epoch_list.extend(y_scan)
-            mask_epoch_list.extend(m_scan)
-            sample_names_list.extend(names_scan)
+        if _own_executor:
+            for future in futures:
+                result = future.result()
+                if brainiac_paths_list is not None:
+                    X_scan, B_scan, y_scan, m_scan, names_scan = result
+                    B_epoch_list.extend(B_scan)
+                else:
+                    X_scan, y_scan, m_scan, names_scan = result
+                X_epoch_list.extend(X_scan)
+                y_epoch_list.extend(y_scan)
+                mask_epoch_list.extend(m_scan)
+                sample_names_list.extend(names_scan)
+        else:
+            for future in futures:
+                tmp_dir, has_data, _ = future.result()
+                if has_data:
+                    X_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'X.npy'))))
+                    y_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'y.npy'))))
+                    mask_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'm.npy'))))
+                    sample_names_list.extend(list(np.load(os.path.join(tmp_dir, 'n.npy'), allow_pickle=True)))
+                    if brainiac_paths_list is not None:
+                        b_path = os.path.join(tmp_dir, 'B.npy')
+                        if os.path.exists(b_path):
+                            B_epoch_list.extend(list(np.load(b_path)))
+                shutil.rmtree(tmp_dir, ignore_errors=True)
     finally:
         if _own_executor:
             executor.shutdown(wait=True)
@@ -1035,10 +1119,11 @@ def load_val_data(
     if _own_executor:
         executor = ThreadPoolExecutor(max_workers=n_cores)
 
+    _submit_fn = load_val_slices if _own_executor else _load_val_slices_to_temp
     futures = []
     for idx in scan_indexes:
         futures.append(executor.submit(
-            load_val_slices,
+            _submit_fn,
             idx,
             volume_paths_list,
             mask_paths,
@@ -1053,25 +1138,40 @@ def load_val_data(
         ))
 
     try:
-        for future in futures:
-            result = future.result()
-            if brainiac_paths_list is not None and return_transform_info:
-                (X_scan, B_scan, y_scan, m_scan, z_inds, t_info) = result
-                B_epoch_list.extend(B_scan)
-                transform_infos.append(t_info)
-            elif brainiac_paths_list is not None:
-                (X_scan, B_scan, y_scan, m_scan, z_inds) = result
-                B_epoch_list.extend(B_scan)
-            elif return_transform_info:
-                (X_scan, y_scan, m_scan, z_inds, t_info) = result
-                transform_infos.append(t_info)
-            else:
-                (X_scan, y_scan, m_scan, z_inds) = result
-
-            X_epoch_list.extend(X_scan)
-            y_epoch_list.extend(y_scan)
-            mask_epoch_list.extend(m_scan)
-            z_indices_all.extend(z_inds)
+        if _own_executor:
+            for future in futures:
+                result = future.result()
+                if brainiac_paths_list is not None and return_transform_info:
+                    (X_scan, B_scan, y_scan, m_scan, z_inds, t_info) = result
+                    B_epoch_list.extend(B_scan)
+                    transform_infos.append(t_info)
+                elif brainiac_paths_list is not None:
+                    (X_scan, B_scan, y_scan, m_scan, z_inds) = result
+                    B_epoch_list.extend(B_scan)
+                elif return_transform_info:
+                    (X_scan, y_scan, m_scan, z_inds, t_info) = result
+                    transform_infos.append(t_info)
+                else:
+                    (X_scan, y_scan, m_scan, z_inds) = result
+                X_epoch_list.extend(X_scan)
+                y_epoch_list.extend(y_scan)
+                mask_epoch_list.extend(m_scan)
+                z_indices_all.extend(z_inds)
+        else:
+            for future in futures:
+                tmp_dir, has_data, _, t_info = future.result()
+                if has_data:
+                    X_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'X.npy'))))
+                    y_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'y.npy'))))
+                    mask_epoch_list.extend(list(np.load(os.path.join(tmp_dir, 'm.npy'))))
+                    z_indices_all.extend(list(np.load(os.path.join(tmp_dir, 'z.npy'))))
+                    if brainiac_paths_list is not None:
+                        b_path = os.path.join(tmp_dir, 'B.npy')
+                        if os.path.exists(b_path):
+                            B_epoch_list.extend(list(np.load(b_path)))
+                if return_transform_info and t_info is not None:
+                    transform_infos.append(t_info)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
     finally:
         if _own_executor:
             executor.shutdown(wait=True)
