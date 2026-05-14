@@ -7,6 +7,7 @@ import pandas as pd
 import psutil
 import torch
 import torch.nn.functional as F
+from concurrent.futures import ProcessPoolExecutor
 
 from .config import (
     output_dir,
@@ -298,6 +299,9 @@ def train_model():
     val_metrics_file_path = os.path.join(output_dir, "val_metrics.tsv")
     training_stats_file_path = os.path.join(output_dir, "training_stats.tsv")
 
+    from .config import n_cores
+    _worker_pool = ProcessPoolExecutor(max_workers=n_cores)
+
     data_loading_counter = 0
     for epoch in range(starting_epoch, epochs):
         print("\n############################")
@@ -371,6 +375,7 @@ def train_model():
                 brainiac_paths_list=train_brainiac_paths_list if use_brainiac_fusion else None,
                 target_height=minimum_height_width,
                 target_width=minimum_height_width,
+                executor=_worker_pool,
             )
             if use_brainiac_fusion:
                 X_epoch_data, B_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, epoch_class_weights = epoch_data
@@ -541,6 +546,7 @@ def train_model():
                         brainiac_paths_list=val_brainiac_paths_list if use_brainiac_fusion else None,
                         target_height=minimum_height_width,
                         target_width=minimum_height_width,
+                        executor=_worker_pool,
                     )
                     if use_brainiac_fusion:
                         X_val_data, B_val_data, y_val_data, mask_val_data, _ = val_data
@@ -617,6 +623,7 @@ def train_model():
             vram_peak_mb=vram_peak_mb,
         )
 
+    _worker_pool.shutdown(wait=False)
     print("Training completed.")
     log_file.close()
 

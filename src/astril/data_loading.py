@@ -903,6 +903,7 @@ def load_epoch_data(
     brainiac_paths_list=None,
     target_height=minimum_height_width,
     target_width=minimum_height_width,
+    executor=None,
 ):
     X_epoch_list = []
     B_epoch_list = []
@@ -910,28 +911,32 @@ def load_epoch_data(
     mask_epoch_list = []
     sample_names_list = []
 
-    with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = [
-            executor.submit(
-                load_train_slices,
-                idx,
-                volume_paths_list,
-                mask_paths,
-                gt_paths,
-                slicing_plane,
-                num_input_slices,
-                num_output_slices,
-                class_multiplication_factors,
-                require_classes,
-                use_flip_augmentation,
-                use_intensity_augmentation,
-                intensity_augmentation_strength,
-                brainiac_paths_list,
-                target_height,
-                target_width,
-            )
-            for idx in scan_indexes
-        ]
+    _own_executor = executor is None
+    if _own_executor:
+        executor = ThreadPoolExecutor(max_workers=n_cores)
+
+    futures = [
+        executor.submit(
+            load_train_slices,
+            idx,
+            volume_paths_list,
+            mask_paths,
+            gt_paths,
+            slicing_plane,
+            num_input_slices,
+            num_output_slices,
+            class_multiplication_factors,
+            require_classes,
+            use_flip_augmentation,
+            use_intensity_augmentation,
+            intensity_augmentation_strength,
+            brainiac_paths_list,
+            target_height,
+            target_width,
+        )
+        for idx in scan_indexes
+    ]
+    try:
         for future in futures:
             result = future.result()
             if brainiac_paths_list is not None:
@@ -943,6 +948,9 @@ def load_epoch_data(
             y_epoch_list.extend(y_scan)
             mask_epoch_list.extend(m_scan)
             sample_names_list.extend(names_scan)
+    finally:
+        if _own_executor:
+            executor.shutdown(wait=True)
 
     if do_shuffle and len(X_epoch_list) > 0:
         if brainiac_paths_list is not None:
@@ -1006,6 +1014,7 @@ def load_val_data(
     target_height=minimum_height_width,
     target_width=minimum_height_width,
     brainiac_paths_list=None,
+    executor=None,
 ):
     """
     Multi-threaded loader for validation (or test) 2.5D slices.
@@ -1015,8 +1024,6 @@ def load_val_data(
     you'd only pass 1 subject in `scan_indexes` at a time
     during inference, but the code still supports multiple.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     X_epoch_list = []
     B_epoch_list = []
     y_epoch_list = []
@@ -1024,24 +1031,28 @@ def load_val_data(
     z_indices_all = []
     transform_infos = []
 
-    with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = []
-        for idx in scan_indexes:
-            futures.append(executor.submit(
-                load_val_slices,
-                idx,
-                volume_paths_list,
-                mask_paths,
-                gt_paths,
-                slicing_plane,
-                num_input_slices,
-                num_output_slices,
-                return_transform_info,
-                target_height=target_height,
-                target_width=target_width,
-                brainiac_paths_list=brainiac_paths_list,
-            ))
+    _own_executor = executor is None
+    if _own_executor:
+        executor = ThreadPoolExecutor(max_workers=n_cores)
 
+    futures = []
+    for idx in scan_indexes:
+        futures.append(executor.submit(
+            load_val_slices,
+            idx,
+            volume_paths_list,
+            mask_paths,
+            gt_paths,
+            slicing_plane,
+            num_input_slices,
+            num_output_slices,
+            return_transform_info,
+            target_height=target_height,
+            target_width=target_width,
+            brainiac_paths_list=brainiac_paths_list,
+        ))
+
+    try:
         for future in futures:
             result = future.result()
             if brainiac_paths_list is not None and return_transform_info:
@@ -1061,6 +1072,9 @@ def load_val_data(
             y_epoch_list.extend(y_scan)
             mask_epoch_list.extend(m_scan)
             z_indices_all.extend(z_inds)
+    finally:
+        if _own_executor:
+            executor.shutdown(wait=True)
 
     X_epoch_data = np.array(X_epoch_list, dtype=np.float32)
     B_epoch_data = np.array(B_epoch_list, dtype=np.float32) if brainiac_paths_list is not None else None
