@@ -457,7 +457,7 @@ def run_segmentation(
 
             model_uses_brainiac_fusion = getattr(model, "brainiac_input_channels", 0) > 0
             val_data = load_val_data(
-                scan_indexes=[subj_idx],
+                idx=subj_idx,
                 volume_paths_list=volume_paths_list,
                 mask_paths=mask_paths,
                 gt_paths=mask_paths,
@@ -473,7 +473,7 @@ def run_segmentation(
                 (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
             else:
                 (X_data, _, M_data, z_indices, transform_infos) = val_data
-            mask_info = transform_infos[0]
+            mask_info = transform_infos[0] if isinstance(transform_infos, (list, tuple)) else transform_infos
             val_gen = ValDataGenerator(
                 X_data, None, M_data, slice_batch_size,
                 brainiac_data=B_data if model_uses_brainiac_fusion else None,

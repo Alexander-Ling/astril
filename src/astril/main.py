@@ -109,6 +109,9 @@ def parse_train_parameters(config_file_path):
         config.val_mask_paths_file = cfg_parser.get("DEFAULT", "val_mask_paths_files")
 
     # Architecture flags
+    config.architecture_type = cfg_parser.get(
+        "DEFAULT", "architecture_type", fallback="dynamic_attention_resunet"
+    ).strip().lower()
     config.use_se_blocks = cfg_parser.getboolean("DEFAULT", "use_se_blocks", fallback=False)
     config.use_deep_supervision = cfg_parser.getboolean("DEFAULT", "use_deep_supervision", fallback=False)
     ds_weights_str = cfg_parser.get("DEFAULT", "deep_supervision_weights", fallback="0.5,0.25")

@@ -14,6 +14,7 @@ brainiac_encode_channels = "all"
 brainiac_encode_channel_indices = None
 
 # Architecture flags
+architecture_type = "dynamic_attention_resunet"
 use_se_blocks = False
 use_deep_supervision = False
 deep_supervision_weights = None     # list of floats e.g. [0.5, 0.25]

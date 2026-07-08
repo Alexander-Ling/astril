@@ -112,6 +112,11 @@ def download_models(overwrite: bool = False, only: Optional[List[str]] = None) -
     for e in entries:
         if not e.url:
             raise RuntimeError(f"No URL configured for '{e.filename}' in models.json")
+        if "REPLACE_WITH" in e.url:
+            raise RuntimeError(
+                f"Placeholder URL configured for '{e.filename}' in models.json. "
+                "Upload the packaged model archive to OSF and replace this with the OSF direct-download URL."
+            )
 
         dst = target / e.filename
         if dst.exists() and not overwrite:
@@ -176,7 +181,7 @@ def download_models(overwrite: bool = False, only: Optional[List[str]] = None) -
 
             final_size = tmp.stat().st_size
             if expected_total is not None and final_size != expected_total:
-                # short read — sleep a bit and try to resume
+                # short read; sleep a bit and try to resume
                 print(f"[warn] Short read for {e.filename}: got {final_size} of {expected_total} bytes; retrying...")
                 time.sleep(1.0 + random.random() * 0.5)
                 continue
@@ -202,7 +207,7 @@ def download_models(overwrite: bool = False, only: Optional[List[str]] = None) -
 
                 # --- Flatten a single top-level directory, if present ---
                 # e.g., archive contains "GBM_seg_v1/<files>" and extract_dir is ".../GBM_seg_v1"
-                # which would produce ".../GBM_seg_v1/GBM_seg_v1/<files>" — flatten that.
+                # which would produce ".../GBM_seg_v1/GBM_seg_v1/<files>"; flatten that.
                 names = zf.namelist()
                 top_levels = {n.split("/", 1)[0] for n in names if "/" in n}
                 if len(top_levels) == 1:
@@ -243,8 +248,6 @@ def cli_download(argv=None) -> None:
     p.add_argument("--keep-archives", action="store_true", help="Keep .zip archives after extraction")
     args = p.parse_args(argv)
     only = [s.strip() for s in args.only.split(",")] if args.only else None
-    #Temporary warning that newer model is coming
-    print(f"[astril -- WARNING] The currently downloadable model was trained on data preprocessed in a different manner than astril.preprocess_brain_mris -- it works poorly on astril preprocessed volumes. An updated model will be available shortly.")
     # Stash flag on the function for simple propagation without changing signature
     download_models._keep_archives = bool(args.keep_archives)  # type: ignore[attr-defined]
     out = download_models(overwrite=args.overwrite, only=only)

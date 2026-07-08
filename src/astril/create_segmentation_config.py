@@ -332,7 +332,7 @@ def create_segmentation_config(
     return str(seg_cfg_path)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate config files for MRI segmentation using multiple channels & models, with training configs for each model.")
     parser.add_argument("--workingDirectory", default=".", help="Directory to store generated config files.")
     parser.add_argument("--inputChannels", nargs="+", required=True,
@@ -365,7 +365,7 @@ if __name__ == "__main__":
                         help="Allow optional channels to be absent and zero-filled at inference time.")
     parser.add_argument("--silent", action="store_true", help="Suppress output messages.")
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     channel_alt_patterns = None
     if args.channel_alt_patterns is not None:
@@ -391,3 +391,7 @@ if __name__ == "__main__":
         optional_channels=args.optional_channels,
         allow_missing_optional_channels=args.allow_missing_optional_channels or bool(args.optional_channels),
     )
+
+
+if __name__ == "__main__":
+    main()

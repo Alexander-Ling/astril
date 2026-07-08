@@ -98,6 +98,7 @@ def create_config_files(
     numOutputSlices=1,
     slicingPlane="axial",
     minimum_height_width=240,
+    architecture_type="dynamic_attention_resunet",
     base_num_filters=32,
     center_depth=1,
     encoder_level_factors=[1, 2, 4, 8],
@@ -367,6 +368,7 @@ def create_config_files(
         f.write(f"num_input_slices = {numInputSlices}\n")
         f.write(f"num_output_slices = {numOutputSlices}\n")
         f.write(f"minimum_height_width = {minimum_height_width}\n")
+        f.write(f"architecture_type = {architecture_type}\n")
         f.write(f"channel_names = {','.join(trainChannels)}\n")
         f.write(f"optional_channels = {','.join(optional_channels)}\n")
         dropout_str = ",".join(f"{k}:{v:g}" for k, v in dropout_map.items())
@@ -426,6 +428,9 @@ def main():
     parser.add_argument("--numOutputSlices", type=int, default=1, help="Number of segmented slices output from cnn model each cycle.")
     parser.add_argument("--slicingPlane", default="axial", choices=["axial", "sagittal", "coronal"], help="Slicing plane.")
     parser.add_argument("--minimum_height_width", type=int, default=240, help="Minimum height or width of slice for training (in pixels).")
+    parser.add_argument("--architecture_type", default="dynamic_attention_resunet",
+                        choices=["dynamic_attention_resunet", "tf_dynamic_attention_resunet", "brainiac_encoder_fusion"],
+                        help="Model architecture type to write into train_parameters.cfg.")
     parser.add_argument("--base_num_filters", type=int, default=32, help="Base number of filters in first encoder layer.")
     parser.add_argument("--center_depth", type=int, default=1, help="Number of center bottleneck blocks to include in UNET model.")
     parser.add_argument("--encoder_level_factors", type=str, default="1,2,4,8",
@@ -513,6 +518,7 @@ def main():
         numOutputSlices=args.numOutputSlices,
         slicingPlane=args.slicingPlane,
         minimum_height_width=args.minimum_height_width,
+        architecture_type=args.architecture_type,
         base_num_filters=args.base_num_filters,
         center_depth=args.center_depth,
         encoder_level_factors=encoder_level_factors,

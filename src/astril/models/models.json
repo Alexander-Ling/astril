@@ -1,6 +1,6 @@
 {
-  "GBM_seg_v1.zip": {
-    "bytes": 1429228910,
+  "GBM_seg_v1_pytorch.zip": {
+    "bytes": 473754730,
     "expect": [
       "Axial_1.pt",
       "Axial_1_train_parameters.cfg",
@@ -17,8 +17,8 @@
     ],
     "extract_to": "GBM_seg_v1",
     "kind": "pytorch_zip",
-    "sha256": "b169e36cfa7df532da4c0efc36a0cd1523a63a5fea880b00d52edc705e32b61c",
-    "url": "https://osf.io/download/tkfwe/",
-    "version": "2025-09-19T13:45:01Z"
+    "sha256": "e8fdcdf6c8b62e51f2cd386171cae48e9a49cd76c4618e92d76b53c9c5e5ff72",
+    "url": "https://osf.io/download/REPLACE_WITH_PYTORCH_GBM_SEG_V1/",
+    "version": "2026-05-15T00:00:00Z"
   }
 }

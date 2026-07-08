@@ -10,7 +10,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
 ]
 name = "astril"
-version = "0.7.17"
+version = "0.7.18"
 description = "Automated segmentation toolkit for radiology image libraries. Currently optimized for MRI brain image processing. Specifically, performs automatic scan selection of DICOM series, conversion to NIFTI/NRRD formats, preprocessing (co-registration, skull stripping, normalization), and GBM segmentation. Also includes robust toolset to train new segmentation models, and generalized functions for processing radiomic images."
 authors = [{name = "Alexander Ling", email = "alexander.l.ling@gmail.com"}]
 dependencies = [
@@ -48,6 +48,7 @@ preprocess_brain_mris = "astril.preprocess_brain_mris:main"
 convert-dicom-series = "astril.dicom_conversion:main"
 astril-make-models-json = "astril.models_manifest:cli_make_models_json"
 astril-download-models = "astril.models_download:cli_download"
+astril-convert-tf-savedmodel = "astril.convert_tf_savedmodel_to_pt:main"
 
 [tool.setuptools]
 include-package-data = true
