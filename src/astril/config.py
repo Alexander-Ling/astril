@@ -3,6 +3,18 @@
 # Mixed precision (float16 for RTX tensor cores)
 use_mixed_precision = False
 
+# DINOv3
+use_dinov3_embeddings = False
+dinov3_model_name = "dinov3_vitb16"
+dinov3_hub_repo = None           # path to local DINOv3 repo clone (for torch.hub)
+dinov3_weights = None            # path or URL to DINOv3 weights (for torch.hub)
+dinov3_hf_model_id = None        # HuggingFace model ID (alternative to hub)
+dinov3_fusion_levels = None      # list of encoder level indices; None = auto (all except 0)
+dinov3_hook_blocks = None        # list of ViT block indices; None = auto
+dinov3_num_input_channels = None # MRI channels to project to 3; None = use all
+dinov3_frozen = True             # freeze DINOv3 backbone during training
+dinov3_frozen_epochs = None      # unfreeze DINOv3 after this many epochs (None = stay frozen)
+
 # BrainIAC
 use_brainiac_embeddings = False
 brainiac_weights_path = None        # path to .ckpt if user supplies manually

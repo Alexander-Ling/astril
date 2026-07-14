@@ -2,7 +2,9 @@ import gc
 import atexit
 import math
 import os
+import re
 import shutil
+import tempfile
 import time
 import numpy as np
 import pandas as pd
@@ -45,6 +47,8 @@ from .config import (
     channel_names,
     optional_channels,
     channel_dropout_probabilities,
+    use_dinov3_embeddings,
+    dinov3_frozen_epochs,
 )
 from .data_loading import (
     read_paths_from_file,
@@ -182,21 +186,76 @@ def _load_checkpoint(path, device):
         return torch.load(path, map_location=device)
 
 
+def _tensors_are_finite(value):
+    """Return False if any tensor nested in a checkpoint contains NaN/Inf."""
+    if torch.is_tensor(value):
+        return bool(torch.isfinite(value).all().item())
+    if isinstance(value, dict):
+        return all(_tensors_are_finite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_tensors_are_finite(item) for item in value)
+    return True
+
+
+def _checkpoint_is_valid(path, device):
+    try:
+        checkpoint = _load_checkpoint(path, device)
+        return (
+            isinstance(checkpoint, dict)
+            and _tensors_are_finite(checkpoint.get("model_state_dict", {}))
+            and _tensors_are_finite(checkpoint.get("optimizer_state_dict", {}))
+        )
+    except Exception as exc:
+        print(f"WARNING: Could not validate checkpoint {path}: {exc}")
+        return False
+
+
+def _latest_valid_checkpoint(checkpoint_dir, device):
+    candidates = []
+    for name in os.listdir(checkpoint_dir) if os.path.isdir(checkpoint_dir) else []:
+        match = re.match(r"^epoch_(\d+)\.pt$", name)
+        if match:
+            candidates.append((int(match.group(1)), os.path.join(checkpoint_dir, name)))
+    for epoch, path in sorted(candidates, reverse=True):
+        if _checkpoint_is_valid(path, device):
+            return path
+        print(f"WARNING: Ignoring non-finite or unreadable checkpoint {path} (epoch {epoch}).")
+    return None
+
+
+def _model_parameters_are_finite(model):
+    return all(torch.isfinite(parameter).all().item() for parameter in model.parameters())
+
+
+def _accumulation_window_size(batch_counter, total_batches, accumulate_n_sub_batches):
+    window_start = ((batch_counter - 1) // accumulate_n_sub_batches) * accumulate_n_sub_batches + 1
+    window_end = min(window_start + accumulate_n_sub_batches - 1, total_batches)
+    return window_end - window_start + 1
+
+
 def _save_checkpoint(path, model, optimizer, epoch):
-    torch.save(
-        {
-            "epoch": epoch,
-            "architecture": model.architecture_config(),
-            "channel_metadata": {
-                "channel_names": list(channel_names or []),
-                "optional_channels": list(optional_channels or []),
-                "channel_dropout_probabilities": dict(channel_dropout_probabilities or {}),
-            },
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+    checkpoint = {
+        "epoch": epoch,
+        "architecture": model.architecture_config(),
+        "channel_metadata": {
+            "channel_names": list(channel_names or []),
+            "optional_channels": list(optional_channels or []),
+            "channel_dropout_probabilities": dict(channel_dropout_probabilities or {}),
         },
-        path,
-    )
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if not _tensors_are_finite(checkpoint):
+        raise RuntimeError(f"Refusing to save non-finite checkpoint for epoch {epoch}.")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".checkpoint_", suffix=".pt", dir=os.path.dirname(path))
+    os.close(fd)
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def _load_model_from_checkpoint(path, device):
@@ -306,7 +365,7 @@ def train_model():
 
     model_subdir = os.path.join(output_dir, "saved_models")
     os.makedirs(model_subdir, exist_ok=True)
-    latest_checkpoint = get_latest_checkpoint(model_subdir)
+    latest_checkpoint = _latest_valid_checkpoint(model_subdir, device)
 
     optimizer_checkpoint = None
     if latest_checkpoint:
@@ -332,7 +391,27 @@ def train_model():
         model = create_dynamic_unet_from_config().to(device)
         starting_epoch = 0
 
-    optimizer = torch.optim.Adam(model.parameters())
+    # Track whether DINOv3 has been unfrozen during this training run
+    _dinov3_unfrozen = use_dinov3_embeddings and not getattr(model, "dinov3_frozen", True)
+    _dinov3_lr_scale = 0.1  # relative LR for DINOv3 param group vs main schedule
+
+    if _dinov3_unfrozen and hasattr(model, "dinov3"):
+        # DINOv3 was already unfrozen in a prior run. Recreate the same two-group optimizer
+        # structure that was saved in the checkpoint (group 0: non-DINOv3, group 1: DINOv3).
+        dinov3_param_ids = {id(p) for p in model.dinov3.parameters()}
+        main_params = [
+            p for p in model.parameters()
+            if p.requires_grad and id(p) not in dinov3_param_ids
+        ]
+        dinov3_params = [p for p in model.dinov3.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam([
+            {"params": main_params},
+            {"params": dinov3_params},
+        ])
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params)
+
     if optimizer_checkpoint and "optimizer_state_dict" in optimizer_checkpoint:
         optimizer.load_state_dict(optimizer_checkpoint["optimizer_state_dict"])
 
@@ -422,9 +501,34 @@ def train_model():
         label_smoothing = parsed["label_smoothing"]
         ds_loss_weight = parsed["deep_supervision_loss_weight"]
 
-        for group in optimizer.param_groups:
-            group["lr"] = learning_rate
+        for i, group in enumerate(optimizer.param_groups):
+            # Last param group is DINOv3 backbone (added after unfreeze) — keep at relative scale
+            if _dinov3_unfrozen and i == len(optimizer.param_groups) - 1:
+                group["lr"] = learning_rate * _dinov3_lr_scale
+            else:
+                group["lr"] = learning_rate
         print(f"  Effective LR: {learning_rate:.6f}")
+
+        # --- DINOv3 selective unfreeze ---
+        if (
+            use_dinov3_embeddings
+            and not _dinov3_unfrozen
+            and dinov3_frozen_epochs is not None
+            and (epoch + 1) > dinov3_frozen_epochs
+            and hasattr(model, "set_dinov3_frozen")
+        ):
+            model.set_dinov3_frozen(False)
+            _dinov3_unfrozen = True
+            dinov3_finetune_lr = learning_rate * 0.1
+            _dinov3_lr_scale = 0.1
+            optimizer.add_param_group({
+                "params": list(model.dinov3.parameters()),
+                "lr": dinov3_finetune_lr,
+            })
+            print(
+                f"  DINOv3 backbone unfrozen at epoch {epoch + 1}. "
+                f"Added to optimizer with LR={dinov3_finetune_lr:.2e} ({_dinov3_lr_scale:.0%} of main LR)"
+            )
 
         # --- Data loading / reuse decision ---
         data_loading_counter += 1
@@ -569,6 +673,10 @@ def train_model():
             y_batch, y_onehot, mask_batch = _to_target_tensors(y_cpu, mask_cpu, device)
             total_train_slices += int(x_batch.shape[0])
 
+            accumulation_window_size = _accumulation_window_size(
+                batch_counter, total_batches, accumulate_n_sub_batches
+            )
+
             with _autocast_context(device, use_amp):
                 output = model(x_batch, b_batch) if use_brainiac_fusion else model(x_batch)
                 if use_deep_supervision:
@@ -602,18 +710,44 @@ def train_model():
                         )
                         loss_value = loss_value + ds_loss_weight * ds_weights[i] * aux_loss
 
-            scaler.scale(loss_value).backward()
+            if not torch.isfinite(logits).all().item() or not torch.isfinite(loss_value).all().item():
+                raise FloatingPointError(
+                    f"Non-finite training output at epoch {epoch + 1}, batch {batch_counter}/{total_batches}; "
+                    f"learning_rate={learning_rate:.6g}, loss={loss_value.detach().float().item()}"
+                )
+
+            # Average each accumulation window, including a shorter final window.
+            scaled_loss_value = loss_value / float(accumulation_window_size)
+            scaler.scale(scaled_loss_value).backward()
             _update_loss_metrics(train_acc, loss_value.detach().float().cpu(), loss_per_class.detach().float())
 
             is_update_batch = (batch_counter % accumulate_n_sub_batches == 0) or (batch_counter == total_batches)
             if is_update_batch:
                 scaler.unscale_(optimizer)
+                nonfinite_gradients = [
+                    name for name, parameter in model.named_parameters()
+                    if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item()
+                ]
+                if nonfinite_gradients:
+                    raise FloatingPointError(
+                        f"Non-finite gradient at epoch {epoch + 1}, batch {batch_counter}/{total_batches}; "
+                        f"learning_rate={learning_rate:.6g}, parameters={nonfinite_gradients[:5]}"
+                    )
                 if gradient_clip_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), gradient_clip_norm, error_if_nonfinite=True
+                    )
                 else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), float("inf"), error_if_nonfinite=True
+                    )
                 scaler.step(optimizer)
                 scaler.update()
+                if not _model_parameters_are_finite(model):
+                    raise FloatingPointError(
+                        f"Non-finite model parameter after update at epoch {epoch + 1}, "
+                        f"batch {batch_counter}/{total_batches}; learning_rate={learning_rate:.6g}"
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 grad_norms.append(float(grad_norm.detach().cpu()))
 

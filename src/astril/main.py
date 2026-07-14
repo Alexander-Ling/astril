@@ -130,12 +130,36 @@ def parse_train_parameters(config_file_path):
     # Mixed precision
     config.use_mixed_precision = cfg_parser.getboolean("DEFAULT", "use_mixed_precision", fallback=False)
 
+    def _none_str(raw):
+        return None if raw in (None, "", "None", "none", "na") else raw
+
+    # DINOv3
+    config.use_dinov3_embeddings = cfg_parser.getboolean("DEFAULT", "use_dinov3_embeddings", fallback=False)
+    config.dinov3_model_name = cfg_parser.get("DEFAULT", "dinov3_model_name", fallback="dinov3_vitb16").strip()
+    config.dinov3_hub_repo = _none_str(cfg_parser.get("DEFAULT", "dinov3_hub_repo", fallback=None))
+    config.dinov3_weights = _none_str(cfg_parser.get("DEFAULT", "dinov3_weights", fallback=None))
+    config.dinov3_hf_model_id = _none_str(cfg_parser.get("DEFAULT", "dinov3_hf_model_id", fallback=None))
+    config.dinov3_num_input_channels = (
+        cfg_parser.getint("DEFAULT", "dinov3_num_input_channels", fallback=0) or None
+    )
+    config.dinov3_frozen = cfg_parser.getboolean("DEFAULT", "dinov3_frozen", fallback=True)
+    config.dinov3_frozen_epochs = (
+        cfg_parser.getint("DEFAULT", "dinov3_frozen_epochs", fallback=0) or None
+    )
+    _dinov3_fusion_levels_raw = cfg_parser.get("DEFAULT", "dinov3_fusion_levels", fallback="").strip()
+    config.dinov3_fusion_levels = (
+        [int(x.strip()) for x in _dinov3_fusion_levels_raw.split(",") if x.strip()]
+        if _dinov3_fusion_levels_raw else None
+    )
+    _dinov3_hook_blocks_raw = cfg_parser.get("DEFAULT", "dinov3_hook_blocks", fallback="").strip()
+    config.dinov3_hook_blocks = (
+        [int(x.strip()) for x in _dinov3_hook_blocks_raw.split(",") if x.strip()]
+        if _dinov3_hook_blocks_raw else None
+    )
+
     # BrainIAC
     config.use_brainiac_embeddings = cfg_parser.getboolean("DEFAULT", "use_brainiac_embeddings", fallback=False)
     config.brainiac_embedding_type = cfg_parser.get("DEFAULT", "brainiac_embedding_type", fallback="encoder_fusion")
-
-    def _none_str(raw):
-        return None if raw in (None, "", "None", "none", "na") else raw
 
     train_bif = _none_str(cfg_parser.get("DEFAULT", "brainiac_feature_paths_files", fallback=None))
     val_bif = _none_str(cfg_parser.get("DEFAULT", "val_brainiac_feature_paths_files", fallback=None))
@@ -232,6 +256,23 @@ def main():
                         help="Enable float16 mixed precision for RTX tensor cores. "
                              "Halves activation VRAM and enables tensor-core utilisation.")
 
+    # DINOv3
+    parser.add_argument(
+        "--DINOv3_Hub_Repo",
+        type=str,
+        default=None,
+        help=(
+            "Path to a local DINOv3 repository clone for torch.hub loading. "
+            "If not provided, the value from train_parameters.cfg (dinov3_hub_repo) is used."
+        ),
+    )
+    parser.add_argument(
+        "--DINOv3_Weights",
+        type=str,
+        default=None,
+        help="Path or URL to DINOv3 weights (.pth). Overrides dinov3_weights in the config.",
+    )
+
     # BrainIAC
     parser.add_argument("--BrainIAC_Weights_Path", type=str, default=None,
                         help=(
@@ -273,6 +314,10 @@ def main():
         config.use_rotation_augmentation = True
     if args.rotation_degrees is not None:
         config.rotation_degrees = args.rotation_degrees
+    if args.DINOv3_Hub_Repo is not None:
+        config.dinov3_hub_repo = args.DINOv3_Hub_Repo
+    if args.DINOv3_Weights is not None:
+        config.dinov3_weights = args.DINOv3_Weights
 
     # Write any CLI-overridden architecture/augmentation flags back to the .cfg
     # so the saved config accurately reflects what was actually used for training.

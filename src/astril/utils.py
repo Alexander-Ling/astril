@@ -515,6 +515,15 @@ def combined_focal_tversky_wce_loss(
     # 1) Weighted Cross Entropy for each class
     # ------------------------------------------------------
     # Apply label smoothing to one-hot targets before WCE (Tversky uses original targets)
+    # The reductions below can span millions of pixels. Keep the loss in FP32
+    # even when the model forward pass is running under CUDA autocast.
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    mask = mask.float()
+    class_weights = torch.as_tensor(class_weights, dtype=torch.float32, device=y_pred.device)
+    alpha_vals = torch.as_tensor(alpha_vals, dtype=torch.float32, device=y_pred.device)
+    beta_vals = torch.as_tensor(beta_vals, dtype=torch.float32, device=y_pred.device)
+
     if label_smoothing > 0.0:
         num_classes_ls = float(y_true.shape[-1])
         y_true_smooth = y_true * (1.0 - label_smoothing) + label_smoothing / num_classes_ls
@@ -525,10 +534,6 @@ def combined_focal_tversky_wce_loss(
 
     boolean_mask = (mask[..., 0] > 0.5).to(dtype=y_pred.dtype)
     valid_pixels = torch.sum(boolean_mask) + smooth
-    class_weights = torch.as_tensor(class_weights, dtype=y_pred.dtype, device=y_pred.device)
-    alpha_vals = torch.as_tensor(alpha_vals, dtype=y_pred.dtype, device=y_pred.device)
-    beta_vals = torch.as_tensor(beta_vals, dtype=y_pred.dtype, device=y_pred.device)
-
     num_classes = y_true.shape[-1]
 
     per_class_wce_sum = []
