@@ -1,7 +1,8 @@
 # These all get dynamically assigned by the loaded config files
 
-# Mixed precision (float16 for RTX tensor cores)
+# Mixed precision (auto prefers bfloat16 when supported)
 use_mixed_precision = False
+mixed_precision_dtype = "auto"
 
 # DINOv3
 use_dinov3_embeddings = False

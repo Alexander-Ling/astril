@@ -129,6 +129,14 @@ def parse_train_parameters(config_file_path):
 
     # Mixed precision
     config.use_mixed_precision = cfg_parser.getboolean("DEFAULT", "use_mixed_precision", fallback=False)
+    config.mixed_precision_dtype = cfg_parser.get(
+        "DEFAULT", "mixed_precision_dtype", fallback="auto"
+    ).strip().lower()
+    if config.mixed_precision_dtype not in {"auto", "bf16", "fp16"}:
+        raise ValueError(
+            "mixed_precision_dtype must be one of: auto, bf16, fp16; "
+            f"got {config.mixed_precision_dtype!r}"
+        )
 
     def _none_str(raw):
         return None if raw in (None, "", "None", "none", "na") else raw
@@ -253,8 +261,14 @@ def main():
 
     # Mixed precision
     parser.add_argument("--Use_Mixed_Precision", action="store_true",
-                        help="Enable float16 mixed precision for RTX tensor cores. "
-                             "Halves activation VRAM and enables tensor-core utilisation.")
+                        help="Enable mixed precision for CUDA tensor cores. "
+                             "Uses BF16 when supported unless overridden.")
+    parser.add_argument(
+        "--Mixed_Precision_Dtype",
+        choices=("auto", "bf16", "fp16"),
+        default=None,
+        help="Mixed-precision dtype. 'auto' prefers BF16 and falls back to FP16.",
+    )
 
     # DINOv3
     parser.add_argument(
@@ -302,6 +316,9 @@ def main():
         config.minimum_height_width = args.minimum_height_width
     if args.Use_Mixed_Precision:
         config.use_mixed_precision = True
+    if args.Mixed_Precision_Dtype is not None:
+        config.use_mixed_precision = True
+        config.mixed_precision_dtype = args.Mixed_Precision_Dtype
     if args.Use_SE_Blocks:
         config.use_se_blocks = True
     if args.Use_Deep_Supervision:
@@ -325,6 +342,9 @@ def main():
     cfg_updates = {}
     if args.Use_Mixed_Precision:
         cfg_updates["use_mixed_precision"] = "true"
+    if args.Mixed_Precision_Dtype is not None:
+        cfg_updates["use_mixed_precision"] = "true"
+        cfg_updates["mixed_precision_dtype"] = args.Mixed_Precision_Dtype
     if args.Use_SE_Blocks:
         cfg_updates["use_se_blocks"] = "true"
     if args.Use_Deep_Supervision:

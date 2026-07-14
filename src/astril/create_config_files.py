@@ -395,6 +395,7 @@ def create_config_files(
         f.write("brainiac_encoder_input_channels = 0\n")
         # Mixed precision (default off; safe to enable on CUDA hardware)
         f.write("use_mixed_precision = false\n")
+        f.write("mixed_precision_dtype = auto\n")
         # Augmentation flags
         f.write(f"use_flip_augmentation = {str(bool(use_flip_augmentation)).lower()}\n")
         f.write(f"use_intensity_augmentation = {str(bool(use_intensity_augmentation)).lower()}\n")

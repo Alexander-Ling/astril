@@ -1,5 +1,6 @@
 import gc
 import atexit
+import contextlib
 import math
 import os
 import re
@@ -40,6 +41,7 @@ from .config import (
     use_deep_supervision,
     deep_supervision_weights,
     use_mixed_precision,
+    mixed_precision_dtype,
     use_brainiac_embeddings,
     brainiac_embedding_type,
     brainiac_feature_paths_files,
@@ -145,6 +147,11 @@ def _update_prediction_metrics(acc, probabilities, y_batch, mask_batch):
         acc["correct_by_class"][c] += np.sum(pred_c & gt_c)
         acc["gt_count_by_class"][c] += np.sum(gt_c)
         acc["pred_count_by_class"][c] += np.sum(pred_c)
+
+
+def _probabilities_for_metrics(logits):
+    """Convert logits to NumPy probabilities through FP32 for BF16 compatibility."""
+    return F.softmax(logits.detach().float(), dim=-1).cpu().numpy()
 
 
 def _update_loss_metrics(acc, loss_value, loss_per_class):
@@ -267,8 +274,113 @@ def _load_model_from_checkpoint(path, device):
     return model, checkpoint, epoch
 
 
-def _autocast_context(device, enabled):
-    return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled)
+def _resolve_mixed_precision(device, enabled, requested_dtype):
+    if not enabled or device.type != "cuda":
+        return False, None, "disabled"
+
+    requested = str(requested_dtype or "auto").strip().lower()
+    if requested not in {"auto", "bf16", "fp16"}:
+        raise ValueError(
+            "mixed_precision_dtype must be one of: auto, bf16, fp16; "
+            f"got {requested_dtype!r}"
+        )
+    if requested == "auto":
+        requested = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+    if requested == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("BF16 mixed precision was requested but is not supported by this CUDA device.")
+        return True, torch.bfloat16, "bf16"
+    return True, torch.float16, "fp16"
+
+
+def _autocast_context(device, enabled, dtype):
+    if not enabled:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
+
+
+def _sample_names_text(sample_names, limit=5):
+    if isinstance(sample_names, str):
+        names = [sample_names]
+    elif isinstance(sample_names, (list, tuple)):
+        names = [str(name) for name in sample_names]
+    else:
+        names = [str(sample_names)]
+    suffix = ", ..." if len(names) > limit else ""
+    return ", ".join(names[:limit]) + suffix
+
+
+def _tensor_range(tensor):
+    detached = tensor.detach()
+    finite = detached[torch.isfinite(detached)]
+    if finite.numel() == 0:
+        return "no finite values"
+    return f"min={finite.min().item():.6g}, max={finite.max().item():.6g}"
+
+
+def _validate_batch_inputs(x, brainiac, mask, sample_names, context):
+    tensors = [("input", x), ("mask", mask)]
+    if brainiac is not None:
+        tensors.append(("brainiac", brainiac))
+    invalid = [name for name, tensor in tensors if not torch.isfinite(tensor).all().item()]
+    if invalid:
+        summaries = "; ".join(
+            f"{name}: {_tensor_range(tensor)}" for name, tensor in tensors
+        )
+        raise FloatingPointError(
+            f"Non-finite {context} batch input(s) {invalid}; "
+            f"samples=[{_sample_names_text(sample_names)}]; {summaries}"
+        )
+
+
+def _compute_model_loss(
+    model,
+    x,
+    brainiac,
+    y_onehot,
+    mask,
+    class_weights,
+    alpha,
+    beta,
+    tversky_gamma,
+    wce_weight,
+    label_smoothing,
+    use_brainiac_fusion,
+    use_deep_supervision,
+    ds_loss_weight,
+):
+    output = model(x, brainiac) if use_brainiac_fusion else model(x)
+    if use_deep_supervision:
+        logits, aux_outputs = output
+    else:
+        logits, aux_outputs = output, []
+    loss_value, loss_per_class = combined_focal_tversky_wce_loss(
+        y_onehot,
+        logits,
+        mask,
+        class_weights,
+        alpha,
+        beta,
+        gamma=tversky_gamma,
+        wce_weight=wce_weight,
+        label_smoothing=label_smoothing,
+    )
+    if use_deep_supervision and aux_outputs:
+        ds_weights = deep_supervision_weights if deep_supervision_weights else [0.5, 0.25]
+        for i, aux in enumerate(aux_outputs):
+            aux_loss, _ = combined_focal_tversky_wce_loss(
+                y_onehot,
+                aux,
+                mask,
+                class_weights,
+                alpha,
+                beta,
+                gamma=tversky_gamma,
+                wce_weight=wce_weight,
+                label_smoothing=label_smoothing,
+            )
+            loss_value = loss_value + ds_loss_weight * ds_weights[i] * aux_loss
+    return logits, loss_value, loss_per_class
 
 
 def _cleanup_temp_dirs(temp_dirs):
@@ -415,9 +527,15 @@ def train_model():
     if optimizer_checkpoint and "optimizer_state_dict" in optimizer_checkpoint:
         optimizer.load_state_dict(optimizer_checkpoint["optimizer_state_dict"])
 
-    use_amp = bool(use_mixed_precision and device.type == "cuda")
-    scaler = torch.amp.GradScaler(device='cuda', enabled=use_amp)
-    print(f"Mixed precision enabled: {use_amp}")
+    use_amp, amp_dtype, amp_dtype_name = _resolve_mixed_precision(
+        device, use_mixed_precision, mixed_precision_dtype
+    )
+    use_grad_scaler = bool(use_amp and amp_dtype == torch.float16)
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_grad_scaler)
+    print(
+        f"Mixed precision enabled: {use_amp}"
+        + (f" (dtype={amp_dtype_name}, grad_scaler={use_grad_scaler})" if use_amp else "")
+    )
 
     dummy_input_shape = (1, num_channels * num_input_slices, minimum_height_width, minimum_height_width)
     with torch.no_grad():
@@ -650,6 +768,8 @@ def train_model():
         grad_norms = []
         dataloader_wait_times = []
         batch_compute_times = []
+        epoch_amp_enabled = use_amp
+        amp_fallback_count = 0
 
         train_iter = iter(train_loader)
         next_batch_t0 = time.perf_counter()
@@ -658,7 +778,7 @@ def train_model():
             batch_t0 = time.perf_counter()
             dataloader_wait_times.append(batch_t0 - next_batch_t0)
             # Unpack: (X, B_or_sentinel, Y, M, sample_name)
-            x_cpu, b_cpu, y_cpu, mask_cpu, _ = batch
+            x_cpu, b_cpu, y_cpu, mask_cpu, sample_names = batch
             y_batch_np = y_cpu.numpy() if torch.is_tensor(y_cpu) else np.asarray(y_cpu)
             if torch.is_tensor(mask_cpu):
                 mask_batch_np = mask_cpu.numpy().astype(np.float32)
@@ -672,48 +792,79 @@ def train_model():
                 b_batch = None
             y_batch, y_onehot, mask_batch = _to_target_tensors(y_cpu, mask_cpu, device)
             total_train_slices += int(x_batch.shape[0])
+            _validate_batch_inputs(
+                x_batch, b_batch, mask_batch, sample_names, context="training"
+            )
 
             accumulation_window_size = _accumulation_window_size(
                 batch_counter, total_batches, accumulate_n_sub_batches
             )
 
-            with _autocast_context(device, use_amp):
-                output = model(x_batch, b_batch) if use_brainiac_fusion else model(x_batch)
-                if use_deep_supervision:
-                    logits, aux_outputs = output
-                else:
-                    logits, aux_outputs = output, []
-                loss_value, loss_per_class = combined_focal_tversky_wce_loss(
+            with _autocast_context(device, epoch_amp_enabled, amp_dtype):
+                logits, loss_value, loss_per_class = _compute_model_loss(
+                    model,
+                    x_batch,
+                    b_batch,
                     y_onehot,
-                    logits,
                     mask_batch,
                     cw_t,
                     alpha_t,
                     beta_t,
-                    gamma=tversky_gamma,
-                    wce_weight=wce_weight,
-                    label_smoothing=label_smoothing,
+                    tversky_gamma,
+                    wce_weight,
+                    label_smoothing,
+                    use_brainiac_fusion,
+                    use_deep_supervision,
+                    ds_loss_weight,
                 )
-                if use_deep_supervision and aux_outputs:
-                    ds_weights = deep_supervision_weights if deep_supervision_weights else [0.5, 0.25]
-                    for i, aux in enumerate(aux_outputs):
-                        aux_loss, _ = combined_focal_tversky_wce_loss(
-                            y_onehot,
-                            aux,
-                            mask_batch,
-                            cw_t,
-                            alpha_t,
-                            beta_t,
-                            gamma=tversky_gamma,
-                            wce_weight=wce_weight,
-                            label_smoothing=label_smoothing,
-                        )
-                        loss_value = loss_value + ds_loss_weight * ds_weights[i] * aux_loss
 
-            if not torch.isfinite(logits).all().item() or not torch.isfinite(loss_value).all().item():
+            outputs_finite = (
+                torch.isfinite(logits).all().item()
+                and torch.isfinite(loss_value).all().item()
+                and torch.isfinite(loss_per_class).all().item()
+            )
+            if not outputs_finite and epoch_amp_enabled:
+                amp_fallback_count += 1
+                print(
+                    f"WARNING: Non-finite {amp_dtype_name} output at epoch {epoch + 1}, "
+                    f"batch {batch_counter}/{total_batches}; retrying in FP32; "
+                    f"samples=[{_sample_names_text(sample_names)}]"
+                )
+                with _autocast_context(device, False, None):
+                    logits, loss_value, loss_per_class = _compute_model_loss(
+                        model,
+                        x_batch,
+                        b_batch,
+                        y_onehot,
+                        mask_batch,
+                        cw_t,
+                        alpha_t,
+                        beta_t,
+                        tversky_gamma,
+                        wce_weight,
+                        label_smoothing,
+                        use_brainiac_fusion,
+                        use_deep_supervision,
+                        ds_loss_weight,
+                    )
+                outputs_finite = (
+                    torch.isfinite(logits).all().item()
+                    and torch.isfinite(loss_value).all().item()
+                    and torch.isfinite(loss_per_class).all().item()
+                )
+                if outputs_finite and amp_fallback_count >= 3:
+                    epoch_amp_enabled = False
+                    print(
+                        f"WARNING: Disabling autocast for the remainder of epoch {epoch + 1} "
+                        f"after {amp_fallback_count} successful FP32 fallbacks."
+                    )
+
+            if not outputs_finite:
                 raise FloatingPointError(
                     f"Non-finite training output at epoch {epoch + 1}, batch {batch_counter}/{total_batches}; "
-                    f"learning_rate={learning_rate:.6g}, loss={loss_value.detach().float().item()}"
+                    f"learning_rate={learning_rate:.6g}, loss={loss_value.detach().float().item()}, "
+                    f"logits={_tensor_range(logits)}, input={_tensor_range(x_batch)}, "
+                    f"samples=[{_sample_names_text(sample_names)}]"
                 )
 
             # Average each accumulation window, including a shorter final window.
@@ -751,7 +902,7 @@ def train_model():
                 optimizer.zero_grad(set_to_none=True)
                 grad_norms.append(float(grad_norm.detach().cpu()))
 
-                probabilities = F.softmax(logits.detach(), dim=-1).cpu().numpy()
+                probabilities = _probabilities_for_metrics(logits)
                 _update_prediction_metrics(train_acc, probabilities, y_batch_np, mask_batch_np)
 
             if (batch_counter % print_every_n_subbatches == 0) or (batch_counter == total_batches):
@@ -834,9 +985,11 @@ def train_model():
                 ),
             )
 
+            val_amp_enabled = use_amp
+            val_amp_fallback_count = 0
             with torch.no_grad():
                 for val_batch in val_loader:
-                    x_cpu, b_cpu, y_cpu, mask_cpu, _ = val_batch
+                    x_cpu, b_cpu, y_cpu, mask_cpu, sample_names = val_batch
                     y_val_np = y_cpu.numpy() if torch.is_tensor(y_cpu) else np.asarray(y_cpu)
                     if torch.is_tensor(mask_cpu):
                         mask_val_np = mask_cpu.numpy().astype(np.float32)
@@ -846,24 +999,76 @@ def train_model():
                     x_val = _to_input_tensor(x_cpu, device)
                     b_val = _to_brainiac_tensor(b_cpu, device) if use_brainiac_fusion else None
                     _, y_val_onehot, mask_val = _to_target_tensors(y_cpu, mask_cpu, device)
+                    _validate_batch_inputs(
+                        x_val, b_val, mask_val, sample_names, context="validation"
+                    )
 
-                    with _autocast_context(device, use_amp):
-                        val_logits = model(x_val, b_val) if use_brainiac_fusion else model(x_val)
-                        if isinstance(val_logits, tuple):
-                            val_logits = val_logits[0]
-                        loss_val, loss_per_class_val = combined_focal_tversky_wce_loss(
+                    with _autocast_context(device, val_amp_enabled, amp_dtype):
+                        val_logits, loss_val, loss_per_class_val = _compute_model_loss(
+                            model,
+                            x_val,
+                            b_val,
                             y_val_onehot,
-                            val_logits,
                             mask_val,
                             cw_t,
                             alpha_t,
                             beta_t,
-                            gamma=tversky_gamma,
-                            wce_weight=wce_weight,
-                            label_smoothing=label_smoothing,
+                            tversky_gamma,
+                            wce_weight,
+                            label_smoothing,
+                            use_brainiac_fusion,
+                            False,
+                            0.0,
+                        )
+
+                    val_outputs_finite = (
+                        torch.isfinite(val_logits).all().item()
+                        and torch.isfinite(loss_val).all().item()
+                        and torch.isfinite(loss_per_class_val).all().item()
+                    )
+                    if not val_outputs_finite and val_amp_enabled:
+                        val_amp_fallback_count += 1
+                        print(
+                            f"WARNING: Non-finite {amp_dtype_name} validation output; "
+                            f"retrying in FP32; samples=[{_sample_names_text(sample_names)}]"
+                        )
+                        with _autocast_context(device, False, None):
+                            val_logits, loss_val, loss_per_class_val = _compute_model_loss(
+                                model,
+                                x_val,
+                                b_val,
+                                y_val_onehot,
+                                mask_val,
+                                cw_t,
+                                alpha_t,
+                                beta_t,
+                                tversky_gamma,
+                                wce_weight,
+                                label_smoothing,
+                                use_brainiac_fusion,
+                                False,
+                                0.0,
+                            )
+                        val_outputs_finite = (
+                            torch.isfinite(val_logits).all().item()
+                            and torch.isfinite(loss_val).all().item()
+                            and torch.isfinite(loss_per_class_val).all().item()
+                        )
+                        if val_outputs_finite and val_amp_fallback_count >= 3:
+                            val_amp_enabled = False
+                            print(
+                                "WARNING: Disabling validation autocast after "
+                                f"{val_amp_fallback_count} successful FP32 fallbacks."
+                            )
+                    if not val_outputs_finite:
+                        raise FloatingPointError(
+                            "Non-finite validation output after FP32 retry; "
+                            f"loss={loss_val.detach().float().item()}, "
+                            f"logits={_tensor_range(val_logits)}, input={_tensor_range(x_val)}, "
+                            f"samples=[{_sample_names_text(sample_names)}]"
                         )
                     _update_loss_metrics(val_acc, loss_val.detach().float().cpu(), loss_per_class_val.detach().float())
-                    val_probabilities = F.softmax(val_logits.detach(), dim=-1).cpu().numpy()
+                    val_probabilities = _probabilities_for_metrics(val_logits)
                     _update_prediction_metrics(val_acc, val_probabilities, y_val_np, mask_val_np)
 
             del val_loader
