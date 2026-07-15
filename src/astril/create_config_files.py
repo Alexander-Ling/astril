@@ -94,14 +94,24 @@ def create_config_files(
     trainingSchedulePath=None,
     preTrainedModelPath=None,
     subbatchLogFrequency=10,
-    numInputSlices=3,
+    numInputSlices=7,
     numOutputSlices=1,
     slicingPlane="axial",
     minimum_height_width=240,
-    architecture_type="dynamic_attention_resunet",
+    architecture_type="residual_context_unext_25d",
     base_num_filters=32,
-    center_depth=1,
+    center_depth=2,
     encoder_level_factors=[1, 2, 4, 8],
+    blocks_per_level=2,
+    context_stem_channels=None,
+    skip_attention_type="residual",
+    use_modality_presence_encoding=True,
+    use_deep_supervision=True,
+    deep_supervision_weights=(0.25, 0.125),
+    channel_dropout_strategy="subset",
+    channel_dropout_subset_probabilities="full:0.50,single:0.25,double:0.15,required_only:0.10",
+    use_ema=True,
+    ema_decay=0.999,
     use_brainiac_embeddings=False,
     brainiac_embedding_type="encoder_fusion",
     brainiac_encode_channels="all",
@@ -373,6 +383,11 @@ def create_config_files(
         f.write(f"optional_channels = {','.join(optional_channels)}\n")
         dropout_str = ",".join(f"{k}:{v:g}" for k, v in dropout_map.items())
         f.write(f"channel_dropout_probabilities = {dropout_str}\n")
+        f.write(f"channel_dropout_strategy = {channel_dropout_strategy}\n")
+        f.write(
+            "channel_dropout_subset_probabilities = "
+            f"{channel_dropout_subset_probabilities}\n"
+        )
         f.write(f"allow_missing_optional_channels = {str(bool(allow_missing_optional_channels)).lower()}\n")
         f.write("missing_channel_fill = zero\n")
         f.write(f"training_schedule_file = {trainingSchedulePath}\n")
@@ -382,10 +397,21 @@ def create_config_files(
         f.write(f"center_depth = {center_depth}\n")
         encoder_factors_str = ",".join(str(x) for x in encoder_level_factors)
         f.write(f"encoder_level_factors = {encoder_factors_str}\n")
-        # Architecture flags (default off; main.py may update these after config generation)
+        f.write(f"blocks_per_level = {int(blocks_per_level)}\n")
+        f.write(f"context_stem_channels = {int(context_stem_channels or 0)}\n")
+        f.write(f"skip_attention_type = {skip_attention_type}\n")
+        f.write(
+            "use_modality_presence_encoding = "
+            f"{str(bool(use_modality_presence_encoding)).lower()}\n"
+        )
         f.write("use_se_blocks = false\n")
-        f.write("use_deep_supervision = false\n")
-        f.write("deep_supervision_weights = 0.5,0.25\n")
+        f.write(f"use_deep_supervision = {str(bool(use_deep_supervision)).lower()}\n")
+        f.write(
+            "deep_supervision_weights = "
+            f"{','.join(str(float(weight)) for weight in deep_supervision_weights)}\n"
+        )
+        f.write(f"use_ema = {str(bool(use_ema)).lower()}\n")
+        f.write(f"ema_decay = {float(ema_decay)}\n")
         # BrainIAC flags. When enabled, BrainIAC is used as a frozen encoder-fusion branch.
         f.write(f"use_brainiac_embeddings = {str(bool(use_brainiac_embeddings)).lower()}\n")
         f.write(f"brainiac_embedding_type = {brainiac_embedding_type}\n")
@@ -425,17 +451,42 @@ def main():
     parser.add_argument("--trainingSchedulePath", default=None, help="Path to training schedule file.")
     parser.add_argument("--preTrainedModelPath", default=None, help="Optional path to a migrated PyTorch .pt checkpoint.")
     parser.add_argument("--subbatchLogFrequency", type=int, default=10, help="Log training outputs every this many sub-batches.")
-    parser.add_argument("--numInputSlices", type=int, default=3, help="Number of adjacent slices input to cnn model each cycle.")
+    parser.add_argument("--numInputSlices", type=int, default=7, help="Number of adjacent slices input to cnn model each cycle.")
     parser.add_argument("--numOutputSlices", type=int, default=1, help="Number of segmented slices output from cnn model each cycle.")
     parser.add_argument("--slicingPlane", default="axial", choices=["axial", "sagittal", "coronal"], help="Slicing plane.")
     parser.add_argument("--minimum_height_width", type=int, default=240, help="Minimum height or width of slice for training (in pixels).")
-    parser.add_argument("--architecture_type", default="dynamic_attention_resunet",
-                        choices=["dynamic_attention_resunet", "tf_dynamic_attention_resunet", "brainiac_encoder_fusion"],
+    parser.add_argument("--architecture_type", default="residual_context_unext_25d",
+                        choices=["residual_context_unext_25d", "dynamic_attention_resunet", "tf_dynamic_attention_resunet", "brainiac_encoder_fusion"],
                         help="Model architecture type to write into train_parameters.cfg.")
     parser.add_argument("--base_num_filters", type=int, default=32, help="Base number of filters in first encoder layer.")
-    parser.add_argument("--center_depth", type=int, default=1, help="Number of center bottleneck blocks to include in UNET model.")
+    parser.add_argument("--center_depth", type=int, default=2, help="Number of center bottleneck blocks to include in UNET model.")
     parser.add_argument("--encoder_level_factors", type=str, default="1,2,4,8",
                         help="Comma-separated expansions for each encoder level (e.g. 1,2,4,8).")
+    parser.add_argument("--blocks_per_level", type=int, default=2)
+    parser.add_argument("--context_stem_channels", type=int, default=0)
+    parser.add_argument("--skip_attention_type", choices=["none", "residual"], default="residual")
+    parser.add_argument(
+        "--use_modality_presence_encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--use_deep_supervision",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--deep_supervision_weights", default="0.25,0.125")
+    parser.add_argument(
+        "--channel_dropout_strategy",
+        choices=["independent", "subset"],
+        default="subset",
+    )
+    parser.add_argument(
+        "--channel_dropout_subset_probabilities",
+        default="full:0.50,single:0.25,double:0.15,required_only:0.10",
+    )
+    parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--use_brainiac_embeddings", action="store_true",
                         help="Enable BrainIAC feature integration in the generated training config.")
     parser.add_argument("--brainiac_embedding_type", default="encoder_fusion",
@@ -488,6 +539,9 @@ def main():
         raise ValueError("--trainingSchedulePath is required unless a recipe writes a default schedule.")
 
     encoder_level_factors = [int(x) for x in args.encoder_level_factors.split(",") if x.strip()]
+    deep_supervision_weights = [
+        float(x) for x in args.deep_supervision_weights.split(",") if x.strip()
+    ]
 
     if args.preTrainedModelPath and not str(args.preTrainedModelPath).lower().endswith(".pt"):
         raise ValueError("--preTrainedModelPath must point to a PyTorch .pt checkpoint.")
@@ -523,6 +577,16 @@ def main():
         base_num_filters=args.base_num_filters,
         center_depth=args.center_depth,
         encoder_level_factors=encoder_level_factors,
+        blocks_per_level=args.blocks_per_level,
+        context_stem_channels=args.context_stem_channels or None,
+        skip_attention_type=args.skip_attention_type,
+        use_modality_presence_encoding=args.use_modality_presence_encoding,
+        use_deep_supervision=args.use_deep_supervision,
+        deep_supervision_weights=deep_supervision_weights,
+        channel_dropout_strategy=args.channel_dropout_strategy,
+        channel_dropout_subset_probabilities=args.channel_dropout_subset_probabilities,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
         use_brainiac_embeddings=args.use_brainiac_embeddings,
         brainiac_embedding_type=args.brainiac_embedding_type,
         brainiac_encode_channels=args.brainiac_encode_channels,

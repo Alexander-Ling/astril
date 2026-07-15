@@ -41,6 +41,9 @@ def parse_train_parameters(config_file_path):
     config.print_every_n_subbatches = cfg_parser.getint("DEFAULT", "print_every_n_subbatches")
     config.minimum_height_width = cfg_parser.getint("DEFAULT", "minimum_height_width")
     config.num_channels = len(config.image_paths_files)
+    config.architecture_type = cfg_parser.get(
+        "DEFAULT", "architecture_type", fallback="residual_context_unext_25d"
+    ).strip().lower()
     config.channel_names = [
         x.strip()
         for x in cfg_parser.get("DEFAULT", "channel_names", fallback="").split(",")
@@ -86,6 +89,48 @@ def parse_train_parameters(config_file_path):
             raise ValueError(f"Dropout probability for channel '{name}' must be in [0, 1].")
         dropout_probs[name] = prob
     config.channel_dropout_probabilities = dropout_probs
+    default_dropout_strategy = (
+        "subset" if config.architecture_type == "residual_context_unext_25d" else "independent"
+    )
+    config.channel_dropout_strategy = cfg_parser.get(
+        "DEFAULT", "channel_dropout_strategy", fallback=default_dropout_strategy
+    ).strip().lower()
+    if config.channel_dropout_strategy not in {"independent", "subset"}:
+        raise ValueError("channel_dropout_strategy must be 'independent' or 'subset'.")
+    subset_raw = cfg_parser.get(
+        "DEFAULT",
+        "channel_dropout_subset_probabilities",
+        fallback="full:0.50,single:0.25,double:0.15,required_only:0.10",
+    )
+    subset_probabilities = {}
+    for item in subset_raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                "channel_dropout_subset_probabilities must be formatted like "
+                "'full:0.5,single:0.25,double:0.15,required_only:0.1'."
+            )
+        name, value = item.split(":", 1)
+        name = name.strip().lower()
+        if name not in {"full", "single", "double", "required_only"}:
+            raise ValueError(f"Unknown channel-dropout subset category '{name}'.")
+        probability = float(value)
+        if probability < 0:
+            raise ValueError("Channel-dropout subset probabilities cannot be negative.")
+        subset_probabilities[name] = probability
+    if config.channel_dropout_strategy == "subset":
+        total_probability = sum(subset_probabilities.values())
+        if not config.optional_channels:
+            subset_probabilities = {"full": 1.0}
+        elif total_probability <= 0:
+            raise ValueError("Channel-dropout subset probabilities must sum to a positive value.")
+        else:
+            subset_probabilities = {
+                key: value / total_probability for key, value in subset_probabilities.items()
+            }
+    config.channel_dropout_subset_probabilities = subset_probabilities
 
     if cfg_parser.has_option("DEFAULT", "base_num_filters"):
         config.base_num_filters = cfg_parser.getint("DEFAULT", "base_num_filters")
@@ -94,7 +139,7 @@ def parse_train_parameters(config_file_path):
     if cfg_parser.has_option("DEFAULT", "center_depth"):
         config.center_depth = cfg_parser.getint("DEFAULT", "center_depth")
     else:
-        config.center_depth = 1
+        config.center_depth = 2 if config.architecture_type == "residual_context_unext_25d" else 1
     if cfg_parser.has_option("DEFAULT", "encoder_level_factors"):
         factors_str = cfg_parser.get("DEFAULT", "encoder_level_factors")
         config.encoder_level_factors = [int(x.strip()) for x in factors_str.split(",") if x.strip()]
@@ -109,16 +154,34 @@ def parse_train_parameters(config_file_path):
         config.val_mask_paths_file = cfg_parser.get("DEFAULT", "val_mask_paths_files")
 
     # Architecture flags
-    config.architecture_type = cfg_parser.get(
-        "DEFAULT", "architecture_type", fallback="dynamic_attention_resunet"
-    ).strip().lower()
     config.use_se_blocks = cfg_parser.getboolean("DEFAULT", "use_se_blocks", fallback=False)
-    config.use_deep_supervision = cfg_parser.getboolean("DEFAULT", "use_deep_supervision", fallback=False)
-    ds_weights_str = cfg_parser.get("DEFAULT", "deep_supervision_weights", fallback="0.5,0.25")
+    is_context_unext = config.architecture_type == "residual_context_unext_25d"
+    config.use_deep_supervision = cfg_parser.getboolean(
+        "DEFAULT", "use_deep_supervision", fallback=is_context_unext
+    )
+    ds_weights_str = cfg_parser.get(
+        "DEFAULT", "deep_supervision_weights", fallback="0.25,0.125"
+    )
     try:
         config.deep_supervision_weights = [float(x.strip()) for x in ds_weights_str.split(",") if x.strip()]
     except ValueError:
-        config.deep_supervision_weights = [0.5, 0.25]
+        config.deep_supervision_weights = [0.25, 0.125]
+    config.blocks_per_level = cfg_parser.getint("DEFAULT", "blocks_per_level", fallback=2)
+    config.context_stem_channels = (
+        cfg_parser.getint("DEFAULT", "context_stem_channels", fallback=0) or None
+    )
+    config.skip_attention_type = cfg_parser.get(
+        "DEFAULT", "skip_attention_type", fallback="residual"
+    ).strip().lower()
+    if config.skip_attention_type not in {"none", "residual"}:
+        raise ValueError("skip_attention_type must be 'none' or 'residual'.")
+    config.use_modality_presence_encoding = cfg_parser.getboolean(
+        "DEFAULT", "use_modality_presence_encoding", fallback=is_context_unext
+    )
+    config.use_ema = cfg_parser.getboolean("DEFAULT", "use_ema", fallback=is_context_unext)
+    config.ema_decay = cfg_parser.getfloat("DEFAULT", "ema_decay", fallback=0.999)
+    if not 0.0 <= config.ema_decay < 1.0:
+        raise ValueError("ema_decay must be in [0, 1).")
 
     # Augmentation flags
     config.use_flip_augmentation = cfg_parser.getboolean("DEFAULT", "use_flip_augmentation", fallback=False)

@@ -525,6 +525,7 @@ def load_val_slices(
     target_height=minimum_height_width,
     target_width=minimum_height_width,
     brainiac_paths_list=None,
+    append_modality_presence=False,
 ):
     """
     Load all 2.5D slices from the scan at index `idx` (without augmentation),
@@ -551,9 +552,11 @@ def load_val_slices(
 
     # 2) Robustly load + orient all channels
     channel_volumes = []
+    channel_presence = []
     for ch_path in volume_paths_list[idx]:
         if is_missing_channel_path(ch_path):
             ch_data = np.zeros_like(mask_data, dtype=np.float32)
+            channel_presence.append(0.0)
         else:
             ch_data, _ = robust_align_volume(
                 ch_path,
@@ -563,6 +566,7 @@ def load_val_slices(
                 target_height=target_height,
                 target_width=target_width
             )
+            channel_presence.append(1.0)
         channel_volumes.append(ch_data)
     brainiac_volume = None
     if brainiac_paths_list is not None:
@@ -609,6 +613,12 @@ def load_val_slices(
             stacked_ch = np.stack(ch_slices, axis=-1)
             input_slices.append(stacked_ch)
         X_window = np.concatenate(input_slices, axis=-1)
+        if append_modality_presence:
+            presence_maps = np.broadcast_to(
+                np.asarray(channel_presence, dtype=np.float32),
+                X_window.shape[:2] + (len(channel_presence),),
+            )
+            X_window = np.concatenate([X_window, presence_maps], axis=-1)
         if brainiac_volume is not None:
             B_scan_data.append(brainiac_slice_for_center(brainiac_volume, z_center, pad_amt))
 
@@ -687,14 +697,17 @@ def _save_scan_volumes_to_temp(
 
     # Load all channels and stack to (num_channels, H, W, D)
     ch_vols = []
+    channel_presence = []
     for ch_path in volume_paths_list[idx]:
         if is_missing_channel_path(ch_path):
             ch = np.zeros_like(mask_vol, dtype=np.float32)
+            channel_presence.append(False)
         else:
             ch, _ = robust_align_volume(
                 ch_path, plane=slicing_plane, pad_amt=pad_amt,
                 enforce_canonical=True, target_height=target_height, target_width=target_width,
             )
+            channel_presence.append(True)
         ch_vols.append(ch)
     vols = np.stack(ch_vols, axis=0).astype(np.float32)  # (C, H, W, D)
 
@@ -712,6 +725,7 @@ def _save_scan_volumes_to_temp(
         num_channels = np.int32(len(ch_vols)),
         sample_name  = np.array([sample_name], dtype=object),
         relevant_z   = relevant_z,
+        channel_presence = np.asarray(channel_presence, dtype=np.uint8),
     )
 
     if has_brainiac:
@@ -730,6 +744,51 @@ def _dataloader_worker_init(worker_id):
     seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def sample_optional_channel_dropout(
+    optional_channel_indices,
+    strategy="independent",
+    independent_probabilities=None,
+    subset_probabilities=None,
+    rng=None,
+):
+    """Choose optional modalities to drop for one fetched training slab."""
+    optional = sorted(set(int(index) for index in optional_channel_indices or []))
+    if not optional:
+        return []
+    rng = rng or random
+    if strategy == "independent":
+        probabilities = dict(independent_probabilities or {})
+        return [
+            index
+            for index in optional
+            if probabilities.get(index, 0.0) > 0
+            and rng.random() < probabilities.get(index, 0.0)
+        ]
+    if strategy != "subset":
+        raise ValueError(f"Unknown channel dropout strategy: {strategy}")
+
+    configured = dict(subset_probabilities or {"full": 1.0})
+    drop_counts = {
+        "full": 0,
+        "single": min(1, len(optional)),
+        "double": min(2, len(optional)),
+        "required_only": len(optional),
+    }
+    # Merge categories that map to the same count for one- or two-optional-channel models.
+    count_weights = {}
+    for category, weight in configured.items():
+        count = drop_counts.get(category)
+        if count is None or weight <= 0:
+            continue
+        count_weights[count] = count_weights.get(count, 0.0) + float(weight)
+    if not count_weights:
+        return []
+    counts = sorted(count_weights)
+    weights = [count_weights[count] for count in counts]
+    selected_count = rng.choices(counts, weights=weights, k=1)[0]
+    return sorted(rng.sample(optional, selected_count)) if selected_count else []
 
 
 class AstrilSliceDataset(torch.utils.data.Dataset):
@@ -757,6 +816,9 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         has_brainiac,
         optional_channel_indices=None,
         channel_dropout_probabilities=None,
+        channel_dropout_strategy="independent",
+        channel_dropout_subset_probabilities=None,
+        append_modality_presence=False,
         brainiac_channel_indices=None,
     ):
         self.scan_temp_dirs               = list(scan_temp_dirs)
@@ -775,6 +837,11 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         self.channel_dropout_probabilities = {
             int(k): float(v) for k, v in dict(channel_dropout_probabilities or {}).items()
         }
+        self.channel_dropout_strategy = str(channel_dropout_strategy)
+        self.channel_dropout_subset_probabilities = dict(
+            channel_dropout_subset_probabilities or {}
+        )
+        self.append_modality_presence = bool(append_modality_presence)
         self.brainiac_channel_indices     = [int(i) for i in (brainiac_channel_indices or [])]
         self._index = []          # list of (scan_idx, z_center)
         self._scan_cache = {}
@@ -853,6 +920,12 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
                 "pad_amt":    int(meta['pad_amt']),
                 "num_channels": int(meta['num_channels']),
                 "sample_name":  str(meta['sample_name'][0]),
+                "channel_presence": np.asarray(
+                    meta["channel_presence"]
+                    if "channel_presence" in meta.files
+                    else np.ones(int(meta['num_channels']), dtype=np.uint8),
+                    dtype=np.uint8,
+                ),
                 "has_brainiac_file": (
                     self.has_brainiac
                     and _os.path.exists(_os.path.join(tmp_dir, 'brainiac.npy'))
@@ -881,6 +954,7 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
         vols         = arrays["vols"]  # (C, H, W, D)
         gt_vol       = arrays["gt"]
         mask_vol     = arrays["mask"]
+        channel_presence = arrays["channel_presence"].astype(np.float32).copy()
 
         half_in  = self.num_input_slices  // 2
         half_out = self.num_output_slices // 2
@@ -910,14 +984,16 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
 
         # Augmentation (training only)
         if self.is_training:
-            dropped_channels = []
-            for ch_idx in self.optional_channel_indices:
-                prob = self.channel_dropout_probabilities.get(ch_idx, 0.0)
-                if prob > 0.0 and random.random() < prob:
-                    dropped_channels.append(ch_idx)
+            dropped_channels = sample_optional_channel_dropout(
+                self.optional_channel_indices,
+                strategy=self.channel_dropout_strategy,
+                independent_probabilities=self.channel_dropout_probabilities,
+                subset_probabilities=self.channel_dropout_subset_probabilities,
+            )
             if dropped_channels:
                 for ch_idx in dropped_channels:
                     X_window[..., ch_idx::num_channels] = 0.0
+                    channel_presence[ch_idx] = 0.0
                     if self.has_brainiac and B_window.ndim > 1 and ch_idx in self.brainiac_channel_indices:
                         b_slot = self.brainiac_channel_indices.index(ch_idx)
                         start = b_slot * 768
@@ -962,6 +1038,17 @@ class AstrilSliceDataset(torch.utils.data.Dataset):
                 contrast = 1.0 + float(np.random.uniform(-s, s))
                 X_window = (X_window * contrast).astype(np.float32)
 
+            # Intensity noise must not turn a deliberately missing modality into signal.
+            for ch_idx in np.flatnonzero(channel_presence < 0.5):
+                X_window[..., int(ch_idx)::num_channels] = 0.0
+
+        if self.append_modality_presence:
+            presence_maps = np.broadcast_to(
+                channel_presence,
+                X_window.shape[:2] + (num_channels,),
+            ).astype(np.float32, copy=False)
+            X_window = np.concatenate([X_window, presence_maps], axis=-1)
+
         return X_window, B_window, Y_window, M_window, sample_name
 
 
@@ -997,6 +1084,9 @@ def load_epoch_dataset(
     temp_base_dir=None,
     optional_channel_indices=None,
     channel_dropout_probabilities=None,
+    channel_dropout_strategy="independent",
+    channel_dropout_subset_probabilities=None,
+    append_modality_presence=False,
     brainiac_channel_indices=None,
 ):
     """
@@ -1039,6 +1129,9 @@ def load_epoch_dataset(
         has_brainiac=has_brainiac,
         optional_channel_indices=optional_channel_indices,
         channel_dropout_probabilities=channel_dropout_probabilities,
+        channel_dropout_strategy=channel_dropout_strategy,
+        channel_dropout_subset_probabilities=channel_dropout_subset_probabilities,
+        append_modality_presence=append_modality_presence,
         brainiac_channel_indices=brainiac_channel_indices,
     )
     return dataset, temp_dirs
@@ -1058,6 +1151,7 @@ def load_val_dataset(
     executor,
     temp_base_dir=None,
     optional_channel_indices=None,
+    append_modality_presence=False,
     brainiac_channel_indices=None,
 ):
     """Parallel volume loading for validation; returns (AstrilSliceDataset, temp_dirs)."""
@@ -1095,6 +1189,9 @@ def load_val_dataset(
         has_brainiac=has_brainiac,
         optional_channel_indices=optional_channel_indices,
         channel_dropout_probabilities={},
+        channel_dropout_strategy="independent",
+        channel_dropout_subset_probabilities={},
+        append_modality_presence=append_modality_presence,
         brainiac_channel_indices=brainiac_channel_indices,
     )
     return dataset, temp_dirs

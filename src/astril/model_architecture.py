@@ -4,6 +4,14 @@ import torch.nn.functional as F
 import contextlib
 
 
+def _group_count(channels, preferred=8):
+    """Return the largest useful GroupNorm group count that divides channels."""
+    for groups in range(min(preferred, channels), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
 class SeparableConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
         super().__init__()
@@ -390,6 +398,351 @@ class DynamicAttentionResUNet(nn.Module):
             return main_out, aux_outputs
 
         return main_out
+
+
+class PreActResidualBlock2d(nn.Module):
+    """GroupNorm/SiLU residual block with full spatial-channel convolutions."""
+
+    def __init__(self, in_channels, out_channels, dilation=1):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(_group_count(in_channels), in_channels)
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.norm2 = nn.GroupNorm(_group_count(out_channels), out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.projection = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        residual = self.projection(x)
+        x = self.conv1(F.silu(self.norm1(x), inplace=True))
+        x = self.conv2(F.silu(self.norm2(x), inplace=True))
+        return x + residual
+
+
+class ResidualSkipAttention(nn.Module):
+    """Identity-initialized skip attention that cannot erase skip features."""
+
+    def __init__(self, channels):
+        super().__init__()
+        intermediate = max(1, channels // 2)
+        self.decoder_projection = nn.Conv2d(channels, intermediate, kernel_size=1)
+        self.skip_projection = nn.Conv2d(channels, intermediate, kernel_size=1)
+        self.score = nn.Conv2d(intermediate, 1, kernel_size=1)
+        nn.init.zeros_(self.score.weight)
+        nn.init.zeros_(self.score.bias)
+
+    def forward(self, decoder, skip):
+        score = F.silu(
+            self.decoder_projection(decoder) + self.skip_projection(skip),
+            inplace=True,
+        )
+        # score==0 gives a multiplier of 1.0. The learned range is [0.5, 1.5].
+        multiplier = 0.5 + torch.sigmoid(self.score(score))
+        return skip * multiplier
+
+
+class SlabContextStem(nn.Module):
+    """Use a shallow 3-D convolution to encode ordered slices, then return to 2-D."""
+
+    def __init__(
+        self,
+        num_modalities,
+        num_input_slices,
+        output_channels,
+        context_channels=None,
+        use_modality_presence=True,
+    ):
+        super().__init__()
+        self.num_modalities = int(num_modalities)
+        self.num_input_slices = int(num_input_slices)
+        self.use_modality_presence = bool(use_modality_presence)
+        context_channels = int(context_channels or max(8, output_channels // 2))
+        self.context_channels = context_channels
+
+        self.slab_conv = nn.Conv3d(
+            self.num_modalities,
+            context_channels,
+            kernel_size=3,
+            padding=1,
+            bias=False,
+        )
+        self.slab_norm = nn.GroupNorm(_group_count(context_channels), context_channels)
+        self.depth_score = nn.Conv3d(context_channels, 1, kernel_size=1)
+        if self.use_modality_presence:
+            self.presence_projection = nn.Conv2d(
+                self.num_modalities, context_channels, kernel_size=1, bias=False
+            )
+            fusion_channels = context_channels * 3
+        else:
+            self.presence_projection = None
+            fusion_channels = context_channels * 2
+        self.fusion = nn.Sequential(
+            nn.Conv2d(fusion_channels, output_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(output_channels), output_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    @property
+    def image_channels(self):
+        return self.num_modalities * self.num_input_slices
+
+    @property
+    def expected_input_channels(self):
+        return self.image_channels + (
+            self.num_modalities if self.use_modality_presence else 0
+        )
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.expected_input_channels:
+            raise ValueError(
+                "ResidualContextUNeXt25D expected input shaped "
+                f"(N, {self.expected_input_channels}, H, W); got {tuple(x.shape)}."
+            )
+        n, _, h, w = x.shape
+        image = x[:, : self.image_channels]
+        # Astril stores channels slice-major: [slice0 modalities, slice1 modalities, ...].
+        image = image.view(
+            n, self.num_input_slices, self.num_modalities, h, w
+        ).permute(0, 2, 1, 3, 4).contiguous()
+        features = F.silu(self.slab_norm(self.slab_conv(image)), inplace=True)
+        center = features[:, :, self.num_input_slices // 2]
+        depth_weights = torch.softmax(self.depth_score(features), dim=2)
+        context = torch.sum(features * depth_weights, dim=2)
+        fusion_inputs = [center, context]
+        if self.use_modality_presence:
+            presence = x[:, self.image_channels :]
+            fusion_inputs.append(self.presence_projection(presence))
+        return self.fusion(torch.cat(fusion_inputs, dim=1))
+
+
+class ResidualContextUNeXt25D(nn.Module):
+    """
+    Astril's scan-efficient default 2.5-D segmentation model.
+
+    A shallow 3-D slab stem learns through-plane ordering. The main U-shaped
+    backbone is 2-D and uses GroupNorm pre-activation residual blocks, smooth
+    decoder upsampling, identity-initialized residual skip attention, and true
+    half/quarter-resolution deep supervision.
+    """
+
+    def __init__(
+        self,
+        input_channels,
+        num_modalities,
+        num_input_slices=7,
+        base_num_filters=32,
+        encoder_level_factors=None,
+        num_output_slices=1,
+        out_channels=4,
+        center_depth=2,
+        blocks_per_level=2,
+        context_stem_channels=None,
+        skip_attention_type="residual",
+        use_modality_presence_encoding=True,
+        use_deep_supervision=True,
+        **_,
+    ):
+        super().__init__()
+        if encoder_level_factors is None:
+            encoder_level_factors = [1, 2, 4, 8]
+        if len(encoder_level_factors) < 3:
+            raise ValueError("ResidualContextUNeXt25D requires at least three encoder levels.")
+        if skip_attention_type not in {"none", "residual"}:
+            raise ValueError("skip_attention_type must be 'none' or 'residual'.")
+
+        self.input_channels = int(input_channels)
+        self.num_modalities = int(num_modalities)
+        self.num_input_slices = int(num_input_slices)
+        self.base_num_filters = int(base_num_filters)
+        self.encoder_level_factors = list(encoder_level_factors)
+        self.num_output_slices = int(num_output_slices)
+        self.out_channels = int(out_channels)
+        self.center_depth = int(center_depth)
+        self.blocks_per_level = int(blocks_per_level)
+        self.skip_attention_type = skip_attention_type
+        self.use_modality_presence_encoding = bool(use_modality_presence_encoding)
+        self.use_deep_supervision = bool(use_deep_supervision)
+        self.use_se_blocks = False
+        self.uses_modality_presence = self.use_modality_presence_encoding
+
+        encoder_channels = [
+            self.base_num_filters * factor for factor in self.encoder_level_factors
+        ]
+        self.encoder_channels = encoder_channels
+        self.context_stem = SlabContextStem(
+            num_modalities=self.num_modalities,
+            num_input_slices=self.num_input_slices,
+            output_channels=encoder_channels[0],
+            context_channels=context_stem_channels,
+            use_modality_presence=self.use_modality_presence_encoding,
+        )
+        self.context_stem_channels = self.context_stem.context_channels
+        if self.input_channels != self.context_stem.expected_input_channels:
+            raise ValueError(
+                f"input_channels={self.input_channels} does not match the slab stem's "
+                f"expected {self.context_stem.expected_input_channels}."
+            )
+
+        self.encoders = nn.ModuleList()
+        self.downsamplers = nn.ModuleList()
+        for level, channels in enumerate(encoder_channels):
+            blocks = []
+            in_channels = encoder_channels[0] if level == 0 else channels
+            for block_index in range(self.blocks_per_level):
+                blocks.append(
+                    PreActResidualBlock2d(
+                        in_channels if block_index == 0 else channels,
+                        channels,
+                    )
+                )
+            self.encoders.append(nn.Sequential(*blocks))
+            next_channels = (
+                encoder_channels[level + 1]
+                if level + 1 < len(encoder_channels)
+                else encoder_channels[-1] * 2
+            )
+            self.downsamplers.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, next_channels, 3, stride=2, padding=1, bias=False),
+                    nn.GroupNorm(_group_count(next_channels), next_channels),
+                    nn.SiLU(inplace=True),
+                )
+            )
+
+        bottleneck_channels = encoder_channels[-1] * 2
+        self.bottleneck_channels = bottleneck_channels
+        self.center_blocks = nn.ModuleList(
+            [
+                PreActResidualBlock2d(
+                    bottleneck_channels,
+                    bottleneck_channels,
+                    dilation=1 if index == 0 else 2,
+                )
+                for index in range(self.center_depth)
+            ]
+        )
+
+        self.up_projections = nn.ModuleList()
+        self.skip_attention = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        previous_channels = bottleneck_channels
+        decoder_channels = []
+        for skip_channels in reversed(encoder_channels):
+            self.up_projections.append(
+                nn.Sequential(
+                    nn.Conv2d(previous_channels, skip_channels, 3, padding=1, bias=False),
+                    nn.GroupNorm(_group_count(skip_channels), skip_channels),
+                    nn.SiLU(inplace=True),
+                )
+            )
+            self.skip_attention.append(
+                ResidualSkipAttention(skip_channels)
+                if self.skip_attention_type == "residual"
+                else nn.Identity()
+            )
+            decoder_blocks = [PreActResidualBlock2d(skip_channels * 2, skip_channels)]
+            decoder_blocks.extend(
+                PreActResidualBlock2d(skip_channels, skip_channels)
+                for _ in range(max(0, self.blocks_per_level - 1))
+            )
+            self.decoders.append(nn.Sequential(*decoder_blocks))
+            decoder_channels.append(skip_channels)
+            previous_channels = skip_channels
+
+        final_channels = self.num_output_slices * self.out_channels
+        self.final_conv = nn.Conv2d(encoder_channels[0], final_channels, kernel_size=1)
+        # Decoder outputs are deep-to-shallow. Supervise half and quarter resolution.
+        self.aux_decoder_indices = [len(decoder_channels) - 2, len(decoder_channels) - 3]
+        self.aux_heads = nn.ModuleList(
+            [nn.Conv2d(decoder_channels[index], final_channels, 1) for index in self.aux_decoder_indices]
+            if self.use_deep_supervision
+            else []
+        )
+
+    @property
+    def expected_input_channels(self):
+        return self.context_stem.expected_input_channels
+
+    def architecture_config(self):
+        return {
+            "architecture_type": "residual_context_unext_25d",
+            "input_channels": self.input_channels,
+            "num_modalities": self.num_modalities,
+            "num_input_slices": self.num_input_slices,
+            "base_num_filters": self.base_num_filters,
+            "encoder_level_factors": self.encoder_level_factors,
+            "num_output_slices": self.num_output_slices,
+            "out_channels": self.out_channels,
+            "center_depth": self.center_depth,
+            "blocks_per_level": self.blocks_per_level,
+            "context_stem_channels": self.context_stem_channels,
+            "skip_attention_type": self.skip_attention_type,
+            "use_modality_presence_encoding": self.use_modality_presence_encoding,
+            "use_deep_supervision": self.use_deep_supervision,
+        }
+
+    def _format_output(self, logits):
+        n, _, h, w = logits.shape
+        logits = logits.view(n, self.num_output_slices, self.out_channels, h, w)
+        return logits.permute(0, 3, 4, 1, 2).contiguous()
+
+    def forward(self, x):
+        encoder_input = self.context_stem(x)
+        skip_connections = []
+        for encoder, downsample in zip(self.encoders, self.downsamplers):
+            encoded = encoder(encoder_input)
+            skip_connections.append(encoded)
+            encoder_input = downsample(encoded)
+
+        decoder_input = encoder_input
+        for block in self.center_blocks:
+            decoder_input = block(decoder_input)
+
+        decoder_outputs = []
+        for index, (up_projection, attention, decoder) in enumerate(
+            zip(self.up_projections, self.skip_attention, self.decoders)
+        ):
+            skip = skip_connections[-(index + 1)]
+            decoder_input = F.interpolate(
+                decoder_input,
+                size=skip.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            decoder_input = up_projection(decoder_input)
+            attended_skip = (
+                attention(decoder_input, skip)
+                if self.skip_attention_type == "residual"
+                else attention(skip)
+            )
+            decoder_input = decoder(torch.cat([decoder_input, attended_skip], dim=1))
+            decoder_outputs.append(decoder_input)
+
+        main_output = self._format_output(self.final_conv(decoder_input))
+        if self.use_deep_supervision and self.training:
+            auxiliary = [
+                self._format_output(head(decoder_outputs[decoder_index]))
+                for head, decoder_index in zip(self.aux_heads, self.aux_decoder_indices)
+            ]
+            return main_output, auxiliary
+        return main_output
 
 
 class BrainIACEncoderFusionUNet(DynamicAttentionResUNet):
@@ -939,6 +1292,10 @@ def create_dynamic_unet_from_config():
         base_num_filters,
         encoder_level_factors,
         center_depth,
+        blocks_per_level,
+        context_stem_channels,
+        skip_attention_type,
+        use_modality_presence_encoding,
         use_se_blocks,
         use_deep_supervision,
         use_brainiac_embeddings,
@@ -1007,6 +1364,27 @@ def create_dynamic_unet_from_config():
             center_depth=center_depth,
         )
 
+    if architecture_type == "residual_context_unext_25d":
+        image_channels = num_channels * num_input_slices
+        input_channels = image_channels + (
+            num_channels if use_modality_presence_encoding else 0
+        )
+        return ResidualContextUNeXt25D(
+            input_channels=input_channels,
+            num_modalities=num_channels,
+            num_input_slices=num_input_slices,
+            base_num_filters=base_num_filters,
+            encoder_level_factors=encoder_level_factors,
+            num_output_slices=num_output_slices,
+            out_channels=num_classes,
+            center_depth=center_depth,
+            blocks_per_level=blocks_per_level,
+            context_stem_channels=context_stem_channels,
+            skip_attention_type=skip_attention_type,
+            use_modality_presence_encoding=use_modality_presence_encoding,
+            use_deep_supervision=use_deep_supervision,
+        )
+
     if architecture_type not in {"dynamic_attention_resunet", ""}:
         raise ValueError(f"Unsupported architecture_type: {architecture_type}")
 
@@ -1031,6 +1409,8 @@ def create_dynamic_unet_from_metadata(metadata: dict):
         return DinoV3EncoderFusionUNet(**metadata)
     if architecture_type == "tf_dynamic_attention_resunet":
         return TFDynamicAttentionResUNet(**metadata)
+    if architecture_type == "residual_context_unext_25d":
+        return ResidualContextUNeXt25D(**metadata)
     if architecture_type not in {"dynamic_attention_resunet", ""}:
         raise ValueError(f"Unsupported architecture_type: {architecture_type}")
     return DynamicAttentionResUNet(**metadata)

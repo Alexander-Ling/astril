@@ -52,7 +52,11 @@ def load_models_for_config(
             checkpoint = torch.load(mp, map_location=device)
         if "architecture" in checkpoint:
             model = create_dynamic_unet_from_metadata(checkpoint["architecture"])
-            state_dict = checkpoint.get("model_state_dict")
+            state_dict = checkpoint.get("ema_model_state_dict")
+            if state_dict is not None:
+                print("[INFO] Using EMA checkpoint weights for inference.")
+            else:
+                state_dict = checkpoint.get("model_state_dict")
         else:
             train_cfg = model_train_config_files[i].strip()
             model = build_model_from_train_config(train_cfg, num_modal_channels=num_modal_channels)
@@ -74,7 +78,11 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
     Reads a model training config file (INI format) and builds a U-Net model
     with the parameters specified.
     """
-    from .model_architecture import DynamicAttentionResUNet, BrainIACEncoderFusionUNet
+    from .model_architecture import (
+        DynamicAttentionResUNet,
+        BrainIACEncoderFusionUNet,
+        ResidualContextUNeXt25D,
+    )
     cp = configparser.ConfigParser()
     cp.read(config_path)
     cfg = cp["DEFAULT"]
@@ -115,13 +123,31 @@ def build_model_from_train_config(config_path, num_modal_channels=None):
             f"Found: {brainiac_embedding_type}"
         )
 
-    model_cls = BrainIACEncoderFusionUNet if use_brainiac_embeddings else DynamicAttentionResUNet
+    architecture_type = cfg.get("architecture_type", fallback="dynamic_attention_resunet").strip().lower()
+    use_modality_presence = cfg.getboolean(
+        "use_modality_presence_encoding",
+        fallback=(architecture_type == "residual_context_unext_25d"),
+    )
+    if architecture_type == "residual_context_unext_25d":
+        input_channels += num_channels if use_modality_presence else 0
+        model_cls = ResidualContextUNeXt25D
+    else:
+        model_cls = BrainIACEncoderFusionUNet if use_brainiac_embeddings else DynamicAttentionResUNet
     model_kwargs = {}
     if model_cls is BrainIACEncoderFusionUNet:
         brainiac_input_channels = cfg.getint("brainiac_encoder_input_channels", fallback=0)
         if brainiac_input_channels <= 0:
             raise ValueError("brainiac_encoder_input_channels must be set for encoder_fusion configs.")
         model_kwargs["brainiac_input_channels"] = brainiac_input_channels
+    if model_cls is ResidualContextUNeXt25D:
+        model_kwargs.update(
+            num_modalities=num_channels,
+            num_input_slices=num_input_slices,
+            blocks_per_level=cfg.getint("blocks_per_level", fallback=2),
+            context_stem_channels=cfg.getint("context_stem_channels", fallback=0) or None,
+            skip_attention_type=cfg.get("skip_attention_type", fallback="residual"),
+            use_modality_presence_encoding=use_modality_presence,
+        )
 
     model = model_cls(
         input_channels=input_channels,
@@ -227,6 +253,26 @@ def average_prob(softmax_list, tiebreaker=0):
         best_label[tie_mask] = 0
     return best_label
 
+
+def average_logit(logit_list, weights=None, tiebreaker=0):
+    """Fuse calibrated model evidence before the final softmax/argmax decision."""
+    import numpy as np
+    stacked = np.stack(logit_list, axis=0)
+    if weights is None:
+        weights = np.ones(stacked.shape[0], dtype=np.float32)
+    weights = np.asarray(weights, dtype=np.float32)
+    if weights.shape != (stacked.shape[0],) or np.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("merging_weights must be non-negative with one value per model.")
+    weighted_logits = np.tensordot(weights / weights.sum(), stacked, axes=(0, 0))
+    best_label = np.argmax(weighted_logits, axis=-1)
+    best_value = np.max(weighted_logits, axis=-1, keepdims=True)
+    tie_mask = np.isclose(weighted_logits, best_value).sum(axis=-1) > 1
+    if tiebreaker > 0:
+        best_label[tie_mask] = np.argmax(stacked[tiebreaker - 1], axis=-1)[tie_mask]
+    else:
+        best_label[tie_mask] = 0
+    return best_label
+
 def max_prob(softmax_list, tiebreaker=0):
     import numpy as np
     stacked = np.stack(softmax_list, axis=0)
@@ -293,6 +339,12 @@ def run_segmentation(
 
     model_paths_str = config_parser["DEFAULT"]["model_paths"]
     merging_method = config_parser["DEFAULT"].get("merging_method", "majority_vote")
+    merging_weights_raw = config_parser["DEFAULT"].get("merging_weights", "").strip()
+    merging_weights = (
+        [float(value.strip()) for value in merging_weights_raw.split(",") if value.strip()]
+        if merging_weights_raw
+        else None
+    )
     output_directory = config_parser["DEFAULT"]["output_directory"]
 
     model_slicing_planes = config_parser["DEFAULT"]["model_train_slicing_planes"].split(",")
@@ -386,6 +438,12 @@ def run_segmentation(
             return average_prob(volumes_4d, tiebreaker=tiebreaker_model)
         elif method == "max_prob":
             return max_prob(volumes_4d, tiebreaker=tiebreaker_model)
+        elif method == "average_logit":
+            return average_logit(
+                volumes_4d,
+                weights=merging_weights,
+                tiebreaker=tiebreaker_model,
+            )
         else:
             raise ValueError(f"Unknown merging method '{method}'")
 
@@ -456,6 +514,7 @@ def run_segmentation(
             print(f"  [Model {m_idx+1}] plane={plane}, in={in_sl}, out={out_sl}, classes={n_cls}, minHW={min_HW}")
 
             model_uses_brainiac_fusion = getattr(model, "brainiac_input_channels", 0) > 0
+            model_uses_presence = bool(getattr(model, "uses_modality_presence", False))
             val_data = load_val_data(
                 idx=subj_idx,
                 volume_paths_list=volume_paths_list,
@@ -468,6 +527,7 @@ def run_segmentation(
                 target_height=min_HW,
                 target_width=min_HW,
                 brainiac_paths_list=brainiac_encoder_paths_list if model_uses_brainiac_fusion else None,
+                append_modality_presence=model_uses_presence,
             )
             if model_uses_brainiac_fusion:
                 (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
@@ -495,7 +555,11 @@ def run_segmentation(
                         batch_logits = model(x_tensor)
                     if isinstance(batch_logits, tuple):
                         batch_logits = batch_logits[0]
-                    batch_pred = F.softmax(batch_logits, dim=-1).cpu().numpy()
+                    batch_pred = (
+                        batch_logits.float().cpu().numpy()
+                        if merging_method == "average_logit"
+                        else F.softmax(batch_logits.float(), dim=-1).cpu().numpy()
+                    )
                     all_preds.append(batch_pred)
 
             if not all_preds:

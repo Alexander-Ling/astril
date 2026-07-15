@@ -27,10 +27,23 @@ brainiac_encode_channels = "all"
 brainiac_encode_channel_indices = None
 
 # Architecture flags
-architecture_type = "dynamic_attention_resunet"
+architecture_type = "residual_context_unext_25d"
 use_se_blocks = False
-use_deep_supervision = False
-deep_supervision_weights = None     # list of floats e.g. [0.5, 0.25]
+use_deep_supervision = True
+deep_supervision_weights = [0.25, 0.125]
+blocks_per_level = 2
+context_stem_channels = None
+skip_attention_type = "residual"
+use_modality_presence_encoding = True
+channel_dropout_strategy = "subset"
+channel_dropout_subset_probabilities = {
+    "full": 0.50,
+    "single": 0.25,
+    "double": 0.15,
+    "required_only": 0.10,
+}
+use_ema = True
+ema_decay = 0.999
 
 # Augmentation
 use_flip_augmentation = False

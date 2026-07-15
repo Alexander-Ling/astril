@@ -60,7 +60,8 @@ def create_segmentation_config(
     channel_alt_patterns=None,
     model_paths=None,
     modelTrainConfigFiles=None,
-    merging_method="majority_vote",
+    merging_method="average_logit",
+    merging_weights=None,
     inputVolumeDirectory=None,
     outputVolumeDirectory=None,
     segmentSuffix="_seg.nii.gz",
@@ -306,6 +307,12 @@ def create_segmentation_config(
 
     # (c) Merging method + output dir
     config_parser["DEFAULT"]["merging_method"] = merging_method
+    if merging_weights is not None:
+        if len(merging_weights) != len(model_paths):
+            raise ValueError("merging_weights must contain one value per model path.")
+        config_parser["DEFAULT"]["merging_weights"] = ",".join(
+            str(float(weight)) for weight in merging_weights
+        )
     config_parser["DEFAULT"]["output_directory"] = outputVolumeDirectory
 
     # (d) Store extracted parameters from the model training configs in parallel arrays
@@ -350,8 +357,19 @@ def main(argv=None):
                         help="Paths to PyTorch .pt model checkpoints. One per slicing plane.")
     parser.add_argument("--modelTrainConfigFiles", nargs="+", required=True,
                         help="Paths to the train_parameters.cfg used to train each model. Must match length of model_paths.")
-    parser.add_argument("--merging_method", default="majority_vote",
-                        help="Method for merging model predictions.")
+    parser.add_argument(
+        "--merging_method",
+        default="average_logit",
+        choices=["average_logit", "average_prob", "majority_vote", "max_prob"],
+        help="Method for merging model predictions.",
+    )
+    parser.add_argument(
+        "--merging_weights",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Optional non-negative per-model weights for average_logit fusion.",
+    )
     parser.add_argument("--inputVolumeDirectory", required=True,
                         help="Directory containing subdirectories or volumes for segmentation.")
     parser.add_argument("--outputVolumeDirectory", required=True,
@@ -383,6 +401,7 @@ def main(argv=None):
         model_paths=args.model_paths,
         modelTrainConfigFiles=args.modelTrainConfigFiles,
         merging_method=args.merging_method,
+        merging_weights=args.merging_weights,
         inputVolumeDirectory=args.inputVolumeDirectory,
         outputVolumeDirectory=args.outputVolumeDirectory,
         segmentSuffix=args.segmentSuffix,

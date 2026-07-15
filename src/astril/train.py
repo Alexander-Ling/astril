@@ -1,5 +1,6 @@
 import gc
 import atexit
+import copy
 import contextlib
 import math
 import os
@@ -49,6 +50,10 @@ from .config import (
     channel_names,
     optional_channels,
     channel_dropout_probabilities,
+    channel_dropout_strategy,
+    channel_dropout_subset_probabilities,
+    use_ema,
+    ema_decay,
     use_dinov3_embeddings,
     dinov3_frozen_epochs,
 )
@@ -204,12 +209,41 @@ def _tensors_are_finite(value):
     return True
 
 
+class ExponentialMovingAverage:
+    """Maintain a detached model copy for stable validation and inference."""
+
+    def __init__(self, model, decay=0.999):
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("EMA decay must be in [0, 1).")
+        self.decay = float(decay)
+        self.model = copy.deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        source_parameters = dict(model.named_parameters())
+        for name, ema_parameter in self.model.named_parameters():
+            source = source_parameters[name].detach()
+            ema_parameter.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
+        source_buffers = dict(model.named_buffers())
+        for name, ema_buffer in self.model.named_buffers():
+            ema_buffer.copy_(source_buffers[name].detach())
+
+    def state_dict(self):
+        return self.model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.model.load_state_dict(state_dict)
+
+
 def _checkpoint_is_valid(path, device):
     try:
         checkpoint = _load_checkpoint(path, device)
         return (
             isinstance(checkpoint, dict)
             and _tensors_are_finite(checkpoint.get("model_state_dict", {}))
+            and _tensors_are_finite(checkpoint.get("ema_model_state_dict", {}))
             and _tensors_are_finite(checkpoint.get("optimizer_state_dict", {}))
         )
     except Exception as exc:
@@ -240,7 +274,7 @@ def _accumulation_window_size(batch_counter, total_batches, accumulate_n_sub_bat
     return window_end - window_start + 1
 
 
-def _save_checkpoint(path, model, optimizer, epoch):
+def _save_checkpoint(path, model, optimizer, epoch, ema=None):
     checkpoint = {
         "epoch": epoch,
         "architecture": model.architecture_config(),
@@ -248,10 +282,17 @@ def _save_checkpoint(path, model, optimizer, epoch):
             "channel_names": list(channel_names or []),
             "optional_channels": list(optional_channels or []),
             "channel_dropout_probabilities": dict(channel_dropout_probabilities or {}),
+            "channel_dropout_strategy": channel_dropout_strategy,
+            "channel_dropout_subset_probabilities": dict(
+                channel_dropout_subset_probabilities or {}
+            ),
         },
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
+    if ema is not None:
+        checkpoint["ema_model_state_dict"] = ema.state_dict()
+        checkpoint["ema_decay"] = ema.decay
     if not _tensors_are_finite(checkpoint):
         raise RuntimeError(f"Refusing to save non-finite checkpoint for epoch {epoch}.")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -333,6 +374,18 @@ def _validate_batch_inputs(x, brainiac, mask, sample_names, context):
         )
 
 
+def _resize_channel_last_spatial(tensor, spatial_size):
+    """Nearest-neighbor resize for (N,H,W,S,C) targets and masks."""
+    if tuple(tensor.shape[1:3]) == tuple(spatial_size):
+        return tensor
+    n, _, _, slices, channels = tensor.shape
+    channel_first = tensor.permute(0, 3, 4, 1, 2).reshape(
+        n, slices * channels, tensor.shape[1], tensor.shape[2]
+    )
+    resized = F.interpolate(channel_first.float(), size=spatial_size, mode="nearest")
+    return resized.view(n, slices, channels, *spatial_size).permute(0, 3, 4, 1, 2).contiguous()
+
+
 def _compute_model_loss(
     model,
     x,
@@ -366,12 +419,14 @@ def _compute_model_loss(
         label_smoothing=label_smoothing,
     )
     if use_deep_supervision and aux_outputs:
-        ds_weights = deep_supervision_weights if deep_supervision_weights else [0.5, 0.25]
+        ds_weights = deep_supervision_weights if deep_supervision_weights else [0.25, 0.125]
         for i, aux in enumerate(aux_outputs):
+            aux_targets = _resize_channel_last_spatial(y_onehot, aux.shape[1:3])
+            aux_mask = _resize_channel_last_spatial(mask, aux.shape[1:3])
             aux_loss, _ = combined_focal_tversky_wce_loss(
-                y_onehot,
+                aux_targets,
                 aux,
-                mask,
+                aux_mask,
                 class_weights,
                 alpha,
                 beta,
@@ -379,7 +434,8 @@ def _compute_model_loss(
                 wce_weight=wce_weight,
                 label_smoothing=label_smoothing,
             )
-            loss_value = loss_value + ds_loss_weight * ds_weights[i] * aux_loss
+            weight = ds_weights[i] if i < len(ds_weights) else ds_weights[-1]
+            loss_value = loss_value + ds_loss_weight * weight * aux_loss
     return logits, loss_value, loss_per_class
 
 
@@ -527,6 +583,15 @@ def train_model():
     if optimizer_checkpoint and "optimizer_state_dict" in optimizer_checkpoint:
         optimizer.load_state_dict(optimizer_checkpoint["optimizer_state_dict"])
 
+    ema = ExponentialMovingAverage(model, decay=ema_decay) if use_ema else None
+    if ema is not None and optimizer_checkpoint:
+        ema_state = optimizer_checkpoint.get("ema_model_state_dict")
+        if ema_state:
+            ema.load_state_dict(ema_state)
+            print(f"Restored EMA weights (decay={ema.decay:g}).")
+    if ema is not None and not optimizer_checkpoint:
+        print(f"EMA validation/inference weights enabled (decay={ema.decay:g}).")
+
     use_amp, amp_dtype, amp_dtype_name = _resolve_mixed_precision(
         device, use_mixed_precision, mixed_precision_dtype
     )
@@ -537,7 +602,11 @@ def train_model():
         + (f" (dtype={amp_dtype_name}, grad_scaler={use_grad_scaler})" if use_amp else "")
     )
 
-    dummy_input_shape = (1, num_channels * num_input_slices, minimum_height_width, minimum_height_width)
+    model_input_channels = int(
+        getattr(model, "expected_input_channels", num_channels * num_input_slices)
+    )
+    append_modality_presence = bool(getattr(model, "uses_modality_presence", False))
+    dummy_input_shape = (1, model_input_channels, minimum_height_width, minimum_height_width)
     with torch.no_grad():
         dummy_x = torch.zeros(dummy_input_shape, dtype=torch.float32, device=device)
         if use_brainiac_fusion:
@@ -691,6 +760,9 @@ def train_model():
                 temp_base_dir=_temp_base_dir,
                 optional_channel_indices=optional_channel_indices,
                 channel_dropout_probabilities=dropout_by_index,
+                channel_dropout_strategy=channel_dropout_strategy,
+                channel_dropout_subset_probabilities=channel_dropout_subset_probabilities,
+                append_modality_presence=append_modality_presence,
                 brainiac_channel_indices=brainiac_channel_indices,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
@@ -717,6 +789,9 @@ def train_model():
                 has_brainiac=use_brainiac_fusion,
                 optional_channel_indices=optional_channel_indices,
                 channel_dropout_probabilities=dropout_by_index,
+                channel_dropout_strategy=channel_dropout_strategy,
+                channel_dropout_subset_probabilities=channel_dropout_subset_probabilities,
+                append_modality_presence=append_modality_presence,
                 brainiac_channel_indices=brainiac_channel_indices,
             )
             epoch_class_weights = compute_class_weights_from_dataset(_train_dataset, num_classes)
@@ -899,6 +974,8 @@ def train_model():
                         f"Non-finite model parameter after update at epoch {epoch + 1}, "
                         f"batch {batch_counter}/{total_batches}; learning_rate={learning_rate:.6g}"
                     )
+                if ema is not None:
+                    ema.update(model)
                 optimizer.zero_grad(set_to_none=True)
                 grad_norms.append(float(grad_norm.detach().cpu()))
 
@@ -924,7 +1001,7 @@ def train_model():
 
         checkpoint_filename = get_checkpoint_name(epoch + 1)
         model_file_path = os.path.join(model_subdir, checkpoint_filename)
-        _save_checkpoint(model_file_path, model, optimizer, epoch + 1)
+        _save_checkpoint(model_file_path, model, optimizer, epoch + 1, ema=ema)
         print(f"Saved PyTorch checkpoint to {model_file_path}")
 
         train_class_metrics, train_all_classes_metrics = _metrics_for_logging(train_acc)
@@ -955,7 +1032,8 @@ def train_model():
             print("Conducting validation (2.5D)...")
             t0_val = time.perf_counter()
             val_acc = _empty_metric_accumulators()
-            model.eval()
+            validation_model = ema.model if ema is not None else model
+            validation_model.eval()
 
             val_dataset, val_temp_dirs = load_val_dataset(
                 scan_indexes=val_indexes,
@@ -971,6 +1049,7 @@ def train_model():
                 executor=_worker_pool,
                 temp_base_dir=_temp_base_dir,
                 optional_channel_indices=optional_channel_indices,
+                append_modality_presence=append_modality_presence,
                 brainiac_channel_indices=brainiac_channel_indices,
             )
             val_loader = torch.utils.data.DataLoader(
@@ -1005,7 +1084,7 @@ def train_model():
 
                     with _autocast_context(device, val_amp_enabled, amp_dtype):
                         val_logits, loss_val, loss_per_class_val = _compute_model_loss(
-                            model,
+                            validation_model,
                             x_val,
                             b_val,
                             y_val_onehot,
@@ -1034,7 +1113,7 @@ def train_model():
                         )
                         with _autocast_context(device, False, None):
                             val_logits, loss_val, loss_per_class_val = _compute_model_loss(
-                                model,
+                                validation_model,
                                 x_val,
                                 b_val,
                                 y_val_onehot,

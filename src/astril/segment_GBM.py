@@ -186,7 +186,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         undo_all_transforms,
         apply_inverse_canonical_4d,
     )
-    from .run_segmentation import majority_vote, average_prob, max_prob
+    from .run_segmentation import majority_vote, average_prob, average_logit, max_prob
 
     # Parse segmentation config file.
     cp = configparser.ConfigParser()
@@ -259,7 +259,13 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     model_num_output_slices = list(map(int, cfg["model_train_num_output_slices"].split(",")))
     model_min_hw = list(map(int, cfg["model_train_minimum_hw"].split(",")))
     model_num_classes = list(map(int, cfg["model_train_num_classes"].split(",")))
-    merging_method = cfg.get("merging_method", "majority_vote")
+    merging_method = cfg.get("merging_method", "average_logit")
+    merging_weights_raw = cfg.get("merging_weights", "").strip()
+    merging_weights = (
+        [float(value.strip()) for value in merging_weights_raw.split(",") if value.strip()]
+        if merging_weights_raw
+        else None
+    )
     
     plane_outputs = []
     for m_idx, model in enumerate(loaded_models):
@@ -270,8 +276,9 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         min_HW = model_min_hw[m_idx]
         print(f"[INFO] Exam {subject_index+1} | Using model {m_idx+1}: plane={plane}, in_slices={in_sl}, out_slices={out_sl}, n_cls={n_cls}, minHW={min_HW}")
         model_uses_brainiac_fusion = getattr(model, "brainiac_input_channels", 0) > 0
+        model_uses_presence = bool(getattr(model, "uses_modality_presence", False))
         val_data = load_val_data(
-            scan_indexes=[subject_index],
+            idx=subject_index,
             volume_paths_list=volume_paths_list,
             mask_paths=mask_paths,
             gt_paths=mask_paths,
@@ -282,6 +289,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             target_height=min_HW,
             target_width=min_HW,
             brainiac_paths_list=brainiac_paths_list if model_uses_brainiac_fusion else None,
+            append_modality_presence=model_uses_presence,
         )
         if model_uses_brainiac_fusion:
             (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
@@ -311,7 +319,11 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
                     batch_logits = model(x_tensor)
                 if isinstance(batch_logits, tuple):
                     batch_logits = batch_logits[0]
-                all_preds.append(F.softmax(batch_logits, dim=-1).cpu().numpy())
+                all_preds.append(
+                    batch_logits.float().cpu().numpy()
+                    if merging_method == "average_logit"
+                    else F.softmax(batch_logits.float(), dim=-1).cpu().numpy()
+                )
         if not all_preds:
             print(f"[WARNING] No predictions for exam {subject_index+1} (model {m_idx+1}).")
             reassembled_4d = np.zeros((oh, ow, od, n_cls), dtype=np.float32)
@@ -355,6 +367,12 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
         merged_label = average_prob(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
     elif merging_method == "max_prob":
         merged_label = max_prob(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+    elif merging_method == "average_logit":
+        merged_label = average_logit(
+            plane_outputs,
+            weights=merging_weights,
+            tiebreaker=tiebreaker_model,
+        ).astype(np.uint8)
     else:
         raise ValueError(f"Unknown merging method '{merging_method}'")
     nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
@@ -408,7 +426,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
         maskPattern=brainmask_pattern,
         model_paths=model1_paths,
         modelTrainConfigFiles=model1_train_configs,
-        merging_method="majority_vote",
+        merging_method="average_logit",
         inputVolumeDirectory=input_dir,
         outputVolumeDirectory="in_place",
         segmentSuffix="_Model_1_seg.nii.gz",
@@ -566,7 +584,7 @@ def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
             maskPattern="_Model_2_mask.nii.gz",
             model_paths=model2_paths,
             modelTrainConfigFiles=model2_train_configs,
-            merging_method="majority_vote",
+            merging_method="average_logit",
             inputVolumeDirectory=subject_dir,
             outputVolumeDirectory="in_place",
             segmentSuffix=segment_suffix,
