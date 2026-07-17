@@ -175,9 +175,11 @@ def _metrics_for_logging(acc):
         pred = acc["pred_count_by_class"][c]
         fp = pred - tp
         fn = gt - tp
-        denom_acc = gt + fp
+        tn = acc["total_samples"] - tp - fp - fn
+        denom_iou = tp + fp + fn
         class_metrics[c] = {
-            "accuracy": tp / float(denom_acc + 1e-9),
+            "iou": tp / float(denom_iou + 1e-9),
+            "accuracy": (tp + tn) / float(acc["total_samples"] + 1e-9),
             "precision": tp / float(pred + 1e-9),
             "recall": tp / float(gt + 1e-9),
             "loss": acc["loss_sum"][c] / float(max(acc["loss_count"][c], 1)),
@@ -1014,7 +1016,7 @@ def train_model():
         print(f"\nEpoch {epoch+1} Train Report:")
         for class_index, metrics in train_class_metrics.items():
             print(
-                f"Class {class_index} - Acc: {metrics['accuracy']:.3f}, "
+                f"Class {class_index} - IoU: {metrics['iou']:.3f}, Acc: {metrics['accuracy']:.3f}, "
                 f"Prec: {metrics['precision']:.3f}, Rec: {metrics['recall']:.3f}, "
                 f"Loss: {metrics['loss']:.4f}"
             )
@@ -1165,7 +1167,7 @@ def train_model():
             print(f"\nEpoch {epoch+1} Validation Report:")
             for class_index, metrics in val_class_metrics.items():
                 print(
-                    f"Class {class_index} - Acc: {metrics['accuracy']:.3f}, "
+                    f"Class {class_index} - IoU: {metrics['iou']:.3f}, Acc: {metrics['accuracy']:.3f}, "
                     f"Prec: {metrics['precision']:.3f}, Rec: {metrics['recall']:.3f}, "
                     f"Loss: {metrics['loss']:.4f}"
                 )

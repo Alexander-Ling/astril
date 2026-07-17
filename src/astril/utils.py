@@ -590,8 +590,31 @@ def append_metrics_to_file(file_path, epoch, class_metrics, all_classes_metrics=
     Append metrics for each class to a .tsv or .txt file.
     Optionally also write a row for "All_Classes" if all_classes_metrics is provided.
     """
+    legacy_header = "Epoch\tClass\tAccuracy\tPrecision\tRecall\tLoss"
+    headers = "Epoch\tClass\tIoU\tAccuracy\tPrecision\tRecall\tLoss\n"
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as existing_file:
+            existing_lines = existing_file.readlines()
+        if existing_lines and existing_lines[0].rstrip("\r\n") == legacy_header:
+            upgraded_lines = [headers]
+            for line in existing_lines[1:]:
+                fields = line.rstrip("\r\n").split("\t")
+                if len(fields) != 6:
+                    raise ValueError(f"Cannot upgrade malformed legacy metrics row in {file_path}: {line!r}")
+                epoch_value, class_name, legacy_accuracy, precision, recall, loss = fields
+                # Historical per-class "Accuracy" was IoU. The historical
+                # All_Classes value was micro accuracy, so it has no matching IoU.
+                if class_name == "All_Classes":
+                    iou, accuracy = "NA", legacy_accuracy
+                else:
+                    iou, accuracy = legacy_accuracy, "NA"
+                upgraded_lines.append(
+                    f"{epoch_value}\t{class_name}\t{iou}\t{accuracy}\t{precision}\t{recall}\t{loss}\n"
+                )
+            with open(file_path, "w", encoding="utf-8", newline="") as upgraded_file:
+                upgraded_file.writelines(upgraded_lines)
+
     mode = 'a' if os.path.exists(file_path) else 'w'
-    headers = "Epoch\tClass\tAccuracy\tPrecision\tRecall\tLoss\n"
     
     with open(file_path, mode) as file:
         if mode == 'w':
@@ -599,18 +622,19 @@ def append_metrics_to_file(file_path, epoch, class_metrics, all_classes_metrics=
 
         # Per-class lines
         for class_index, metrics in class_metrics.items():
+            iou = _metric_value(metrics['iou'])
             accuracy = _metric_value(metrics['accuracy'])
             precision = _metric_value(metrics['precision'])
             recall = _metric_value(metrics['recall'])
             loss_val = _metric_value(metrics['loss'])
             file.write(
-                f"{epoch}\tClass_{class_index}\t{accuracy:.3f}\t{precision:.3f}\t{recall:.3f}\t{loss_val:.4f}\n"
+                f"{epoch}\tClass_{class_index}\t{iou:.3f}\t{accuracy:.3f}\t{precision:.3f}\t{recall:.3f}\t{loss_val:.4f}\n"
             )
 
         # Optional line for "All_Classes"
         if all_classes_metrics is not None:
             file.write(
-                f"{epoch}\tAll_Classes\t"
+                f"{epoch}\tAll_Classes\tNA\t"
                 f"{all_classes_metrics['accuracy']:.3f}\t"
                 f"{all_classes_metrics['precision']:.3f}\t"
                 f"{all_classes_metrics['recall']:.3f}\t"
