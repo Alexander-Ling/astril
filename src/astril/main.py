@@ -38,6 +38,9 @@ def parse_train_parameters(config_file_path):
         config.pretrained_model_path = None
     else:
         config.pretrained_model_path = raw_pretrained
+    config.pretrained_model_load_optimizer = cfg_parser.getboolean(
+        "DEFAULT", "pretrained_model_load_optimizer", fallback=True
+    )
     config.print_every_n_subbatches = cfg_parser.getint("DEFAULT", "print_every_n_subbatches")
     config.minimum_height_width = cfg_parser.getint("DEFAULT", "minimum_height_width")
     config.num_channels = len(config.image_paths_files)

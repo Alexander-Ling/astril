@@ -392,6 +392,7 @@ def create_config_files(
         f.write("missing_channel_fill = zero\n")
         f.write(f"training_schedule_file = {trainingSchedulePath}\n")
         f.write(f"pretrained_model_path = {preTrainedModelPath}\n")
+        f.write("pretrained_model_load_optimizer = true\n")
         f.write(f"print_every_n_subbatches = {subbatchLogFrequency}\n")
         f.write(f"base_num_filters = {base_num_filters}\n")
         f.write(f"center_depth = {center_depth}\n")

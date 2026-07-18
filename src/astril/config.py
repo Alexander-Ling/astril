@@ -70,6 +70,7 @@ num_input_slices = None
 num_output_slices = None
 training_schedule_file = None
 pretrained_model_path = None
+pretrained_model_load_optimizer = True
 print_every_n_subbatches = None
 minimum_height_width = None
 num_channels = None

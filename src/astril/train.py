@@ -30,6 +30,7 @@ from .config import (
     slicing_plane,
     training_schedule_file,
     pretrained_model_path,
+    pretrained_model_load_optimizer,
     print_every_n_subbatches,
     num_input_slices,
     num_output_slices,
@@ -554,7 +555,13 @@ def train_model():
                 "pretrained_model_path must point to a PyTorch .pt checkpoint after the migration."
             )
         print(f"Starting from pre-trained PyTorch checkpoint: {pretrained_model_path}")
-        model, optimizer_checkpoint, _ = _load_model_from_checkpoint(pretrained_model_path, device)
+        model, pretrained_checkpoint, _ = _load_model_from_checkpoint(pretrained_model_path, device)
+        if pretrained_model_load_optimizer:
+            optimizer_checkpoint = pretrained_checkpoint
+            print("Restoring optimizer and EMA state from the pre-trained checkpoint.")
+        else:
+            optimizer_checkpoint = None
+            print("Using pre-trained model weights only; optimizer and EMA state are freshly initialized.")
         starting_epoch = 0
     else:
         print("Creating PyTorch model from scratch.")
