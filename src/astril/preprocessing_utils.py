@@ -3476,7 +3476,96 @@ def apply_mask_anydim(input_image_path, mask_path, output_path):
     nib.save(nib.Nifti1Image(out, img.affine, img.header), output_path)
     return output_path
 
-def normalize_masked_anydim(input_image_path, mask_path, output_path, zero_outside_mask=False):
+def _normalize_masked_frame(
+    data,
+    mask,
+    *,
+    method="robust_zscore",
+    percentiles=(0.1, 99.9),
+    z_clip=5.0,
+):
+    """Normalize one 3-D frame while preserving the transformed raw background.
+
+    ``robust_zscore`` estimates location/scale from winsorized finite in-mask
+    values, then applies the same winsorization and optional z clipping to the
+    complete finite image (foreground and background alike).
+
+    Empty, non-finite-only, and constant in-mask inputs deliberately fall back
+    to a unit scale instead of raising, so one degenerate scan cannot stop a
+    large batch.  Non-finite voxels are treated as raw zero for the output.
+    """
+    import numpy as np
+
+    if method not in {"robust_zscore", "zscore"}:
+        raise ValueError("method must be 'robust_zscore' or 'zscore'")
+    if len(percentiles) != 2:
+        raise ValueError("percentiles must contain exactly two values")
+    low_pct, high_pct = (float(percentiles[0]), float(percentiles[1]))
+    if not (0.0 <= low_pct < high_pct <= 100.0):
+        raise ValueError("percentiles must satisfy 0 <= low < high <= 100")
+    if z_clip is not None and float(z_clip) <= 0:
+        raise ValueError("z_clip must be positive or None")
+
+    data = np.asarray(data, dtype=np.float32)
+    mask = np.asarray(mask, dtype=bool)
+    finite = np.isfinite(data)
+    valid = mask & finite
+    # Do not let NaN/Inf propagate into training inputs.  A non-finite voxel is
+    # represented exactly as a raw background zero in the normalized output.
+    working = np.where(finite, data, 0.0).astype(np.float32, copy=False)
+    values = working[valid]
+
+    location = 0.0
+    scale = 1.0
+    normalized_input = working
+    if values.size:
+        if method == "robust_zscore":
+            lo, hi = np.percentile(values, (low_pct, high_pct))
+            if np.isfinite(lo) and np.isfinite(hi):
+                clipped_values = np.clip(values, lo, hi)
+                location = float(clipped_values.mean())
+                scale = float(clipped_values.std())
+                # Apply the foreground-derived bounds to the complete image so
+                # background follows the exact same intensity transform.
+                normalized_input = np.clip(working, lo, hi)
+            else:
+                location = float(values.mean())
+                scale = float(values.std())
+        else:
+            location = float(values.mean())
+            scale = float(values.std())
+
+        # Constant images are valid inputs.  A unit fallback maps their
+        # foreground to zero while retaining the corresponding background level.
+        near_constant_scale = np.finfo(np.float32).eps * max(1.0, abs(location))
+        if not np.isfinite(scale) or scale <= near_constant_scale:
+            scale = 1.0
+
+    out = ((normalized_input - location) / scale).astype(np.float32, copy=False)
+    if method == "robust_zscore" and z_clip is not None and values.size:
+        out = np.clip(out, -float(z_clip), float(z_clip))
+    return out
+
+
+def normalize_masked_anydim(
+    input_image_path,
+    mask_path,
+    output_path,
+    zero_outside_mask=False,
+    *,
+    method="robust_zscore",
+    percentiles=(0.1, 99.9),
+    z_clip=5.0,
+):
+    """Normalize a masked 3-D/4-D MRI with robust per-frame z-scoring.
+
+    The default clips only finite in-mask intensities at the 0.1/99.9th
+    percentiles, estimates mean/std from those winsorized values, and clips
+    all finite image values to ``[-5, 5]``. The same winsorization and clipping
+    are applied to background unless ``zero_outside_mask=True``.
+
+    Set ``method='zscore'`` for the legacy untrimmed mean/std behavior.
+    """
     import nibabel as nib
     import numpy as np
 
@@ -3492,37 +3581,27 @@ def normalize_masked_anydim(input_image_path, mask_path, output_path, zero_outsi
         if data.shape != mask.shape:
             raise ValueError(f"Mask shape {mask.shape} does not match image shape {data.shape}")
 
-        out = np.zeros_like(data)
-        vals = data[mask]
-        if vals.size:
-            mu = vals.mean()
-            sigma = vals.std()
-            if sigma <= 0:
-                sigma = 1.0
-            if zero_outside_mask:
-                out[mask] = (vals - mu) / sigma
-            else:
-                out = (data - mu) / sigma
+        out = _normalize_masked_frame(
+            data, mask, method=method, percentiles=percentiles, z_clip=z_clip
+        )
+        if zero_outside_mask:
+            out = out.copy()
+            out[~mask] = 0.0
 
     elif data.ndim == 4:
         if data.shape[:3] != mask.shape:
             raise ValueError(f"Mask shape {mask.shape} does not match image spatial shape {data.shape[:3]}")
 
-        out = np.zeros_like(data)
+        out = np.empty_like(data)
         for t in range(data.shape[3]):
             frame = data[..., t]
-            vals = frame[mask]
-            if not vals.size:
-                continue
-            mu = vals.mean()
-            sigma = vals.std()
-            if sigma <= 0:
-                sigma = 1.0
-            out_frame = out[..., t]          # view
+            out_frame = _normalize_masked_frame(
+                frame, mask, method=method, percentiles=percentiles, z_clip=z_clip
+            )
             if zero_outside_mask:
-                out_frame[mask] = (vals - mu) / sigma
-            else:
-                out_frame = (frame - mu) / sigma
+                out_frame = out_frame.copy()
+                out_frame[~mask] = 0.0
+            out[..., t] = out_frame
 
     else:
         raise ValueError(f"Unsupported ndim={data.ndim} for {input_image_path}")

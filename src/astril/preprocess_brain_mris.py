@@ -398,6 +398,9 @@ def preprocess_library(
     registration_strategy: str = "medium",
     registration_voxel_mm: str = "2,2,2",
     family_parent_map: dict[str, str] | None = None,
+    normalization_method: str = "robust_zscore",
+    normalization_percentiles: tuple[float, float] = (0.1, 99.9),
+    normalization_z_clip: float | None = None,
     final_dims: tuple[int, int, int] = (240, 240, 155),
     final_voxels: tuple[float, float, float] = (1.0, 1.0, 1.0),
     save_scans_with_skulls: bool = False,
@@ -862,6 +865,7 @@ def preprocess_library(
             "PatientBrainmaskUsed",
             "anchor_label", "modalities",
             "registration_metric", "anchor_to_coreg_metric", "registration_strategy", "registration_voxel_mm", "interp",
+            "normalization_method", "normalization_percentiles", "normalization_z_clip",
             "final_dims", "final_voxels",
             "save_scans_with_skulls", "use_gpu", "enable_tta", "debug",
         ])
@@ -933,6 +937,9 @@ def preprocess_library(
                 debug=debug,
                 brainmask_path=str(brainmask_path) if (reuse_patient_brainmask and brainmask_path) else None,
                 family_parent_map=family_parent_map,
+                normalization_method=normalization_method,
+                normalization_percentiles=normalization_percentiles,
+                normalization_z_clip=normalization_z_clip,
                 use_gpu=use_gpu,
                 enable_tta=enable_tta,
                 n_workers_per_registration_process=n_workers_per_registration_process,
@@ -1033,6 +1040,7 @@ def preprocess_library(
             str(patient_mask or "NONE") if reuse_patient_brainmask else "DISABLED",
             anchor_label, ",".join(modalities) if modalities else "AUTO",
             registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
+            normalization_method, normalization_percentiles, normalization_z_clip,
             final_dims, final_voxels,
             save_scans_with_skulls, use_gpu, enable_tta, debug,
         ])
@@ -1178,6 +1186,26 @@ def main():
             "Example: '{\"DWI\":\"DWI\", \"SWI\":\"SWI\"}'."
         ),
     )
+    p.add_argument(
+        "--normalization_method",
+        choices=("robust_zscore", "zscore"),
+        default="robust_zscore",
+        help="Final 3-D brain normalization method (default: robust_zscore).",
+    )
+    p.add_argument(
+        "--normalization_percentiles",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        default=(0.1, 99.9),
+        help="In-mask winsorization percentiles for robust_zscore (default: 0.1 99.9).",
+    )
+    p.add_argument(
+        "--normalization_z_clip",
+        type=float,
+        default=None,
+        help="Optional symmetric final z-score limit for robust_zscore (default: disabled).",
+    )
     p.add_argument("--final_dims", action="append", default=None, metavar="NX,NY,NZ",
                    help="Final data dimensions; repeatable. Provide like '240,240,155' (or '240x240x155'). If given multiple times, you must also provide --final_voxels the same number of times.")
     p.add_argument("--final_voxels", action="append", default=None, metavar="SX,SY,SZ",
@@ -1224,6 +1252,9 @@ def main():
         registration_strategy=args.registration_strategy,
         registration_voxel_mm=args.registration_voxel_mm,
         family_parent_map=family_parent_map,
+        normalization_method=args.normalization_method,
+        normalization_percentiles=args.normalization_percentiles,
+        normalization_z_clip=args.normalization_z_clip,
         final_dims=args.final_dims,
         final_voxels=args.final_voxels,
         save_scans_with_skulls=args.save_scans_with_skulls,
