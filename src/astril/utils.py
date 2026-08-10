@@ -38,6 +38,7 @@ def init_logging(output_dir):
     Returns:
         (log_file, log_file_path)
     """
+    os.makedirs(output_dir, exist_ok=True)
     current_date_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_file_path = os.path.join(output_dir, f"Log_{current_date_time}.log")
 
