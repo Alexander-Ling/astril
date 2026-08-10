@@ -31,6 +31,7 @@ from .config import (
     training_schedule_file,
     pretrained_model_path,
     pretrained_model_load_optimizer,
+    pretrained_transfer_mode,
     print_every_n_subbatches,
     num_input_slices,
     num_output_slices,
@@ -318,6 +319,63 @@ def _load_model_from_checkpoint(path, device):
     return model, checkpoint, epoch
 
 
+def _initialize_model_from_compatible_checkpoint(path, device):
+    """Initialize the configured model with compatible tensors from a checkpoint.
+
+    Unlike ``pretrained_model_path``'s normal full-checkpoint restore, this
+    creates the destination architecture from the active configuration.  It is
+    therefore safe to transfer a backbone into a model with a different output
+    head (for example binary Model A -> five-class Model B).
+    """
+    checkpoint = _load_checkpoint(path, device)
+    source_state = checkpoint.get("ema_model_state_dict") or checkpoint["model_state_dict"]
+    source_name = "EMA" if checkpoint.get("ema_model_state_dict") else "model"
+    model = create_dynamic_unet_from_config().to(device)
+    destination_state = model.state_dict()
+    head_prefixes = ("final_conv.", "aux_heads.")
+    copied = {}
+    skipped = []
+    incompatible_backbone = []
+
+    for key, source_tensor in source_state.items():
+        destination_tensor = destination_state.get(key)
+        if destination_tensor is not None and destination_tensor.shape == source_tensor.shape:
+            copied[key] = source_tensor
+            continue
+        skipped.append(key)
+        if not key.startswith(head_prefixes):
+            incompatible_backbone.append(
+                f"{key}: source={tuple(source_tensor.shape)} "
+                f"destination={None if destination_tensor is None else tuple(destination_tensor.shape)}"
+            )
+
+    missing_backbone = [
+        key for key in destination_state
+        if key not in copied and not key.startswith(head_prefixes)
+    ]
+    if incompatible_backbone or missing_backbone:
+        details = incompatible_backbone + [f"missing source tensor: {key}" for key in missing_backbone]
+        raise RuntimeError(
+            "Compatible-weight transfer found non-head incompatibilities:\n  "
+            + "\n  ".join(details)
+        )
+
+    missing, unexpected = model.load_state_dict(copied, strict=False)
+    illegal_missing = [key for key in missing if not key.startswith(head_prefixes)]
+    if illegal_missing or unexpected:
+        raise RuntimeError(
+            "Compatible-weight transfer did not load the expected backbone tensors: "
+            f"missing={illegal_missing}, unexpected={unexpected}"
+        )
+    print(
+        f"Initialized configured model from {source_name} tensors in {path}: "
+        f"copied={len(copied)}, fresh_head_tensors={len(missing)}, skipped_source_tensors={len(skipped)}."
+    )
+    if skipped:
+        print("Freshly initialized destination heads; skipped source tensors: " + ", ".join(skipped))
+    return model
+
+
 def _resolve_mixed_precision(device, enabled, requested_dtype):
     if not enabled or device.type != "cuda":
         return False, None, "disabled"
@@ -555,13 +613,22 @@ def train_model():
                 "pretrained_model_path must point to a PyTorch .pt checkpoint after the migration."
             )
         print(f"Starting from pre-trained PyTorch checkpoint: {pretrained_model_path}")
-        model, pretrained_checkpoint, _ = _load_model_from_checkpoint(pretrained_model_path, device)
-        if pretrained_model_load_optimizer:
-            optimizer_checkpoint = pretrained_checkpoint
-            print("Restoring optimizer and EMA state from the pre-trained checkpoint.")
-        else:
+        if pretrained_transfer_mode == "compatible_weights":
+            if pretrained_model_load_optimizer:
+                raise ValueError(
+                    "compatible_weights transfer requires pretrained_model_load_optimizer = false."
+                )
+            model = _initialize_model_from_compatible_checkpoint(pretrained_model_path, device)
             optimizer_checkpoint = None
-            print("Using pre-trained model weights only; optimizer and EMA state are freshly initialized.")
+            print("Using compatible pre-trained weights only; optimizer and EMA are freshly initialized.")
+        else:
+            model, pretrained_checkpoint, _ = _load_model_from_checkpoint(pretrained_model_path, device)
+            if pretrained_model_load_optimizer:
+                optimizer_checkpoint = pretrained_checkpoint
+                print("Restoring optimizer and EMA state from the pre-trained checkpoint.")
+            else:
+                optimizer_checkpoint = None
+                print("Using pre-trained model weights only; optimizer and EMA state are freshly initialized.")
         starting_epoch = 0
     else:
         print("Creating PyTorch model from scratch.")

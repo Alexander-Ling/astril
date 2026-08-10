@@ -239,16 +239,42 @@ def download_models(overwrite: bool = False, only: Optional[List[str]] = None) -
     print(f"\nModels available at: {target}")
     return target
 
+
+def model_archives_for_families(families: List[str]) -> List[str]:
+    """Return manifest archive filenames whose extracted family matches ``families``."""
+    manifest = _load_manifest()
+    wanted = {family.strip() for family in families if family and family.strip()}
+    if not wanted:
+        raise ValueError("At least one non-empty model family is required.")
+    archives = [
+        filename for filename, metadata in manifest.items()
+        if metadata.get("kind") == "pytorch_zip" and metadata.get("extract_to") in wanted
+    ]
+    missing = sorted(wanted - {manifest[filename].get("extract_to") for filename in archives})
+    if missing:
+        raise ValueError(f"No downloadable model archive is registered for family/families: {missing}")
+    return archives
+
+
+def download_model_families(families: List[str], overwrite: bool = False) -> Path:
+    """Download and extract the registered archives for the requested model families."""
+    return download_models(overwrite=overwrite, only=model_archives_for_families(families))
+
 # ---- CLI ----
 def cli_download(argv=None) -> None:
     import argparse
     p = argparse.ArgumentParser(prog="astril-download-models")
     p.add_argument("--overwrite", action="store_true", help="Replace existing files")
     p.add_argument("--only", type=str, help="Comma-separated list of filenames to fetch")
+    p.add_argument("--family", type=str, help="Comma-separated extracted model family/families to fetch, e.g. GBM_seg_v2")
     p.add_argument("--keep-archives", action="store_true", help="Keep .zip archives after extraction")
     args = p.parse_args(argv)
+    if args.only and args.family:
+        p.error("Use either --only or --family, not both.")
     only = [s.strip() for s in args.only.split(",")] if args.only else None
     # Stash flag on the function for simple propagation without changing signature
     download_models._keep_archives = bool(args.keep_archives)  # type: ignore[attr-defined]
-    out = download_models(overwrite=args.overwrite, only=only)
+    out = download_model_families(
+        [s.strip() for s in args.family.split(",") if s.strip()], overwrite=args.overwrite
+    ) if args.family else download_models(overwrite=args.overwrite, only=only)
     print(out)

@@ -41,6 +41,13 @@ def parse_train_parameters(config_file_path):
     config.pretrained_model_load_optimizer = cfg_parser.getboolean(
         "DEFAULT", "pretrained_model_load_optimizer", fallback=True
     )
+    config.pretrained_transfer_mode = cfg_parser.get(
+        "DEFAULT", "pretrained_transfer_mode", fallback="full_checkpoint"
+    ).strip().lower()
+    if config.pretrained_transfer_mode not in {"full_checkpoint", "compatible_weights"}:
+        raise ValueError(
+            "pretrained_transfer_mode must be 'full_checkpoint' or 'compatible_weights'."
+        )
     config.print_every_n_subbatches = cfg_parser.getint("DEFAULT", "print_every_n_subbatches")
     config.minimum_height_width = cfg_parser.getint("DEFAULT", "minimum_height_width")
     config.num_channels = len(config.image_paths_files)

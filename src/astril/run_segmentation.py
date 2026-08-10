@@ -297,7 +297,11 @@ def run_segmentation(
     slice_batch_size=1,
     overwrite=False,
     tiebreaker_model=0,
-    debug_models=False
+    debug_models=False,
+    save_foreground_probability=False,
+    foreground_probability_suffix="_foreground_probability.nii.gz",
+    save_class_probabilities=False,
+    class_probability_suffix_template="_class{class_index}_probability.nii.gz",
 ):
     import numpy as np
     import nibabel as nib
@@ -608,6 +612,44 @@ def run_segmentation(
         merged_label = merge_predictions(plane_outputs).astype(np.uint8)
         nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
         print(f"[INFO] Final seg => {out_path}")
+        if save_class_probabilities:
+            if merging_method != "average_prob":
+                raise ValueError(
+                    "Class probability export requires merging_method = average_prob."
+                )
+            mean_probabilities = np.mean(np.stack(plane_outputs, axis=0), axis=0)
+            for class_index in range(n_cls):
+                probability_name = base_name.replace(
+                    maskPattern,
+                    class_probability_suffix_template.format(class_index=class_index),
+                )
+                if probability_name == base_name:
+                    probability_name = base_name.replace(
+                        ".nii.gz",
+                        class_probability_suffix_template.format(class_index=class_index),
+                    )
+                probability_path = out_dir / probability_name
+                class_probability = mean_probabilities[..., class_index].astype(np.float32)
+                nib.save(nib.Nifti1Image(class_probability, affine), str(probability_path))
+                print(f"[INFO] Class {class_index} probability => {probability_path}")
+        if save_foreground_probability:
+            if merging_method != "average_prob":
+                raise ValueError(
+                    "Foreground probability export requires merging_method = average_prob."
+                )
+            if n_cls != 2:
+                raise ValueError(
+                    "Foreground probability export currently requires a binary model ensemble."
+                )
+            foreground_probability = np.mean(
+                np.stack(plane_outputs, axis=0), axis=0
+            )[..., 1].astype(np.float32)
+            probability_name = base_name.replace(maskPattern, foreground_probability_suffix)
+            if probability_name == base_name:
+                probability_name = base_name.replace(".nii.gz", foreground_probability_suffix)
+            probability_path = out_dir / probability_name
+            nib.save(nib.Nifti1Image(foreground_probability, affine), str(probability_path))
+            print(f"[INFO] Foreground probability => {probability_path}")
 
     print("[INFO] All exams done.")
 
@@ -631,6 +673,14 @@ def main():
                         help="Force PyTorch to use CPU.")
     parser.add_argument("--debug_models", action="store_true", default=False,
                         help="Save each model's pre-merge label for debug.")
+    parser.add_argument("--save_foreground_probability", action="store_true", default=False,
+                        help="With a binary average-probability ensemble, also write the mean foreground probability.")
+    parser.add_argument("--foreground_probability_suffix", default="_foreground_probability.nii.gz",
+                        help="Suffix for --save_foreground_probability outputs.")
+    parser.add_argument("--save_class_probabilities", action="store_true", default=False,
+                        help="With average-probability merging, write one probability NIfTI per class.")
+    parser.add_argument("--class_probability_suffix_template", default="_class{class_index}_probability.nii.gz",
+                        help="Filename suffix template for --save_class_probabilities.")
 
     args = parser.parse_args()
     if args.use_cpu:
@@ -641,7 +691,11 @@ def main():
         slice_batch_size=args.slice_batch_size,
         overwrite=args.overwrite_existing_outputs,
         tiebreaker_model=args.tiebreaker_model,
-        debug_models=args.debug_models
+        debug_models=args.debug_models,
+        save_foreground_probability=args.save_foreground_probability,
+        foreground_probability_suffix=args.foreground_probability_suffix,
+        save_class_probabilities=args.save_class_probabilities,
+        class_probability_suffix_template=args.class_probability_suffix_template,
     )
 
 if __name__ == "__main__":

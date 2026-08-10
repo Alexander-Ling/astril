@@ -1,24 +1,27 @@
 {
-  "GBM_seg_v1_pytorch.zip": {
-    "bytes": 473754730,
+  "GBM_seg_v2.zip": {
+    "bytes": 1759730639,
     "expect": [
-      "Axial_1.pt",
-      "Axial_1_train_parameters.cfg",
-      "Axial_2.pt",
-      "Axial_2_train_parameters.cfg",
-      "Coronal_1.pt",
-      "Coronal_1_train_parameters.cfg",
-      "Coronal_2.pt",
-      "Coronal_2_train_parameters.cfg",
-      "Sagittal_1.pt",
-      "Sagittal_1_train_parameters.cfg",
-      "Sagittal_2.pt",
-      "Sagittal_2_train_parameters.cfg"
+      "README.md",
+      "CITATIONS.md",
+      "CITATIONS.bib",
+      "Model_A_Axial.pt",
+      "Model_A_Axial_train_parameters.cfg",
+      "Model_A_Coronal.pt",
+      "Model_A_Coronal_train_parameters.cfg",
+      "Model_A_Sagittal.pt",
+      "Model_A_Sagittal_train_parameters.cfg",
+      "Model_B_Axial.pt",
+      "Model_B_Axial_train_parameters.cfg",
+      "Model_B_Coronal.pt",
+      "Model_B_Coronal_train_parameters.cfg",
+      "Model_B_Sagittal.pt",
+      "Model_B_Sagittal_train_parameters.cfg"
     ],
-    "extract_to": "GBM_seg_v1",
+    "extract_to": "GBM_seg_v2",
     "kind": "pytorch_zip",
-    "sha256": "e8fdcdf6c8b62e51f2cd386171cae48e9a49cd76c4618e92d76b53c9c5e5ff72",
-    "url": "https://osf.io/download/REPLACE_WITH_PYTORCH_GBM_SEG_V1/",
-    "version": "2026-05-15T00:00:00Z"
+    "sha256": "47c5a4f97b8ea415300e84a139ef744e75ea4b646e13a848373c995c0b342cb1",
+    "url": "https://osf.io/download/j2vbp/",
+    "version": "2026-08-10"
   }
 }
