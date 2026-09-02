@@ -633,17 +633,24 @@ def run_segmentation(
                 nib.save(nib.Nifti1Image(class_probability, affine), str(probability_path))
                 print(f"[INFO] Class {class_index} probability => {probability_path}")
         if save_foreground_probability:
-            if merging_method != "average_prob":
-                raise ValueError(
-                    "Foreground probability export requires merging_method = average_prob."
-                )
             if n_cls != 2:
                 raise ValueError(
                     "Foreground probability export currently requires a binary model ensemble."
                 )
-            foreground_probability = np.mean(
-                np.stack(plane_outputs, axis=0), axis=0
-            )[..., 1].astype(np.float32)
+            stacked_outputs = np.stack(plane_outputs, axis=0)
+            if merging_method == "average_prob":
+                foreground_probability = np.mean(stacked_outputs, axis=0)[..., 1]
+            elif merging_method == "average_logit":
+                weights = np.ones(stacked_outputs.shape[0], dtype=np.float32) if merging_weights is None else np.asarray(merging_weights, dtype=np.float32)
+                weights = weights / weights.sum()
+                fused_logits = np.tensordot(weights, stacked_outputs, axes=(0, 0))
+                foreground_logit = fused_logits[..., 1] - fused_logits[..., 0]
+                foreground_probability = 1.0 / (1.0 + np.exp(-np.clip(foreground_logit, -80.0, 80.0)))
+            else:
+                raise ValueError(
+                    "Foreground probability export requires merging_method = average_prob or average_logit."
+                )
+            foreground_probability = foreground_probability.astype(np.float32)
             probability_name = base_name.replace(maskPattern, foreground_probability_suffix)
             if probability_name == base_name:
                 probability_name = base_name.replace(".nii.gz", foreground_probability_suffix)
