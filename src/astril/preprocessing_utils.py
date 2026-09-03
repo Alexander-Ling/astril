@@ -4,6 +4,7 @@ import numpy as np
 import nibabel as nib
 import shutil
 import os
+import sys
 import warnings
 try:
     import pydicom
@@ -22,6 +23,8 @@ import glob
 import contextlib
 import threading
 import atexit
+import importlib.util
+import sysconfig
 from scipy.ndimage import zoom
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -2312,6 +2315,56 @@ def _log_nifti_shape(nifti_path: str, orig_path: str | None, verbose=None):
 def _which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
+
+def ensure_dcm2niix_accessible() -> str:
+    """Return a usable dcm2niix executable, including from Python's install.
+
+    A Python environment can contain the dcm2niix package while its Scripts
+    directory is absent from the shell PATH.  Resolve that installation
+    directly and add its directory to this process's PATH so both subprocess
+    calls and external Astril commands behave consistently.
+    """
+    found = shutil.which("dcm2niix")
+    if found:
+        return found
+
+    executable_name = "dcm2niix.exe" if os.name == "nt" else "dcm2niix"
+    scripts_dir = Path(sysconfig.get_path("scripts"))
+    candidates = [scripts_dir / executable_name]
+    spec = importlib.util.find_spec("dcm2niix")
+    if spec is not None:
+        if spec.submodule_search_locations:
+            package_dir = Path(next(iter(spec.submodule_search_locations)))
+        elif spec.origin:
+            package_dir = Path(spec.origin).parent
+        else:
+            package_dir = None
+        if package_dir is not None:
+            candidates.append(package_dir / executable_name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            os.environ["PATH"] = str(candidate.parent) + os.pathsep + os.environ.get("PATH", "")
+            found = shutil.which("dcm2niix")
+            if found:
+                return found
+
+    scripts_text = str(scripts_dir)
+    if os.name == "nt":
+        path_fix = f'$env:Path = "{scripts_text};$env:Path"'
+    else:
+        path_fix = f'export PATH="{scripts_text}:$PATH"'
+    raise RuntimeError(
+        "dcm2niix is required for DICOM conversion, but its executable was "
+        "not found in the active Python installation or on PATH.\n\n"
+        "Install it with:\n"
+        f"    {sys.executable!r} -m pip install dcm2niix\n\n"
+        "Add Python's executable directory to the current shell:\n"
+        f"    {path_fix}\n\n"
+        "Verify with:\n"
+        "    dcm2niix -h"
+    )
+
 def _transcode_dicom_dir_to_explicit_le(src_dir: str, *, verbose=None, temp_root_dir: str | None = None) -> str | None:
     """Return path to a temp dir with decoded DICOMs (Explicit VR Little Endian), or None if no tool is available."""
     src = Path(src_dir)
@@ -2378,8 +2431,7 @@ def _nifti_from_any(input_path_or_dir: str,
     if _is_dicom_dir(input_path_or_dir):
         _dbg(verbose, "Input is DICOM dir:", input_path_or_dir)
         # Ensure dcm2niix exists
-        if not _which("dcm2niix"):
-            raise RuntimeError("dcm2niix not found on PATH. Please install dcm2niix and ensure it is discoverable.")
+        dcm2niix_exe = ensure_dcm2niix_accessible()
 
         tmpdirs_created: list[str] = []
         def _mk_tmp(prefix: str) -> str:
@@ -2398,7 +2450,7 @@ def _nifti_from_any(input_path_or_dir: str,
         # Try dcm2niix (with optional transcode+retry)
         try:
             tmpdir = _mk_tmp(prefix="dcm2niix_")
-            cmd = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir]
+            cmd = [dcm2niix_exe, "-z", "y", "-f", "tmp", "-o", tmpdir, input_path_or_dir]
             _dbg(verbose, "running:", " ".join(cmd))
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             _dbg(verbose, f"dcm2niix returncode={proc.returncode}")
@@ -2412,7 +2464,7 @@ def _nifti_from_any(input_path_or_dir: str,
                         tmpdirs_created.append(decoded)
 
                     tmpdir2 = _mk_tmp(prefix="dcm2niix_")
-                    cmd2 = ["dcm2niix", "-z", "y", "-f", "tmp", "-o", tmpdir2, decoded]
+                    cmd2 = [dcm2niix_exe, "-z", "y", "-f", "tmp", "-o", tmpdir2, decoded]
                     _dbg(verbose, "retry:", " ".join(cmd2))
                     proc2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     _dbg(verbose, f"dcm2niix retry returncode={proc2.returncode}")
@@ -2613,8 +2665,7 @@ def export_dwi_nrrd_from_dicoms(
     This is primarily intended for 3D Slicer / SlicerDMRI compatibility.
     We keep the standard NIfTI + .bval/.bvec + .json outputs as well.
     """
-    if not _which("dcm2niix"):
-        raise RuntimeError("dcm2niix not found on PATH. Please install dcm2niix and ensure it is discoverable.")
+    dcm2niix_exe = ensure_dcm2niix_accessible()
 
     out_dir = os.path.dirname(os.path.abspath(output_nrrd_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -2661,7 +2712,7 @@ def export_dwi_nrrd_from_dicoms(
 
     try:
         tmpdir = _mk_tmp(prefix="dwi_nrrd_")
-        cmd = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir, dicom_series_dir]
+        cmd = [dcm2niix_exe, "-e", "y", "-f", base, "-o", tmpdir, dicom_series_dir]
         _dbg(verbose, "[export_dwi_nrrd] running:", " ".join(cmd))
         proc = subprocess.run(cmd, capture_output=True, text=True)
         _dbg(verbose, f"[export_dwi_nrrd] dcm2niix returncode={proc.returncode}")
@@ -2679,7 +2730,7 @@ def export_dwi_nrrd_from_dicoms(
             )
             if decoded:
                 tmpdir_retry = _mk_tmp(prefix="dwi_nrrd_retry_")
-                cmd_retry = ["dcm2niix", "-e", "y", "-f", base, "-o", tmpdir_retry, decoded]
+                cmd_retry = [dcm2niix_exe, "-e", "y", "-f", base, "-o", tmpdir_retry, decoded]
                 _dbg(verbose, "[export_dwi_nrrd] retry:", " ".join(cmd_retry))
                 proc_retry = subprocess.run(cmd_retry, capture_output=True, text=True)
                 _dbg(verbose, f"[export_dwi_nrrd] retry returncode={proc_retry.returncode}")
