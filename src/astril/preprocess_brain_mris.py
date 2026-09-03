@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import subprocess
 import tempfile
+import importlib.util
+import sysconfig
 
 # We import and call your existing function directly (no subprocess).
 # If your package layout differs (e.g., installed as astril), adjust the import:
@@ -40,6 +42,60 @@ class _InterruptibleThreadPoolExecutor(ThreadPoolExecutor):
             cancel_futures=exc_type is not None,
         )
         return False
+
+
+def _ensure_dcm2niix_accessible() -> str:
+    """Ensure the dcm2niix executable can be found by this Python process.
+
+    The PyPI package may place its launcher in Python's Scripts/bin directory
+    without that directory being present on PATH (especially for base Python
+    installations on Windows).  In that case, add the package/script
+    directory for this process rather than requiring users to edit PATH first.
+    """
+    executable_name = "dcm2niix.exe" if os.name == "nt" else "dcm2niix"
+
+    found = shutil.which("dcm2niix")
+    if found:
+        return found
+
+    candidates: list[Path] = []
+    scripts_dir = Path(sysconfig.get_path("scripts"))
+    candidates.append(scripts_dir / executable_name)
+
+    spec = importlib.util.find_spec("dcm2niix")
+    if spec is not None:
+        if spec.submodule_search_locations:
+            package_dir = Path(next(iter(spec.submodule_search_locations)))
+        elif spec.origin:
+            package_dir = Path(spec.origin).parent
+        else:
+            package_dir = None
+        if package_dir is not None:
+            candidates.append(package_dir / executable_name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            candidate_dir = str(candidate.parent)
+            os.environ["PATH"] = candidate_dir + os.pathsep + os.environ.get("PATH", "")
+            found = shutil.which("dcm2niix")
+            if found:
+                return found
+
+    scripts_text = str(scripts_dir)
+    if os.name == "nt":
+        path_fix = f'$env:Path = "{scripts_text};$env:Path"'
+    else:
+        path_fix = f'export PATH="{scripts_text}:$PATH"'
+    raise RuntimeError(
+        "dcm2niix is required before preprocessing can start, but the "
+        "dcm2niix executable was not found on PATH.\n\n"
+        "Install it in this Python environment with:\n"
+        "    python -m pip install dcm2niix\n\n"
+        "Then add Python's executable directory to PATH for the current shell:\n"
+        f"    {path_fix}\n\n"
+        "Verify the installation with:\n"
+        "    dcm2niix --version"
+    )
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -445,6 +501,7 @@ def preprocess_library(
 
     in_dir = Path(in_dir).resolve()
     out_dir = Path(out_dir).resolve()
+    _ensure_dcm2niix_accessible()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------
