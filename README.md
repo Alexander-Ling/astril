@@ -51,6 +51,10 @@ to each axial, coronal, or sagittal model.
 
 ### General Workflow (rough draft)
 ---
+For the current DICOM preprocessing API, metadata-indexed workflow, function
+inputs/outputs, and organization-index schema, see
+[the preprocessing reference](docs/preprocessing_reference.md).
+
 #### Format for radiology image inputs:
 astril is designed to perform image pre-processing and segmentation on NIFTI (.nii.gz) images. However, astril includes functionality to convert DICOM imaging datasets to NIFTI images and organize them into the folder structure expected by astril's processing functions.
 If starting from a set of DICOM images, they should be organized by patient, exam, radiology type, and sequence as in the following example:
@@ -151,7 +155,7 @@ NIFTI_Library/
  3. Create a DICOM to NIFTI conversion plan by identifying DICOM series types and identifying where the converted scans will be stored and how they will be named.
      ```
      usage: python -m astril.preprocess plan_dicom_to_nifti_conversion [-h] --patientMetadata PATIENTMETADATA --dir DIR --outDir OUTDIR --planOut PLANOUT [--n_workers N_WORKERS] [--noProgress]
-                                                                  [--previousPlan [PREVIOUSPLAN ...]] [--ignorePrevious] [--mrSubdirs [MRSUBDIRS ...]] [--minSlices MINSLICES] [--use_actual_exam_ids]
+                                                                  [--previousPlan [PREVIOUSPLAN ...]] [--ignorePrevious] [--minSlices MINSLICES] [--use_actual_exam_ids]
                                                                   [--add_missing_derived] [--make_derived_from_scratch] [--unexpectedMultiframePolicy {keep_first,skip}]
 
     options:
@@ -167,8 +171,6 @@ NIFTI_Library/
       --previousPlan [PREVIOUSPLAN ...]
                             0+ previous plan files to reuse/skip exam directories from. (default: None)
       --ignorePrevious      Skip exams already present in previous plan files (instead of reusing their rows). (default: False)
-      --mrSubdirs [MRSUBDIRS ...]
-                            Only include these MR subfolder names (case-insensitive). (default: None)
       --minSlices MINSLICES
                             Minimum slices required to consider a sequence for selection. (default: 10)
       --use_actual_exam_ids

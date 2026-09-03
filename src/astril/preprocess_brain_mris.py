@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import threading
+import signal
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +30,16 @@ except Exception:  # pragma: no cover
 # ----------------------------
 # Helpers
 # ----------------------------
+
+class _InterruptibleThreadPoolExecutor(ThreadPoolExecutor):
+    """Avoid waiting for all queued exams when the caller presses Ctrl+C."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown(
+            wait=exc_type is None,
+            cancel_futures=exc_type is not None,
+        )
+        return False
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1048,7 +1059,7 @@ def preprocess_library(
         _advance(1)
 
     if n_workers and n_workers > 1:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        with _InterruptibleThreadPoolExecutor(max_workers=n_workers) as pool:
             futs = {pool.submit(_process_exam_dir, ex): ex for ex in all_exam_dirs}
             for fut in as_completed(futs):
                 ex = futs[fut]
@@ -1279,4 +1290,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    def _stop_cli_immediately(_signum, _frame):
+        print("\n[preprocess_brain_mris] Interrupted; stopping immediately.", flush=True)
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, _stop_cli_immediately)
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Keep a fallback for platforms where the signal handler cannot be
+        # installed or a nested call restores the default handler.
+        os._exit(130)
