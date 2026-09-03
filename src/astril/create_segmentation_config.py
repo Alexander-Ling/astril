@@ -4,6 +4,8 @@ import glob
 from pathlib import Path
 import configparser
 
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
 def parse_train_config_for_model_parameters(train_config_path):
     """
     Reads a train_parameters.cfg (created by create_config_files)
@@ -55,14 +57,18 @@ def create_segmentation_config(
     inputChannels=None,
     channelPatterns=None,
     maskPattern=None,
+    channel_alt_patterns=None,
     model_paths=None,
     modelTrainConfigFiles=None,
-    merging_method="majority_vote",
+    merging_method="average_logit",
+    merging_weights=None,
     inputVolumeDirectory=None,
     outputVolumeDirectory=None,
     segmentSuffix="_seg.nii.gz",
     output_config_filename="segmentation_parameters.cfg",
-    silent=False
+    silent=False,
+    optional_channels=None,
+    allow_missing_optional_channels=None,
 ):
     """
     Creates config files for segmentation in `workingDirectory/Configs/`.
@@ -77,7 +83,7 @@ def create_segmentation_config(
        run_segmentation can use them.
     4. Creates a central `segmentation_parameters.cfg` describing:
        - The .cfg files for channels & mask
-       - The model checkpoints/paths & their *training* parameters
+       - The PyTorch .pt model checkpoints & their *training* parameters
        - The merging method (e.g. "majority_vote")
        - The output volume directory or "in_place" if segmentation results go alongside each mask
 
@@ -93,7 +99,7 @@ def create_segmentation_config(
     maskPattern : str
         Pattern to identify mask files, e.g. "-brainmask.nii.gz".
     model_paths : list of str
-        Paths (or directories) to trained models.
+        Paths to migrated PyTorch .pt checkpoints.
     modelTrainConfigFiles : list of str
         Paths to the train_parameters.cfg used to train each corresponding model in model_paths.
     merging_method : str
@@ -126,10 +132,39 @@ def create_segmentation_config(
     if maskPattern is None:
         raise ValueError("maskPattern must be provided.")
 
+    if channel_alt_patterns is not None and len(channel_alt_patterns) != len(inputChannels):
+        raise ValueError("channel_alt_patterns must be the same length as inputChannels.")
     if not model_paths or not modelTrainConfigFiles:
         raise ValueError("You must provide both model_paths and modelTrainConfigFiles (one per model).")
     if len(model_paths) != len(modelTrainConfigFiles):
         raise ValueError("Mismatch: the number of model_paths must match the number of modelTrainConfigFiles.")
+
+    if optional_channels is None:
+        inferred_optional = []
+        for cfg_path in modelTrainConfigFiles:
+            cp = configparser.ConfigParser()
+            cp.read(str(cfg_path))
+            raw = cp["DEFAULT"].get("optional_channels", "")
+            for token in raw.split(","):
+                token = token.strip()
+                if token and token not in inferred_optional:
+                    inferred_optional.append(token)
+        optional_channels = inferred_optional
+    else:
+        optional_channels = list(optional_channels or [])
+    unknown_optional = sorted(set(optional_channels) - set(inputChannels))
+    if unknown_optional:
+        raise ValueError(f"optional_channels contains unknown channel(s): {unknown_optional}")
+    optional_channel_set = set(optional_channels)
+    if allow_missing_optional_channels is None:
+        allow_missing_optional_channels = bool(optional_channel_set)
+
+    invalid_model_paths = [m for m in model_paths if not str(m).lower().endswith(".pt")]
+    if invalid_model_paths:
+        raise ValueError(
+            "Migrated astril segmentation expects PyTorch .pt checkpoints. "
+            f"Invalid model_paths: {invalid_model_paths}"
+        )
 
     if inputVolumeDirectory is None:
         raise ValueError("`inputVolumeDirectory` must be provided.")
@@ -161,25 +196,49 @@ def create_segmentation_config(
     def match_pattern(directory, pattern):
         """
         Search for exactly one file in `directory` whose name contains `pattern`.
-        If none or more than one, return None.
+        Pattern may contain '|'-separated fallbacks tried left-to-right
+        (e.g. "_T2f_normalized.nii.gz|_T2f_brain-norm.nii.gz").
+        If multiple files match, prefer a NIfTI whose name starts with the
+        current exam directory name. This keeps legacy DFCI folders with
+        duplicate numeric-ID and DFCI-prefixed masks from being skipped.
+        Returns None if no pattern yields a usable match.
         """
-        matches = [f for f in directory.iterdir() if pattern in f.name]
-        if len(matches) != 1:
+        if pattern is None:
             return None
-        return matches[0]
+        for pat in pattern.split("|"):
+            pat = pat.strip()
+            matches = [f for f in directory.iterdir() if pat in f.name]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                nii_matches = [f for f in matches if f.name.endswith((".nii.gz", ".nii"))]
+                if len(nii_matches) == 1:
+                    return nii_matches[0]
+                prefix_matches = [f for f in nii_matches if f.name.startswith(directory.name)]
+                if len(prefix_matches) == 1:
+                    return prefix_matches[0]
+        return None
 
     # ------------------------------
     # 3) Loop over subdirectories, match each channel & mask
+    #    For channels with an alt pattern: prefer primary, fall back to alt.
+    #    No doubling — pick one match per subject.
     # ------------------------------
     for d in all_dirs:
         matched_channel_files = []
         skip_this_dir = False
 
-        for chan, pat in zip(inputChannels, channelPatterns):
+        for i, (chan, pat) in enumerate(zip(inputChannels, channelPatterns)):
             fpath = match_pattern(d, pat)
+            if fpath is None and channel_alt_patterns and channel_alt_patterns[i]:
+                fpath = match_pattern(d, channel_alt_patterns[i])
             if fpath is None:
-                skip_this_dir = True
-                break
+                if allow_missing_optional_channels and chan in optional_channel_set:
+                    matched_channel_files.append(MISSING_CHANNEL_SENTINEL)
+                    continue
+                else:
+                    skip_this_dir = True
+                    break
             matched_channel_files.append(str(fpath))
 
         if skip_this_dir:
@@ -238,12 +297,22 @@ def create_segmentation_config(
     # (a) References to newly created .cfg files
     config_parser["DEFAULT"]["channel_paths_files"] = ",".join(channel_cfg_files)
     config_parser["DEFAULT"]["mask_paths_file"] = str(mask_cfg_file)
+    config_parser["DEFAULT"]["channel_names"] = ",".join(inputChannels)
+    config_parser["DEFAULT"]["optional_channels"] = ",".join(optional_channels)
+    config_parser["DEFAULT"]["allow_missing_optional_channels"] = str(bool(allow_missing_optional_channels)).lower()
+    config_parser["DEFAULT"]["missing_channel_fill"] = "zero"
 
     # (b) Model paths
     config_parser["DEFAULT"]["model_paths"] = ",".join(str(Path(m).resolve()) for m in model_paths)
 
     # (c) Merging method + output dir
     config_parser["DEFAULT"]["merging_method"] = merging_method
+    if merging_weights is not None:
+        if len(merging_weights) != len(model_paths):
+            raise ValueError("merging_weights must contain one value per model path.")
+        config_parser["DEFAULT"]["merging_weights"] = ",".join(
+            str(float(weight)) for weight in merging_weights
+        )
     config_parser["DEFAULT"]["output_directory"] = outputVolumeDirectory
 
     # (d) Store extracted parameters from the model training configs in parallel arrays
@@ -270,7 +339,7 @@ def create_segmentation_config(
     return str(seg_cfg_path)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate config files for MRI segmentation using multiple channels & models, with training configs for each model.")
     parser.add_argument("--workingDirectory", default=".", help="Directory to store generated config files.")
     parser.add_argument("--inputChannels", nargs="+", required=True,
@@ -279,12 +348,28 @@ if __name__ == "__main__":
                         help="Patterns for each channel's input data (e.g. T1c_brain_norm.nii.gz, T2w_brain_norm.nii.gz, etc.).")
     parser.add_argument("--maskPattern", required=True,
                         help="Pattern to identify mask files (e.g. brainmask.nii.gz).")
+    parser.add_argument("--channel_alt_patterns", nargs="+", default=None,
+                        help="Optional fallback patterns, one per channel. Use 'none' for channels "
+                             "with no fallback (e.g. --channel_alt_patterns none _T2w_brain-norm.nii.gz). "
+                             "Primary pattern is preferred; alt is used when primary is absent. "
+                             "No dataset doubling at inference time.")
     parser.add_argument("--model_paths", nargs="+", required=True,
-                        help="Paths to model checkpoints/directories. One per slicing plane.")
+                        help="Paths to PyTorch .pt model checkpoints. One per slicing plane.")
     parser.add_argument("--modelTrainConfigFiles", nargs="+", required=True,
                         help="Paths to the train_parameters.cfg used to train each model. Must match length of model_paths.")
-    parser.add_argument("--merging_method", default="majority_vote",
-                        help="Method for merging model predictions.")
+    parser.add_argument(
+        "--merging_method",
+        default="average_logit",
+        choices=["average_logit", "average_prob", "majority_vote", "max_prob"],
+        help="Method for merging model predictions.",
+    )
+    parser.add_argument(
+        "--merging_weights",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Optional non-negative per-model weights for average_logit fusion.",
+    )
     parser.add_argument("--inputVolumeDirectory", required=True,
                         help="Directory containing subdirectories or volumes for segmentation.")
     parser.add_argument("--outputVolumeDirectory", required=True,
@@ -292,21 +377,40 @@ if __name__ == "__main__":
     parser.add_argument("--segmentSuffix", default="_seg.nii.gz", help="Suffix to use when saving segmentation volumes--will replace maskPattern in mask file names if maskPattern includes .nii.gz. Otherwise, will be appended to end of mask filenames.")
     parser.add_argument("--output_config_filename", default="segmentation_parameters.cfg",
                         help="Name of the segmentation config file to produce (in Configs/).")
+    parser.add_argument("--optional_channels", nargs="*", default=None,
+                        help="Channel names that may be missing at inference time.")
+    parser.add_argument("--allow_missing_optional_channels", action="store_true",
+                        help="Allow optional channels to be absent and zero-filled at inference time.")
     parser.add_argument("--silent", action="store_true", help="Suppress output messages.")
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    channel_alt_patterns = None
+    if args.channel_alt_patterns is not None:
+        channel_alt_patterns = [
+            None if p.strip().lower() in ("none", "na", "") else p.strip()
+            for p in args.channel_alt_patterns
+        ]
 
     create_segmentation_config(
         workingDirectory=args.workingDirectory,
         inputChannels=args.inputChannels,
         channelPatterns=args.channelPatterns,
         maskPattern=args.maskPattern,
+        channel_alt_patterns=channel_alt_patterns,
         model_paths=args.model_paths,
         modelTrainConfigFiles=args.modelTrainConfigFiles,
         merging_method=args.merging_method,
+        merging_weights=args.merging_weights,
         inputVolumeDirectory=args.inputVolumeDirectory,
         outputVolumeDirectory=args.outputVolumeDirectory,
         segmentSuffix=args.segmentSuffix,
         output_config_filename=args.output_config_filename,
-        silent=args.silent
+        silent=args.silent,
+        optional_channels=args.optional_channels,
+        allow_missing_optional_channels=args.allow_missing_optional_channels or bool(args.optional_channels),
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -6,8 +6,8 @@ import numpy as np
 import re
 import ast
 import pandas as pd
-import tensorflow as tf
-import tensorflow.keras.backend as K
+import torch
+import torch.nn.functional as F
 from datetime import datetime
 
 
@@ -38,6 +38,7 @@ def init_logging(output_dir):
     Returns:
         (log_file, log_file_path)
     """
+    os.makedirs(output_dir, exist_ok=True)
     current_date_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_file_path = os.path.join(output_dir, f"Log_{current_date_time}.log")
 
@@ -375,6 +376,36 @@ def parse_and_validate_schedule_params(
     # compute beta for Tversky => (1 - alpha)
     beta_vals_list = [1.0 - a for a in alpha_vals_list]
 
+    # 2g) gradient_clip_norm => float > 0 or NA => default=None (no clipping)
+    gradient_clip_norm = get_optional_value(
+        current_params,
+        "gradient_clip_norm",
+        float,
+        default=None,
+        warn_msg="Must be a float > 0",
+        condition=lambda x: x > 0
+    )
+
+    # 2h) label_smoothing => float in [0, 0.5] => default=0.0
+    label_smoothing = get_optional_value(
+        current_params,
+        "label_smoothing",
+        float,
+        default=0.0,
+        warn_msg="Must be a float in [0, 0.5]",
+        condition=lambda x: 0.0 <= x <= 0.5
+    )
+
+    # 2i) deep_supervision_loss_weight => float in [0, 1] => default=0.5
+    deep_supervision_loss_weight = get_optional_value(
+        current_params,
+        "deep_supervision_loss_weight",
+        float,
+        default=0.5,
+        warn_msg="Must be a float in [0, 1]",
+        condition=lambda x: 0.0 <= x <= 1.0
+    )
+
     return {
         "scan_batch_size": scan_batch_size,
         "slice_sub_batch_size": slice_sub_batch_size,
@@ -389,7 +420,10 @@ def parse_and_validate_schedule_params(
         "class_multiplication_factors": class_multiplication_factors,
         "require_classes": require_classes,
         "alpha_vals_list": alpha_vals_list,
-        "beta_vals_list": beta_vals_list
+        "beta_vals_list": beta_vals_list,
+        "gradient_clip_norm": gradient_clip_norm,
+        "label_smoothing": label_smoothing,
+        "deep_supervision_loss_weight": deep_supervision_loss_weight,
     }
 
 # -----------------------------------------------------------------------------
@@ -407,47 +441,12 @@ def weighted_cross_entropy(
     We expect y_pred to be raw logits (not yet softmaxed), but if they're
     already softmax, you'll see a difference in usage below.
     """
-    # 1) Flatten or keep shape? We'll mask out invalid pixels by multiplying the loss by 'mask_f'
-    boolean_mask = tf.cast(mask[..., 0] > 0.5, tf.float32)  # (batch, H, W, out_slices)
-    mask_4d = tf.expand_dims(boolean_mask, axis=-1)         # (batch, H, W, out_slices, 1)
-
-    # 2) Optionally check if y_pred is logits or already prob
-    #    Typically crossentropy expects logits. If your net outputs prob, we use a stable trick:
-    #    loss = -y_true * log(y_pred)  (no tf.nn.sparse_softmax_cross_entropy_with_logits).
-    #    We'll assume y_pred is LOGITS here, so we do a typical cross_entropy below.
-
-    # 3) Weighted crossentropy
-    #    shape: y_true => (..., num_classes)
-    #           y_pred => (..., num_classes)
-    #    We do: CE = - sum_i [ w_i * y_true[i] * log(softmax(y_pred)[i]) ]
-    #    Then sum/mean over valid pixels.
-
-    # Turn logits into prob via softmax
-    y_pred_prob = tf.nn.softmax(y_pred, axis=-1)
-
-    # Prevent log(0)
-    y_pred_prob = tf.clip_by_value(y_pred_prob, smooth, 1.0 - smooth)
-
-    ce_loss_map = 0.0
-    for c, w_c in enumerate(class_weights):
-        # y_true_c => (batch, H, W, out_slices)
-        # y_pred_prob_c => same shape
-        y_true_c = y_true[..., c]
-        y_pred_prob_c = y_pred_prob[..., c]
-
-        # Weighted cross entropy for class c
-        ce_loss_c = - w_c * y_true_c * tf.math.log(y_pred_prob_c + smooth)
-
-        ce_loss_map += ce_loss_c
-
-    # Multiply by mask to ignore invalid pixels
-    ce_loss_map = ce_loss_map * tf.squeeze(mask_4d, axis=-1)
-
-    # Now average over all valid pixels
-    valid_pixels = tf.reduce_sum(boolean_mask)
-    ce_loss = tf.reduce_sum(ce_loss_map) / (valid_pixels + smooth)
-
-    return ce_loss
+    boolean_mask = (mask[..., 0] > 0.5).to(dtype=y_pred.dtype)
+    y_pred_prob = F.softmax(y_pred, dim=-1).clamp(smooth, 1.0 - smooth)
+    class_weights = torch.as_tensor(class_weights, dtype=y_pred.dtype, device=y_pred.device)
+    ce_loss_map = -(class_weights * y_true * torch.log(y_pred_prob + smooth)).sum(dim=-1)
+    ce_loss_map = ce_loss_map * boolean_mask
+    return ce_loss_map.sum() / (boolean_mask.sum() + smooth)
 
 def focal_tversky_loss(
     y_true,
@@ -467,41 +466,29 @@ def focal_tversky_loss(
       - mask to ignore irrelevant pixels
     """
 
-    # 1) Convert logits -> probabilities
-    y_pred = tf.nn.softmax(y_pred, axis=-1)
-
-    # 2) Mask out invalid pixels
-    boolean_mask = tf.cast(mask[..., 0] > 0.5, tf.float32)
-    mask_expanded = tf.expand_dims(boolean_mask, axis=-1)
-
+    y_pred = F.softmax(y_pred, dim=-1)
+    boolean_mask = (mask[..., 0] > 0.5).to(dtype=y_pred.dtype)
+    mask_expanded = boolean_mask.unsqueeze(-1)
     y_true = y_true * mask_expanded
     y_pred = y_pred * mask_expanded
 
-    # 3) Loop over each class
-    num_classes = y_true.shape[-1]
-    batch_loss_sum = 0.0
+    class_weights = torch.as_tensor(class_weights, dtype=y_pred.dtype, device=y_pred.device)
+    alpha_vals = torch.as_tensor(alpha_vals, dtype=y_pred.dtype, device=y_pred.device)
+    beta_vals = torch.as_tensor(beta_vals, dtype=y_pred.dtype, device=y_pred.device)
 
-    for c in range(num_classes):
-        w_c = class_weights[c]
-        alpha_c = alpha_vals[c]
-        beta_c = beta_vals[c]
-
+    per_class = []
+    for c in range(y_true.shape[-1]):
         y_true_c = y_true[..., c]
         y_pred_c = y_pred[..., c]
+        intersection = torch.sum(y_true_c * y_pred_c)
+        fp = torch.sum(y_pred_c * (1.0 - y_true_c))
+        fn = torch.sum((1.0 - y_pred_c) * y_true_c)
+        tversky_c = (intersection + smooth) / (
+            intersection + alpha_vals[c] * fp + beta_vals[c] * fn + smooth
+        )
+        per_class.append(class_weights[c] * torch.pow(1.0 - tversky_c, gamma))
 
-        intersection = tf.reduce_sum(y_true_c * y_pred_c)
-        fp = tf.reduce_sum(y_pred_c * (1.0 - y_true_c))
-        fn = tf.reduce_sum((1.0 - y_pred_c) * y_true_c)
-
-        tversky_c = (intersection + smooth) / (intersection + alpha_c * fp + beta_c * fn + smooth)
-        # Focal Tversky
-        focal_tversky_c = tf.pow((1.0 - tversky_c), gamma)
-
-        batch_loss_sum += w_c * focal_tversky_c
-
-    # 4) Average across classes
-    loss_value = batch_loss_sum / float(num_classes)
-    return loss_value
+    return torch.stack(per_class).sum() / float(y_true.shape[-1])
 
 def combined_focal_tversky_wce_loss(
     y_true,
@@ -512,87 +499,80 @@ def combined_focal_tversky_wce_loss(
     beta_vals,
     gamma=1.0,
     wce_weight=0.5,
-    smooth=1e-6
+    smooth=1e-6,
+    label_smoothing=0.0,
 ):
     """
     Combined Weighted Cross Entropy + Focal Tversky Loss.
     Returns:
-      total_loss: tf.Tensor scalar for the entire batch
-      per_class_loss: list (or tf.Tensor) of length num_classes giving the
+      total_loss: torch.Tensor scalar for the entire batch
+      per_class_loss: torch.Tensor of length num_classes giving the
                       combined loss contribution for each class.
+    label_smoothing: if > 0, soft-labels the one-hot targets for the WCE component,
+                     reducing overconfidence on rare classes.
     """
 
     # ------------------------------------------------------
     # 1) Weighted Cross Entropy for each class
     # ------------------------------------------------------
-    # Convert logits -> probabilities
-    y_pred_prob = tf.nn.softmax(y_pred, axis=-1)
-    y_pred_prob = tf.clip_by_value(y_pred_prob, smooth, 1.0 - smooth)
+    # Apply label smoothing to one-hot targets before WCE (Tversky uses original targets)
+    # The reductions below can span millions of pixels. Keep the loss in FP32
+    # even when the model forward pass is running under CUDA autocast.
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+    mask = mask.float()
+    class_weights = torch.as_tensor(class_weights, dtype=torch.float32, device=y_pred.device)
+    alpha_vals = torch.as_tensor(alpha_vals, dtype=torch.float32, device=y_pred.device)
+    beta_vals = torch.as_tensor(beta_vals, dtype=torch.float32, device=y_pred.device)
 
-    # boolean_mask => shape (batch,H,W,out_slices)
-    boolean_mask = tf.cast(mask[..., 0] > 0.5, tf.float32)
-    # We'll flatten or at least sum over valid pixels
-    valid_pixels = tf.reduce_sum(boolean_mask) + smooth
+    if label_smoothing > 0.0:
+        num_classes_ls = float(y_true.shape[-1])
+        y_true_smooth = y_true * (1.0 - label_smoothing) + label_smoothing / num_classes_ls
+    else:
+        y_true_smooth = y_true
 
-    # For partial loss tracking
+    y_pred_prob = F.softmax(y_pred, dim=-1).clamp(smooth, 1.0 - smooth)
+
+    boolean_mask = (mask[..., 0] > 0.5).to(dtype=y_pred.dtype)
+    valid_pixels = torch.sum(boolean_mask) + smooth
     num_classes = y_true.shape[-1]
 
     per_class_wce_sum = []
     for c in range(num_classes):
         w_c = class_weights[c]
-
-        y_true_c = y_true[..., c]  # shape (batch,H,W,out_slices)
+        y_true_c = y_true_smooth[..., c]
         y_pred_c = y_pred_prob[..., c]
-
-        # cross-entropy = - w_c * y_true_c * log(y_pred_c)
-        ce_c = -w_c * y_true_c * tf.math.log(y_pred_c + smooth)
-        # zero out invalid pixels
+        ce_c = -w_c * y_true_c * torch.log(y_pred_c + smooth)
         ce_c = ce_c * boolean_mask
-
-        # sum over the whole batch
-        class_ce_sum = tf.reduce_sum(ce_c)
+        class_ce_sum = torch.sum(ce_c)
         per_class_wce_sum.append(class_ce_sum)
 
-    # Weighted CE for the entire batch
-    total_wce = tf.add_n(per_class_wce_sum) / valid_pixels
+    total_wce = torch.stack(per_class_wce_sum).sum() / valid_pixels
 
-    # ------------------------------------------------------
-    # 2) Focal Tversky for each class
-    # ------------------------------------------------------
-    y_pred_prob_masked = y_pred_prob * tf.expand_dims(boolean_mask, axis=-1)
-    y_true_masked = y_true * tf.expand_dims(boolean_mask, axis=-1)
+    y_pred_prob_masked = y_pred_prob * boolean_mask.unsqueeze(-1)
+    y_true_masked = y_true * boolean_mask.unsqueeze(-1)
 
     per_class_ft = []
     for c in range(num_classes):
-        w_c       = class_weights[c]
-        alpha_c   = alpha_vals[c]
-        beta_c    = beta_vals[c]
+        w_c = class_weights[c]
+        alpha_c = alpha_vals[c]
+        beta_c = beta_vals[c]
+        y_true_c = y_true_masked[..., c]
+        y_pred_c = y_pred_prob_masked[..., c]
 
-        y_true_c  = y_true_masked[..., c]
-        y_pred_c  = y_pred_prob_masked[..., c]
-
-        intersection = tf.reduce_sum(y_true_c * y_pred_c)
-        fp = tf.reduce_sum(y_pred_c * (1.0 - y_true_c))
-        fn = tf.reduce_sum((1.0 - y_pred_c) * y_true_c)
+        intersection = torch.sum(y_true_c * y_pred_c)
+        fp = torch.sum(y_pred_c * (1.0 - y_true_c))
+        fn = torch.sum((1.0 - y_pred_c) * y_true_c)
 
         tversky_c = (intersection + smooth) / (intersection + alpha_c*fp + beta_c*fn + smooth)
-        focal_tversky_c = tf.pow((1.0 - tversky_c), gamma)
-
-        # weight the class’s focal tversky
+        focal_tversky_c = torch.pow((1.0 - tversky_c), gamma)
         per_class_ft.append(w_c * focal_tversky_c)
 
-    # Divide the Tversky Sum by the Sum of the Weights
-    sum_w = tf.reduce_sum(class_weights)
-    total_ft = tf.add_n(per_class_ft) / (sum_w + 1e-6)
+    sum_w = torch.sum(class_weights)
+    total_ft = torch.stack(per_class_ft).sum() / (sum_w + 1e-6)
 
-    # ------------------------------------------------------
-    # 3) Combine them
-    # ------------------------------------------------------
     total_loss = wce_weight * total_wce + (1.0 - wce_weight) * total_ft
 
-    # For each class c, define that class’s portion:
-    #   class_loss_c = wce_weight*(per_class_wce_sum[c]/valid_pixels)
-    #                  + (1-wce_weight)*(per_class_ft[c]/num_classes)
     per_class_loss = []
     for c in range(num_classes):
         class_wce = per_class_wce_sum[c] / valid_pixels
@@ -600,7 +580,7 @@ def combined_focal_tversky_wce_loss(
         per_class_loss_c = wce_weight * class_wce + (1.0 - wce_weight) * class_ft
         per_class_loss.append(per_class_loss_c)
 
-    return total_loss, tf.stack(per_class_loss, axis=0)  # shape (num_classes,)
+    return total_loss, torch.stack(per_class_loss, dim=0)
 
 # -----------------------------------------------------------------------------
 # Training/Validation performance loggers
@@ -611,8 +591,31 @@ def append_metrics_to_file(file_path, epoch, class_metrics, all_classes_metrics=
     Append metrics for each class to a .tsv or .txt file.
     Optionally also write a row for "All_Classes" if all_classes_metrics is provided.
     """
+    legacy_header = "Epoch\tClass\tAccuracy\tPrecision\tRecall\tLoss"
+    headers = "Epoch\tClass\tIoU\tAccuracy\tPrecision\tRecall\tLoss\n"
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as existing_file:
+            existing_lines = existing_file.readlines()
+        if existing_lines and existing_lines[0].rstrip("\r\n") == legacy_header:
+            upgraded_lines = [headers]
+            for line in existing_lines[1:]:
+                fields = line.rstrip("\r\n").split("\t")
+                if len(fields) != 6:
+                    raise ValueError(f"Cannot upgrade malformed legacy metrics row in {file_path}: {line!r}")
+                epoch_value, class_name, legacy_accuracy, precision, recall, loss = fields
+                # Historical per-class "Accuracy" was IoU. The historical
+                # All_Classes value was micro accuracy, so it has no matching IoU.
+                if class_name == "All_Classes":
+                    iou, accuracy = "NA", legacy_accuracy
+                else:
+                    iou, accuracy = legacy_accuracy, "NA"
+                upgraded_lines.append(
+                    f"{epoch_value}\t{class_name}\t{iou}\t{accuracy}\t{precision}\t{recall}\t{loss}\n"
+                )
+            with open(file_path, "w", encoding="utf-8", newline="") as upgraded_file:
+                upgraded_file.writelines(upgraded_lines)
+
     mode = 'a' if os.path.exists(file_path) else 'w'
-    headers = "Epoch\tClass\tAccuracy\tPrecision\tRecall\tLoss\n"
     
     with open(file_path, mode) as file:
         if mode == 'w':
@@ -620,46 +623,39 @@ def append_metrics_to_file(file_path, epoch, class_metrics, all_classes_metrics=
 
         # Per-class lines
         for class_index, metrics in class_metrics.items():
-            accuracy  = metrics['accuracy'].result().numpy()
-            precision = metrics['precision'].result().numpy()
-            recall    = metrics['recall'].result().numpy()
-            loss_val  = metrics['loss'].result().numpy()
+            iou = _metric_value(metrics['iou'])
+            accuracy = _metric_value(metrics['accuracy'])
+            precision = _metric_value(metrics['precision'])
+            recall = _metric_value(metrics['recall'])
+            loss_val = _metric_value(metrics['loss'])
             file.write(
-                f"{epoch}\tClass_{class_index}\t{accuracy:.3f}\t{precision:.3f}\t{recall:.3f}\t{loss_val:.4f}\n"
+                f"{epoch}\tClass_{class_index}\t{iou:.3f}\t{accuracy:.3f}\t{precision:.3f}\t{recall:.3f}\t{loss_val:.4f}\n"
             )
 
         # Optional line for "All_Classes"
         if all_classes_metrics is not None:
             file.write(
-                f"{epoch}\tAll_Classes\t"
+                f"{epoch}\tAll_Classes\tNA\t"
                 f"{all_classes_metrics['accuracy']:.3f}\t"
                 f"{all_classes_metrics['precision']:.3f}\t"
                 f"{all_classes_metrics['recall']:.3f}\t"
                 f"{all_classes_metrics['loss']:.4f}\n"
             )
 
-def prepare_class_metrics_for_logging(train_or_val_class_metrics):
-    """
-    Prepare a dictionary of metrics for each class index.
-    """
-    class_metrics = {}
-    num_cls = len(train_or_val_class_metrics['accuracy'])
-    for class_index in range(num_cls):
-        class_metrics[class_index] = {
-            'accuracy':  train_or_val_class_metrics['accuracy'][class_index],
-            'precision': train_or_val_class_metrics['precision'][class_index],
-            'recall':    train_or_val_class_metrics['recall'][class_index],
-            'loss':      train_or_val_class_metrics['loss'][class_index],
-        }
-    return class_metrics
+
+def _metric_value(value):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return float(value)
 
 # -----------------------------------------------------------------------------
 # Training Helpers (Checkpointing + Schedules)
 # -----------------------------------------------------------------------------
 def get_latest_checkpoint(checkpoint_dir):
     """
-    Returns the latest checkpoint (either a directory named "epoch_{num}" 
-    or a single-file .keras checkpoint named "epoch_{num}.keras") in 
+    Returns the latest PyTorch checkpoint named "epoch_{num}.pt" in
     `checkpoint_dir`, based on modification time.
 
     If no checkpoint is found, returns None.
@@ -668,19 +664,12 @@ def get_latest_checkpoint(checkpoint_dir):
         return None
 
     all_items = os.listdir(checkpoint_dir)
-    # Patterns to match single-file checkpoints or directories:
-    keras_pattern = re.compile(r'^epoch_(\d+)\.keras$')
-    dir_pattern = re.compile(r'^epoch_(\d+)$')
+    pt_pattern = re.compile(r'^epoch_(\d+)\.pt$')
 
     valid_items = []
     for item in all_items:
         item_path = os.path.join(checkpoint_dir, item)
-        
-        # Check if it's a .keras file with the right pattern
-        if os.path.isfile(item_path) and keras_pattern.match(item):
-            valid_items.append(item_path)
-        # Or if it's a directory with the right pattern
-        elif os.path.isdir(item_path) and dir_pattern.match(item):
+        if os.path.isfile(item_path) and pt_pattern.match(item):
             valid_items.append(item_path)
 
     if not valid_items:
@@ -692,24 +681,16 @@ def get_latest_checkpoint(checkpoint_dir):
 
 def get_epoch_from_checkpoint(checkpoint_path):
     """
-    Extracts the epoch number from a checkpoint path that may be 
-    either a .keras file ("epoch_{number}.keras") or a directory 
-    ("epoch_{number}").
+    Extracts the epoch number from a PyTorch checkpoint path named
+    "epoch_{number}.pt".
 
     If neither pattern is matched, returns None.
     """
     filename = os.path.basename(checkpoint_path)
 
-    # We allow either a .keras file or a directory
-    patterns = [
-        r'^epoch_(\d+)\.keras$',  # e.g., epoch_3.keras
-        r'^epoch_(\d+)$'         # e.g., epoch_3 (directory format)
-    ]
-
-    for pat in patterns:
-        match = re.search(pat, filename)
-        if match:
-            return int(match.group(1))
+    match = re.search(r'^epoch_(\d+)\.pt$', filename)
+    if match:
+        return int(match.group(1))
 
     return None
 
@@ -869,3 +850,73 @@ def compute_weighted_macro_metrics(agg, num_classes, epsilon=1e-9):
         'weighted_macro_recall': weighted_recall_sum,
         'micro_accuracy': micro_accuracy
     }
+
+
+# -----------------------------------------------------------------------------
+# Hardware stats and training stats logging
+# -----------------------------------------------------------------------------
+
+def get_vram_stats_mb():
+    """
+    Returns (current_mb, peak_mb) GPU memory usage.
+    Returns (0.0, 0.0) if no CUDA GPU is available.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return 0.0, 0.0
+        return (
+            torch.cuda.memory_allocated() / 1024 ** 2,
+            torch.cuda.max_memory_allocated() / 1024 ** 2,
+        )
+    except Exception:
+        return 0.0, 0.0
+
+
+def append_training_stats(
+    file_path,
+    epoch,
+    data_load_s,
+    train_s,
+    val_s,
+    slices_per_sec,
+    mean_grad_norm,
+    learning_rate,
+    vram_used_mb,
+    vram_peak_mb,
+    dataloader_wait_s=None,
+    batch_compute_s=None,
+):
+    """
+    Appends one row per epoch to training_stats.tsv.
+    Writes header on first call (when file does not yet exist).
+    """
+    header = (
+        "Epoch\tDataLoad_s\tTrain_s\tVal_s\t"
+        "Slices_Per_Sec\tMean_Grad_Norm\tLR\tVRAM_Used_MB\tVRAM_Peak_MB\t"
+        "Mean_DataLoader_Wait_s\tMean_Batch_Compute_s\n"
+    )
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+        existing_header = lines[0].rstrip("\n")
+        if "Mean_DataLoader_Wait_s" not in existing_header:
+            upgraded = [
+                existing_header + "\tMean_DataLoader_Wait_s\tMean_Batch_Compute_s\n"
+            ]
+            for line in lines[1:]:
+                upgraded.append(line.rstrip("\n") + "\tNA\tNA\n")
+            with open(file_path, "w") as f:
+                f.writelines(upgraded)
+
+    mode = 'a' if os.path.exists(file_path) else 'w'
+    val_s_str = f"{val_s:.1f}" if val_s is not None else "NA"
+    wait_s_str = f"{dataloader_wait_s:.4f}" if dataloader_wait_s is not None else "NA"
+    compute_s_str = f"{batch_compute_s:.4f}" if batch_compute_s is not None else "NA"
+    with open(file_path, mode) as f:
+        if mode == 'w':
+            f.write(header)
+        f.write(
+            f"{epoch}\t{data_load_s:.1f}\t{train_s:.1f}\t{val_s_str}\t"
+            f"{slices_per_sec:.0f}\t{mean_grad_norm:.4f}\t{learning_rate:.6f}\t"
+            f"{vram_used_mb:.0f}\t{vram_peak_mb:.0f}\t{wait_s_str}\t{compute_s_str}\n"
+        )

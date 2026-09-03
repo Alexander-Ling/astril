@@ -1,8 +1,27 @@
 {
-  "GBM_seg_v1.zip": {
-    "bytes": 1429228910,
-    "sha256": "b169e36cfa7df532da4c0efc36a0cd1523a63a5fea880b00d52edc705e32b61c",
-    "url": "https://osf.io/download/tkfwe/",
-    "version": "2025-09-19T13:45:01Z"
+  "GBM_seg_v2.zip": {
+    "bytes": 1759730639,
+    "expect": [
+      "README.md",
+      "CITATIONS.md",
+      "CITATIONS.bib",
+      "Model_A_Axial.pt",
+      "Model_A_Axial_train_parameters.cfg",
+      "Model_A_Coronal.pt",
+      "Model_A_Coronal_train_parameters.cfg",
+      "Model_A_Sagittal.pt",
+      "Model_A_Sagittal_train_parameters.cfg",
+      "Model_B_Axial.pt",
+      "Model_B_Axial_train_parameters.cfg",
+      "Model_B_Coronal.pt",
+      "Model_B_Coronal_train_parameters.cfg",
+      "Model_B_Sagittal.pt",
+      "Model_B_Sagittal_train_parameters.cfg"
+    ],
+    "extract_to": "GBM_seg_v2",
+    "kind": "pytorch_zip",
+    "sha256": "47c5a4f97b8ea415300e84a139ef744e75ea4b646e13a848373c995c0b342cb1",
+    "url": "https://osf.io/download/j2vbp/",
+    "version": "2026-08-10"
   }
 }

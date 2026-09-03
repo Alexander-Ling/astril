@@ -15,6 +15,9 @@ dist/
 .vs/
 .vscode/
 
+# Claude Code
+.claude/
+
 # Models inside the package (redundant with nested .gitignore, but safe)
 src/astril/models/**
 !src/astril/models/models.json

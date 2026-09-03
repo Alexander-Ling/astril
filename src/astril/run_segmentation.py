@@ -2,94 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Module: run_segmentation
-This module runs the segmentation process using a 2.5D pipeline.
-It loads model files from paths specified in the segmentation configuration.
-Pre-trained models may be provided as full models (directories or .keras files)
-or as HDF5 files containing only weights. In the latter case, the model architecture
-is rebuilt using parameters extracted from the associated model training config file.
+This module runs the segmentation process using a 2.5D pipeline and PyTorch
+.pt checkpoints.
 """
-
-print("Initializing segmentation environment...")
+from __future__ import annotations
 
 import os
 import sys
 import argparse
 import configparser
-import numpy as np
-import nibabel as nib
-import tensorflow as tf
 from pathlib import Path
-from tensorflow.keras.models import load_model
 
-
-# Keras 3 layers (for wrapping legacy SavedModel)
-try:
-    import keras
-    from keras.layers import TFSMLayer
-except Exception:  # pragma: no cover
-    keras = None
-    TFSMLayer = None
-
-# Import data loading functions from your package.
-from .data_loading import (
-    read_paths_from_file,
-    load_val_data,
-    ValDataGenerator,
-    undo_all_transforms,
-    apply_inverse_canonical_4d
-)
-
-# Import model architecture and custom layers.
-from .model_architecture import (
-    DynamicAttentionResUNet,
-    ResidualConvBlock,
-    AttentionBlock
-)
-
-# Import global configuration variables (if available).
-try:
-    from .config import num_channels as global_num_channels
-except ImportError:
-    global_num_channels = None
-
-# Define custom objects dictionary for full model loading.
-custom_objects_dict = {
-    'ResidualConvBlock': ResidualConvBlock,
-    'AttentionBlock': AttentionBlock,
-    'DynamicAttentionResUNet': DynamicAttentionResUNet
-}
-
-
-########################################################################
-# SavedModel helpers (Keras 3 no longer loads these via load_model)
-########################################################################
-def _is_tf_saved_model_dir(path: str | Path) -> bool:
-    p = Path(path)
-    if not p.is_dir():
-        return False
-    return (p / "saved_model.pb").exists() or (p / "saved_model.pbtxt").exists()
-
-
-def _wrap_saved_model_as_keras(saved_model_dir: str,
-                               input_channels: int,
-                               call_endpoint: str = "serving_default"):
-    """
-    Wrap a TF SavedModel as a Keras Model for inference using Keras 3 TFSMLayer.
-    The wrapped model has Input shape (None, None, None, input_channels) and
-    returns the first tensor if the SavedModel outputs a dict.
-    """
-    if TFSMLayer is None or keras is None:
-        raise ImportError(
-            "Keras 3 is required to load TensorFlow SavedModel via TFSMLayer. "
-            "Install `keras>=3` or convert your model to `.keras`."
-        )
-    inp = keras.Input(shape=(None, None, input_channels), dtype=tf.float32, name="input")
-    layer = TFSMLayer(saved_model_dir, call_endpoint=call_endpoint)
-    out = layer(inp)
-    if isinstance(out, dict):
-        # deterministically pick the first output
-        out = next(iter(out.values()))
-    return keras.Model(inp, out, name="wrapped_saved_model")
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
 
 ########################################################################
 # Shared helper: load a list of models given config-derived arrays
@@ -100,47 +24,48 @@ def load_models_for_config(
     model_num_input_slices: list[int],
     model_min_hw: list[int],
     num_modal_channels: int,
-    model_call_endpoints: list[str] | None = None,
+    device: torch.device | None = None,
 ):
     """
     Unified model loader used by run_segmentation.py and segment_GBM.py.
-    Supports .keras, legacy .h5 (weights-only), and TF SavedModel directories.
+    Supports only migrated PyTorch .pt checkpoints.
     """
-    if model_call_endpoints is None:
-        model_call_endpoints = ["serving_default"] * len(model_paths)
+    import torch
+    from .model_architecture import create_dynamic_unet_from_metadata
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     loaded = []
     for i, mp in enumerate(model_paths):
         mp = mp.strip()
         print(f"[INFO] Loading model {i+1}/{len(model_paths)} => {mp}")
-
-        # 1) Native Keras v3 model
-        if mp.endswith(".keras"):
-            model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-            loaded.append(model)
-            continue
-
-        # 2) Legacy weight-only HDF5
-        if mp.endswith(".h5"):
+        if not mp.lower().endswith(".pt"):
+            raise ValueError(
+                f"Unsupported model path '{mp}'. Migrated astril inference expects PyTorch .pt checkpoints."
+            )
+        if not os.path.isfile(mp):
+            raise FileNotFoundError(f"PyTorch model checkpoint not found: {mp}")
+        try:
+            checkpoint = torch.load(mp, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(mp, map_location=device)
+        if "architecture" in checkpoint:
+            model = create_dynamic_unet_from_metadata(checkpoint["architecture"])
+            state_dict = checkpoint.get("ema_model_state_dict")
+            if state_dict is not None:
+                print("[INFO] Using EMA checkpoint weights for inference.")
+            else:
+                state_dict = checkpoint.get("model_state_dict")
+        else:
             train_cfg = model_train_config_files[i].strip()
-            min_hw_val = model_min_hw[i]
-            input_slices = model_num_input_slices[i]
-            model = load_pretrained_model(mp, train_cfg, min_hw_val, input_slices)
-            loaded.append(model)
-            continue
-
-        # 3) Legacy TF SavedModel directory (Keras 3 path via TFSMLayer)
-        if os.path.isdir(mp) and _is_tf_saved_model_dir(mp):
-            input_slices = model_num_input_slices[i]
-            input_channels = num_modal_channels * input_slices
-            call_ep = model_call_endpoints[i] if i < len(model_call_endpoints) else "serving_default"
-            print(f"  [INFO] Detected TF SavedModel; wrapping via TFSMLayer (endpoint='{call_ep}').")
-            model = _wrap_saved_model_as_keras(mp, input_channels=input_channels, call_endpoint=call_ep)
-            loaded.append(model)
-            continue
-
-        # 4) Fallback: try Keras loader (covers directories that might be Keras)
-        model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
+            model = build_model_from_train_config(train_cfg, num_modal_channels=num_modal_channels)
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+        if state_dict is None:
+            raise ValueError(f"Checkpoint '{mp}' does not contain model_state_dict.")
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
         loaded.append(model)
 
     return loaded
@@ -148,11 +73,16 @@ def load_models_for_config(
 ########################################################################
 # Helper: Build model from a model training config file.
 ########################################################################
-def build_model_from_train_config(config_path):
+def build_model_from_train_config(config_path, num_modal_channels=None):
     """
     Reads a model training config file (INI format) and builds a U-Net model
     with the parameters specified.
     """
+    from .model_architecture import (
+        DynamicAttentionResUNet,
+        BrainIACEncoderFusionUNet,
+        ResidualContextUNeXt25D,
+    )
     cp = configparser.ConfigParser()
     cp.read(config_path)
     cfg = cp["DEFAULT"]
@@ -164,70 +94,128 @@ def build_model_from_train_config(config_path):
     encoder_level_factors = [int(x.strip()) for x in cfg.get("encoder_level_factors", fallback="1,2,4,8").split(",") if x.strip()]
     center_depth = cfg.getint("center_depth", fallback=1)
     
-    # Try to get num_channels from the config; otherwise, infer from image_paths_files.
-    num_channels_val = cfg.get("num_channels", None)
-    if num_channels_val is None or num_channels_val.strip() == "":
-        ips = cfg.get("image_paths_files", "")
-        if ips.strip():
-            num_channels = len(ips.split(","))
-        else:
-            num_channels = 1  # fallback default
+    if num_modal_channels is not None:
+        num_channels = int(num_modal_channels)
     else:
-        num_channels = int(num_channels_val)
-    
-    # If a global value was defined (e.g. from .config) and is not None, use that instead.
-    if global_num_channels is not None:
-        num_channels = global_num_channels
+        # Try to get num_channels from the config; otherwise, infer from image_paths_files.
+        num_channels_val = cfg.get("num_channels", None)
+        if num_channels_val is None or num_channels_val.strip() == "":
+            ips = cfg.get("image_paths_files", "")
+            if ips.strip():
+                num_channels = len(ips.split(","))
+            else:
+                num_channels = 1  # fallback default
+        else:
+            num_channels = int(num_channels_val)
+
+    if num_channels < 1:
+        raise ValueError(f"Invalid num_channels={num_channels} while building model from {config_path}")
 
     input_channels = num_channels * num_input_slices
 
-    model = DynamicAttentionResUNet(
+    use_se_blocks = cfg.getboolean("use_se_blocks", fallback=False)
+    use_deep_supervision = cfg.getboolean("use_deep_supervision", fallback=False)
+    use_brainiac_embeddings = cfg.getboolean("use_brainiac_embeddings", fallback=False)
+    brainiac_embedding_type = cfg.get("brainiac_embedding_type", fallback="encoder_fusion")
+    if use_brainiac_embeddings and brainiac_embedding_type != "encoder_fusion":
+        raise ValueError(
+            "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+            f"Found: {brainiac_embedding_type}"
+        )
+
+    architecture_type = cfg.get("architecture_type", fallback="dynamic_attention_resunet").strip().lower()
+    use_modality_presence = cfg.getboolean(
+        "use_modality_presence_encoding",
+        fallback=(architecture_type == "residual_context_unext_25d"),
+    )
+    if architecture_type == "residual_context_unext_25d":
+        input_channels += num_channels if use_modality_presence else 0
+        model_cls = ResidualContextUNeXt25D
+    else:
+        model_cls = BrainIACEncoderFusionUNet if use_brainiac_embeddings else DynamicAttentionResUNet
+    model_kwargs = {}
+    if model_cls is BrainIACEncoderFusionUNet:
+        brainiac_input_channels = cfg.getint("brainiac_encoder_input_channels", fallback=0)
+        if brainiac_input_channels <= 0:
+            raise ValueError("brainiac_encoder_input_channels must be set for encoder_fusion configs.")
+        model_kwargs["brainiac_input_channels"] = brainiac_input_channels
+    if model_cls is ResidualContextUNeXt25D:
+        model_kwargs.update(
+            num_modalities=num_channels,
+            num_input_slices=num_input_slices,
+            blocks_per_level=cfg.getint("blocks_per_level", fallback=2),
+            context_stem_channels=cfg.getint("context_stem_channels", fallback=0) or None,
+            skip_attention_type=cfg.get("skip_attention_type", fallback="residual"),
+            use_modality_presence_encoding=use_modality_presence,
+        )
+
+    model = model_cls(
         input_channels=input_channels,
         base_num_filters=base_num_filters,
         encoder_level_factors=encoder_level_factors,
         num_output_slices=num_output_slices,
         out_channels=num_classes,
-        center_depth=center_depth
+        center_depth=center_depth,
+        use_se_blocks=use_se_blocks,
+        use_deep_supervision=use_deep_supervision,
+        **model_kwargs,
     )
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return model
 
 
-########################################################################
-# Helper: Load a pretrained model (full model or weight-only HDF5).
-########################################################################
-def load_pretrained_model(mp, train_config_path, min_hw, num_input_slices):
-    """
-    Attempts to load the full model from the path mp. If that fails with a ValueError
-    (indicating that the file contains only weights), rebuilds the model architecture using
-    the provided training config file and loads the weights after initializing the model
-    with a dummy input tensor.
+def _train_config_requires_brainiac(config_path: str) -> bool:
+    """Returns True if the given training config declares use_brainiac_embeddings = true."""
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    return cp["DEFAULT"].getboolean("use_brainiac_embeddings", fallback=False)
 
-    Parameters:
-      mp (str): Path to the model file.
-      train_config_path (str): Path to the training configuration file.
-      min_hw (int): Minimum height/width to use for the dummy input.
-      num_input_slices (int): Number of input slices (used in computing input channels).
-    """
-    try:
-        model = load_model(mp, custom_objects=custom_objects_dict, compile=False)
-        return model
-    except ValueError as e:
-        if "No model config found" in str(e):
-            model = build_model_from_train_config(train_config_path)
-            # Create a dummy input tensor based on the minimum height/width and the model's input channels.
-            dummy_input = tf.zeros((1, min_hw, min_hw, model.input_channels))
-            _ = model(dummy_input)  # Run a forward pass to create the variables.
-            model.load_weights(mp)
-            return model
-        else:
-            raise
+
+def _train_config_brainiac_embedding_type(config_path: str) -> str:
+    """Returns the BrainIAC integration mode from a train cfg."""
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    return cp["DEFAULT"].get("brainiac_embedding_type", "encoder_fusion")
+
+
+def _brainiac_inference_label(index: int) -> str:
+    return f"ch{index}"
+
+
+def _train_config_brainiac_channel_indices(config_path: str, num_modal_channels: int) -> list[int]:
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+    raw = cp["DEFAULT"].get("brainiac_encode_channels", "all").strip()
+    if raw.lower() in {"", "all", "none"}:
+        return list(range(num_modal_channels))
+
+    indices = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(
+                f"Segmentation requires numeric brainiac_encode_channels in {config_path}; "
+                f"found '{raw}'. Re-run train-model so the config is normalized."
+            )
+        idx = int(token)
+        if idx < 0 or idx >= num_modal_channels:
+            raise ValueError(
+                f"BrainIAC channel index {idx} in {config_path} is out of range for "
+                f"{num_modal_channels} segmentation input channels."
+            )
+        if idx not in indices:
+            indices.append(idx)
+    if not indices:
+        raise ValueError(f"brainiac_encode_channels in {config_path} selected no channels.")
+    return indices
 
 
 ########################################################################
 # Merging helper functions.
 ########################################################################
 def majority_vote(softmax_list, tiebreaker=0):
+    import numpy as np
     label_vols = [np.argmax(s, axis=-1) for s in softmax_list]
     stacked = np.stack(label_vols, axis=0)
     num_models, H, W, D = stacked.shape
@@ -251,6 +239,7 @@ def majority_vote(softmax_list, tiebreaker=0):
     return best_label
 
 def average_prob(softmax_list, tiebreaker=0):
+    import numpy as np
     stacked = np.stack(softmax_list, axis=0)
     sum_probs = np.sum(stacked, axis=0)
     best_label = np.argmax(sum_probs, axis=-1)
@@ -264,7 +253,28 @@ def average_prob(softmax_list, tiebreaker=0):
         best_label[tie_mask] = 0
     return best_label
 
+
+def average_logit(logit_list, weights=None, tiebreaker=0):
+    """Fuse calibrated model evidence before the final softmax/argmax decision."""
+    import numpy as np
+    stacked = np.stack(logit_list, axis=0)
+    if weights is None:
+        weights = np.ones(stacked.shape[0], dtype=np.float32)
+    weights = np.asarray(weights, dtype=np.float32)
+    if weights.shape != (stacked.shape[0],) or np.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("merging_weights must be non-negative with one value per model.")
+    weighted_logits = np.tensordot(weights / weights.sum(), stacked, axes=(0, 0))
+    best_label = np.argmax(weighted_logits, axis=-1)
+    best_value = np.max(weighted_logits, axis=-1, keepdims=True)
+    tie_mask = np.isclose(weighted_logits, best_value).sum(axis=-1) > 1
+    if tiebreaker > 0:
+        best_label[tie_mask] = np.argmax(stacked[tiebreaker - 1], axis=-1)[tie_mask]
+    else:
+        best_label[tie_mask] = 0
+    return best_label
+
 def max_prob(softmax_list, tiebreaker=0):
+    import numpy as np
     stacked = np.stack(softmax_list, axis=0)
     max_probs = np.max(stacked, axis=0)
     best_label = np.argmax(max_probs, axis=-1)
@@ -287,8 +297,28 @@ def run_segmentation(
     slice_batch_size=1,
     overwrite=False,
     tiebreaker_model=0,
-    debug_models=False
+    debug_models=False,
+    save_foreground_probability=False,
+    foreground_probability_suffix="_foreground_probability.nii.gz",
+    save_class_probabilities=False,
+    class_probability_suffix_template="_class{class_index}_probability.nii.gz",
 ):
+    import numpy as np
+    import nibabel as nib
+    import torch
+    import torch.nn.functional as F
+    from .data_loading import (
+        read_paths_from_file,
+        load_val_data,
+        ValDataGenerator,
+        undo_all_transforms,
+        apply_inverse_canonical_4d,
+    )
+
+    force_cpu = os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    device = torch.device("cuda" if torch.cuda.is_available() and not force_cpu else "cpu")
+    print(f"[INFO] PyTorch device: {device}")
+
     # --- A) Parse segmentation config and load paths ---
     if not os.path.isfile(segmentation_config_file):
         raise FileNotFoundError(f"Config file not found: {segmentation_config_file}")
@@ -300,9 +330,25 @@ def run_segmentation(
     channel_cfg_files_str = config_parser["DEFAULT"]["channel_paths_files"]
     channel_cfg_files = channel_cfg_files_str.split(",")
     mask_cfg_file = config_parser["DEFAULT"]["mask_paths_file"]
+    channel_names = [
+        x.strip()
+        for x in config_parser["DEFAULT"].get("channel_names", "").split(",")
+        if x.strip()
+    ]
+    optional_channels = {
+        x.strip()
+        for x in config_parser["DEFAULT"].get("optional_channels", "").split(",")
+        if x.strip()
+    }
 
     model_paths_str = config_parser["DEFAULT"]["model_paths"]
     merging_method = config_parser["DEFAULT"].get("merging_method", "majority_vote")
+    merging_weights_raw = config_parser["DEFAULT"].get("merging_weights", "").strip()
+    merging_weights = (
+        [float(value.strip()) for value in merging_weights_raw.split(",") if value.strip()]
+        if merging_weights_raw
+        else None
+    )
     output_directory = config_parser["DEFAULT"]["output_directory"]
 
     model_slicing_planes = config_parser["DEFAULT"]["model_train_slicing_planes"].split(",")
@@ -315,13 +361,6 @@ def run_segmentation(
     model_paths = model_paths_str.split(",")
     if len(model_paths) != len(model_slicing_planes):
         raise ValueError("Mismatch between the number of model paths and model_train_slicing_planes.")
-
-    # Optional: per-model SavedModel call endpoints (defaults to 'serving_default')
-    _endpoints_str = config_parser["DEFAULT"].get("model_call_endpoints", None)
-    if _endpoints_str:
-        model_call_endpoints = [s.strip() for s in _endpoints_str.split(",")]
-    else:
-        model_call_endpoints = ["serving_default"] * len(model_paths)
 
     maskPattern = config_parser["DEFAULT"]["maskpattern"]
     segmentSuffix = config_parser["DEFAULT"]["segmentsuffix"]
@@ -342,6 +381,8 @@ def run_segmentation(
     for cfiles in channel_file_lists:
         if len(cfiles) != num_subjects:
             raise ValueError("Mismatch in number of lines across channel cfg and mask cfg.")
+    if not channel_names:
+        channel_names = [f"ch{i}" for i in range(len(channel_file_lists))]
 
     volume_paths_list = list(zip(*channel_file_lists))
     volume_paths_list = [list(vp) for vp in volume_paths_list]
@@ -355,10 +396,45 @@ def run_segmentation(
         model_num_input_slices=model_num_input_slices,
         model_min_hw=model_min_hw,
         num_modal_channels=num_modal_channels,
-        model_call_endpoints=model_call_endpoints,
+        device=device,
     )
 
-    # --- C) Define merging function ---
+    # --- C) Detect BrainIAC dependency and prepare weights/temp dir ---
+    brainiac_needed = any(
+        _train_config_requires_brainiac(tcfg) for tcfg in model_train_config_files
+    )
+    brainiac_weights_path = None
+    brainiac_tmp_dir = None
+    brainiac_mode = None
+    brainiac_channel_indices = None
+    if brainiac_needed:
+        from .brainiac_utils import (
+            ensure_brainiac_weights,
+            BrainIACWeightsNotFoundError,
+        )
+        import tempfile
+        try:
+            brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
+        except BrainIACWeightsNotFoundError as e:
+            raise RuntimeError(str(e))
+        brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
+
+        brainiac_cfg = next(
+            tc for tc in model_train_config_files if _train_config_requires_brainiac(tc)
+        )
+        brainiac_mode = _train_config_brainiac_embedding_type(brainiac_cfg)
+        if brainiac_mode != "encoder_fusion":
+            raise ValueError(
+                "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
+                f"Found {brainiac_mode} in {brainiac_cfg}."
+            )
+        brainiac_channel_indices = _train_config_brainiac_channel_indices(
+            brainiac_cfg,
+            num_modal_channels,
+        )
+        print(f"[brainiac] Encoder-fusion mode. Channels={brainiac_channel_indices}. Temp cache: {brainiac_tmp_dir}")
+
+    # --- D) Define merging function ---
     def merge_predictions(volumes_4d, method=merging_method):
         if method == "majority_vote":
             return majority_vote(volumes_4d, tiebreaker=tiebreaker_model)
@@ -366,10 +442,16 @@ def run_segmentation(
             return average_prob(volumes_4d, tiebreaker=tiebreaker_model)
         elif method == "max_prob":
             return max_prob(volumes_4d, tiebreaker=tiebreaker_model)
+        elif method == "average_logit":
+            return average_logit(
+                volumes_4d,
+                weights=merging_weights,
+                tiebreaker=tiebreaker_model,
+            )
         else:
             raise ValueError(f"Unknown merging method '{method}'")
 
-    # --- D) Process each subject ---
+    # --- E) Process each subject ---
     for subj_idx in range(num_subjects):
         mask_path = mask_paths[subj_idx]
         if output_directory == "in_place":
@@ -379,6 +461,35 @@ def run_segmentation(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         base_name = os.path.basename(mask_path)
+        missing_channels = [
+            channel_names[i]
+            for i, path in enumerate(volume_paths_list[subj_idx])
+            if str(path).strip() == MISSING_CHANNEL_SENTINEL
+        ]
+        missing_required = [ch for ch in missing_channels if ch not in optional_channels]
+        if missing_required:
+            raise ValueError(f"Exam {subj_idx+1} has missing required channel(s): {missing_required}")
+        if missing_channels:
+            print(f"[INFO] Missing optional channel(s) zero-filled: {missing_channels}")
+
+        # Compute BrainIAC features for this subject if required
+        brainiac_encoder_paths_list = None
+        if brainiac_needed:
+            from .brainiac_utils import compute_brainiac_encoder_features
+            subject_features = []
+            for ch_idx in brainiac_channel_indices:
+                channel_path = volume_paths_list[subj_idx][ch_idx]
+                label = _brainiac_inference_label(ch_idx)
+                if str(channel_path).strip() == MISSING_CHANNEL_SENTINEL:
+                    subject_features.append(MISSING_CHANNEL_SENTINEL)
+                else:
+                    features = compute_brainiac_encoder_features(
+                        [channel_path], brainiac_weights_path,
+                        brainiac_tmp_dir / f"{label}_encoder", label,
+                    )
+                    subject_features.append(features[0])
+            brainiac_encoder_paths_list = [None] * num_subjects
+            brainiac_encoder_paths_list[subj_idx] = subject_features
         if ".nii.gz" in maskPattern:
             seg_name = base_name.replace(maskPattern, segmentSuffix)
         else:
@@ -406,8 +517,10 @@ def run_segmentation(
 
             print(f"  [Model {m_idx+1}] plane={plane}, in={in_sl}, out={out_sl}, classes={n_cls}, minHW={min_HW}")
 
-            (X_data, _, M_data, z_indices, transform_infos) = load_val_data(
-                scan_indexes=[subj_idx],
+            model_uses_brainiac_fusion = getattr(model, "brainiac_input_channels", 0) > 0
+            model_uses_presence = bool(getattr(model, "uses_modality_presence", False))
+            val_data = load_val_data(
+                idx=subj_idx,
                 volume_paths_list=volume_paths_list,
                 mask_paths=mask_paths,
                 gt_paths=mask_paths,
@@ -416,14 +529,42 @@ def run_segmentation(
                 num_output_slices=out_sl,
                 return_transform_info=True,
                 target_height=min_HW,
-                target_width=min_HW
+                target_width=min_HW,
+                brainiac_paths_list=brainiac_encoder_paths_list if model_uses_brainiac_fusion else None,
+                append_modality_presence=model_uses_presence,
             )
-            mask_info = transform_infos[0]
-            val_gen = ValDataGenerator(X_data, None, M_data, slice_batch_size)
+            if model_uses_brainiac_fusion:
+                (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
+            else:
+                (X_data, _, M_data, z_indices, transform_infos) = val_data
+            mask_info = transform_infos[0] if isinstance(transform_infos, (list, tuple)) else transform_infos
+            val_gen = ValDataGenerator(
+                X_data, None, M_data, slice_batch_size,
+                brainiac_data=B_data if model_uses_brainiac_fusion else None,
+            )
             all_preds = []
-            for x_batch, m_batch in val_gen:
-                batch_pred = model.predict(x_batch)
-                all_preds.append(batch_pred)
+            with torch.no_grad():
+                for batch in val_gen:
+                    if model_uses_brainiac_fusion:
+                        x_batch, b_batch, m_batch = batch
+                    else:
+                        x_batch, m_batch = batch
+                    x_tensor = torch.as_tensor(x_batch, dtype=torch.float32, device=device)
+                    x_tensor = x_tensor.permute(0, 3, 1, 2).contiguous()
+                    if model_uses_brainiac_fusion:
+                        b_tensor = torch.as_tensor(b_batch, dtype=torch.float32, device=device)
+                        b_tensor = b_tensor.permute(0, 3, 1, 2).contiguous()
+                        batch_logits = model(x_tensor, b_tensor)
+                    else:
+                        batch_logits = model(x_tensor)
+                    if isinstance(batch_logits, tuple):
+                        batch_logits = batch_logits[0]
+                    batch_pred = (
+                        batch_logits.float().cpu().numpy()
+                        if merging_method == "average_logit"
+                        else F.softmax(batch_logits.float(), dim=-1).cpu().numpy()
+                    )
+                    all_preds.append(batch_pred)
 
             if not all_preds:
                 print(f"[WARNING] No slices processed for exam {subj_idx+1} ({base_name}).")
@@ -468,9 +609,54 @@ def run_segmentation(
             plane_outputs.append(final_arr)
 
         print(f"[INFO] Merging via {merging_method}...")
-        merged_label = majority_vote(plane_outputs, tiebreaker=tiebreaker_model).astype(np.uint8)
+        merged_label = merge_predictions(plane_outputs).astype(np.uint8)
         nib.save(nib.Nifti1Image(merged_label, affine), str(out_path))
         print(f"[INFO] Final seg => {out_path}")
+        if save_class_probabilities:
+            if merging_method != "average_prob":
+                raise ValueError(
+                    "Class probability export requires merging_method = average_prob."
+                )
+            mean_probabilities = np.mean(np.stack(plane_outputs, axis=0), axis=0)
+            for class_index in range(n_cls):
+                probability_name = base_name.replace(
+                    maskPattern,
+                    class_probability_suffix_template.format(class_index=class_index),
+                )
+                if probability_name == base_name:
+                    probability_name = base_name.replace(
+                        ".nii.gz",
+                        class_probability_suffix_template.format(class_index=class_index),
+                    )
+                probability_path = out_dir / probability_name
+                class_probability = mean_probabilities[..., class_index].astype(np.float32)
+                nib.save(nib.Nifti1Image(class_probability, affine), str(probability_path))
+                print(f"[INFO] Class {class_index} probability => {probability_path}")
+        if save_foreground_probability:
+            if n_cls != 2:
+                raise ValueError(
+                    "Foreground probability export currently requires a binary model ensemble."
+                )
+            stacked_outputs = np.stack(plane_outputs, axis=0)
+            if merging_method == "average_prob":
+                foreground_probability = np.mean(stacked_outputs, axis=0)[..., 1]
+            elif merging_method == "average_logit":
+                weights = np.ones(stacked_outputs.shape[0], dtype=np.float32) if merging_weights is None else np.asarray(merging_weights, dtype=np.float32)
+                weights = weights / weights.sum()
+                fused_logits = np.tensordot(weights, stacked_outputs, axes=(0, 0))
+                foreground_logit = fused_logits[..., 1] - fused_logits[..., 0]
+                foreground_probability = 1.0 / (1.0 + np.exp(-np.clip(foreground_logit, -80.0, 80.0)))
+            else:
+                raise ValueError(
+                    "Foreground probability export requires merging_method = average_prob or average_logit."
+                )
+            foreground_probability = foreground_probability.astype(np.float32)
+            probability_name = base_name.replace(maskPattern, foreground_probability_suffix)
+            if probability_name == base_name:
+                probability_name = base_name.replace(".nii.gz", foreground_probability_suffix)
+            probability_path = out_dir / probability_name
+            nib.save(nib.Nifti1Image(foreground_probability, affine), str(probability_path))
+            print(f"[INFO] Foreground probability => {probability_path}")
 
     print("[INFO] All exams done.")
 
@@ -491,21 +677,32 @@ def main():
     parser.add_argument("--overwrite_existing_outputs", action="store_true", default=False,
                         help="Overwrite existing outputs instead of skipping.")
     parser.add_argument("--use_cpu", action="store_true", default=False,
-                        help="Force TensorFlow to use CPU.")
+                        help="Force PyTorch to use CPU.")
     parser.add_argument("--debug_models", action="store_true", default=False,
                         help="Save each model's pre-merge label for debug.")
+    parser.add_argument("--save_foreground_probability", action="store_true", default=False,
+                        help="With a binary average-probability ensemble, also write the mean foreground probability.")
+    parser.add_argument("--foreground_probability_suffix", default="_foreground_probability.nii.gz",
+                        help="Suffix for --save_foreground_probability outputs.")
+    parser.add_argument("--save_class_probabilities", action="store_true", default=False,
+                        help="With average-probability merging, write one probability NIfTI per class.")
+    parser.add_argument("--class_probability_suffix_template", default="_class{class_index}_probability.nii.gz",
+                        help="Filename suffix template for --save_class_probabilities.")
 
     args = parser.parse_args()
     if args.use_cpu:
-        print("[INFO] Forcing TensorFlow to use CPU.")
+        print("[INFO] Forcing PyTorch to use CPU.")
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        tf.config.set_visible_devices([], "GPU")
     run_segmentation(
         segmentation_config_file=args.config,
         slice_batch_size=args.slice_batch_size,
         overwrite=args.overwrite_existing_outputs,
         tiebreaker_model=args.tiebreaker_model,
-        debug_models=args.debug_models
+        debug_models=args.debug_models,
+        save_foreground_probability=args.save_foreground_probability,
+        foreground_probability_suffix=args.foreground_probability_suffix,
+        save_class_probabilities=args.save_class_probabilities,
+        class_probability_suffix_template=args.class_probability_suffix_template,
     )
 
 if __name__ == "__main__":

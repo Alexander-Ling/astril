@@ -268,6 +268,9 @@ def run_preprocessing_pipeline(
     enable_tta=False,
     brainmask_path=None,
     family_parent_map=None,
+    normalization_method="robust_zscore",
+    normalization_percentiles=(0.1, 99.9),
+    normalization_z_clip=None,
     debug=False,
     verbose=True,
 ):
@@ -339,6 +342,14 @@ def run_preprocessing_pipeline(
         when processing modality families (i.e. parent + derived sequences) for co-registration. Transformation
         matrices are calculcated from a single sequence per family and then applied to all family members, defaulting
         to use the parent sequence for calculation of the transformation matrix.
+    normalization_method : {"robust_zscore", "zscore"}, default="robust_zscore"
+        Intensity normalization used for final 3-D brain-normalized outputs. The robust default winsorizes
+        finite in-mask values before estimating location/scale and applies those bounds to the whole image.
+    normalization_percentiles : tuple[float, float], default=(0.1, 99.9)
+        Lower and upper in-mask percentiles used by ``robust_zscore``.
+    normalization_z_clip : float | None, default=None
+        Optional symmetric final z-score limit for ``robust_zscore``. The brain preprocessing pipeline does not
+        z-clip by default.
     debug : bool, default=False
         If True, intermediate files are kept in the caller-provided temp_dir.
     verbose : bool, default=True
@@ -1237,7 +1248,14 @@ def run_preprocessing_pipeline(
     for lbl, src_brain in list(brain_paths.items()):
         out_norm = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_brain-norm_temp.nii.gz")
         try:
-            normalize_masked_anydim(src_brain, brainmask_temp, out_norm)
+            normalize_masked_anydim(
+                src_brain,
+                brainmask_temp,
+                out_norm,
+                method=normalization_method,
+                percentiles=normalization_percentiles,
+                z_clip=normalization_z_clip,
+            )
             norm_paths[lbl] = out_norm
         except Exception as e:
             if verbose:
@@ -1625,6 +1643,9 @@ def preprocess_single_brain_mri(
     scanID=None,
     brainmask_path=None,
     family_parent_map=None,
+    normalization_method="robust_zscore",
+    normalization_percentiles=(0.1, 99.9),
+    normalization_z_clip=None,
     use_gpu=False,
     enable_tta=False,
     verbose=True,
@@ -1706,6 +1727,9 @@ def preprocess_single_brain_mri(
         sub-modalities in that family. If a sub-modality is not geometry-compatible (shape/affine) with
         the parent scan, it falls back to individual transform estimation.
         Family is inferred as the label prefix before the first underscore (e.g. "DWI_TRACE" -> "DWI").
+    normalization_method, normalization_percentiles, normalization_z_clip
+        Passed to ``normalize_masked_anydim`` for the final 3-D ``_brain-norm`` outputs. Defaults to robust
+        per-mask winsorized z-scoring; the brain pipeline leaves z clipping disabled by default.
     debug : bool, default=False
         If True, keep intermediate files in an output-local temp workspace.
         Even when debug is False, the temporary workspace is created under
@@ -1880,6 +1904,9 @@ def preprocess_single_brain_mri(
             enable_tta=enable_tta,
             brainmask_path=brainmask_path,
             family_parent_map=family_parent_map,
+            normalization_method=normalization_method,
+            normalization_percentiles=normalization_percentiles,
+            normalization_z_clip=normalization_z_clip,
             debug=True,
             verbose=verbose,
         )
@@ -1912,6 +1939,9 @@ def preprocess_single_brain_mri(
                 enable_tta=enable_tta,
                 brainmask_path=brainmask_path,
                 family_parent_map=family_parent_map,
+                normalization_method=normalization_method,
+                normalization_percentiles=normalization_percentiles,
+                normalization_z_clip=normalization_z_clip,
                 debug=False,
                 verbose=verbose,
             )
@@ -2061,6 +2091,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--normalization_method",
+        choices=("robust_zscore", "zscore"),
+        default="robust_zscore",
+        help="Final 3-D brain normalization method (default: robust_zscore).",
+    )
+    parser.add_argument(
+        "--normalization_percentiles",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        default=(0.1, 99.9),
+        help="In-mask winsorization percentiles for robust_zscore (default: 0.1 99.9).",
+    )
+    parser.add_argument(
+        "--normalization_z_clip",
+        type=float,
+        default=None,
+        help="Optional symmetric final z-score limit for robust_zscore (default: disabled).",
+    )
+    parser.add_argument(
         "--family_parent_map",
         default=None,
         help=(
@@ -2174,6 +2224,9 @@ def main():
         enable_tta=args.enable_tta,
         brainmask_path=args.brainmask,
         family_parent_map=family_parent_map,
+        normalization_method=args.normalization_method,
+        normalization_percentiles=args.normalization_percentiles,
+        normalization_z_clip=args.normalization_z_clip,
         verbose=not args.quiet,
         overwrite=bool(args.overwrite),
     )

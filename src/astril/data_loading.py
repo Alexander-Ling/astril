@@ -1,19 +1,60 @@
 import os
-import gc
 import random
+import shutil
+import tempfile
 import numpy as np
 import nibabel as nib
-import psutil
 import matplotlib.pyplot as plt
-from tensorflow.keras.utils import Sequence
+import torch
 from concurrent.futures import ThreadPoolExecutor
-from scipy.ndimage import rotate
+from scipy.ndimage import rotate as scipy_rotate
 
 # Nibabel orientation imports:
 from nibabel.orientations import io_orientation, ornt_transform, apply_orientation
 from nibabel.funcs import as_closest_canonical
 
 from .config import n_cores, minimum_height_width
+
+
+MISSING_CHANNEL_SENTINEL = "__MISSING__"
+
+
+def is_missing_channel_path(path):
+    return path is None or str(path).strip() == MISSING_CHANNEL_SENTINEL
+
+
+class Sequence:
+    """Minimal sequence protocol used by astril's NumPy batch generators."""
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
+class ValDataGenerator(Sequence):
+    """Small NumPy batch generator used by inference code paths."""
+
+    def __init__(self, x_data, y_data, mask_data, batch_size, brainiac_data=None):
+        self.x_data = x_data
+        self.y_data = y_data
+        self.mask_data = mask_data
+        self.batch_size = int(batch_size)
+        self.brainiac_data = brainiac_data
+
+    def __len__(self):
+        if not self.x_data:
+            return 0
+        return int(np.ceil(len(self.x_data) / float(self.batch_size)))
+
+    def __getitem__(self, index):
+        start = index * self.batch_size
+        end = min(start + self.batch_size, len(self.x_data))
+        x_batch = np.stack(self.x_data[start:end], axis=0).astype(np.float32)
+        m_batch = np.stack(self.mask_data[start:end], axis=0).astype(np.float32)
+        if self.brainiac_data is not None:
+            b_batch = np.stack(self.brainiac_data[start:end], axis=0).astype(np.float32)
+            return x_batch, b_batch, m_batch
+        return x_batch, m_batch
 
 # -------------------------------------------------
 # Basic I/O
@@ -318,6 +359,81 @@ def robust_align_volume(file_path, plane, pad_amt, enforce_canonical=True, targe
 
     return data_final, transform_info
 
+
+def _reorder_brainiac_axes(feature_volume, plane):
+    """Reorder canonical BrainIAC grid axes so the slice axis is third."""
+    axes_order = {
+        'axial': (0, 1, 2),
+        'sagittal': (1, 2, 0),
+        'coronal': (0, 2, 1),
+    }.get(plane)
+    if axes_order is None:
+        raise ValueError(f"Invalid slicing plane: {plane}")
+    return np.transpose(feature_volume, axes_order + (3,))
+
+
+def _pad_brainiac_hw(feature_volume, target_h, target_w):
+    """Pad/crop patch-grid H/W axes to a stable per-sample size."""
+    h, w, d, c = feature_volume.shape
+    out = np.zeros((target_h, target_w, d, c), dtype=np.float32)
+    copy_h = min(h, target_h)
+    copy_w = min(w, target_w)
+    src_h0 = max((h - target_h) // 2, 0)
+    src_w0 = max((w - target_w) // 2, 0)
+    dst_h0 = max((target_h - h) // 2, 0)
+    dst_w0 = max((target_w - w) // 2, 0)
+    out[dst_h0:dst_h0 + copy_h, dst_w0:dst_w0 + copy_w] = feature_volume[
+        src_h0:src_h0 + copy_h,
+        src_w0:src_w0 + copy_w,
+    ]
+    return out
+
+
+def load_brainiac_feature_volumes(
+    brainiac_paths,
+    plane,
+    image_shape,
+    pad_amt,
+    target_height=minimum_height_width,
+    target_width=minimum_height_width,
+):
+    """Load canonical patch-token grids and align them to astril's slicing plane."""
+    if not brainiac_paths:
+        return None
+
+    target_h = int(np.ceil(target_height / 16.0))
+    target_w = int(np.ceil(target_width / 16.0))
+    prepared = []
+    first_shape = None
+    for path in brainiac_paths:
+        if is_missing_channel_path(path):
+            prepared.append(None)
+            continue
+        feat = np.load(path).astype(np.float32)  # (X_p,Y_p,Z_p,C)
+        feat = _reorder_brainiac_axes(feat, plane)
+        feat = _pad_brainiac_hw(feat, target_h, target_w)
+        first_shape = feat.shape if first_shape is None else first_shape
+        prepared.append(feat)
+
+    if first_shape is None:
+        image_depth = int(image_shape[2]) if len(image_shape) >= 3 else 1
+        unpadded_depth = max(image_depth - 2 * int(pad_amt), 1)
+        patch_depth = max(1, int(np.ceil(unpadded_depth / 16.0)))
+        first_shape = (target_h, target_w, patch_depth, 768)
+
+    volumes = [
+        np.zeros(first_shape, dtype=np.float32) if feat is None else feat
+        for feat in prepared
+    ]
+    return np.concatenate(volumes, axis=-1)
+
+
+def brainiac_slice_for_center(feature_volume, z_center, pad_amt):
+    """Return the nearest patch-plane features for a padded image-slice center."""
+    z_unpadded = max(int(z_center) - int(pad_amt), 0)
+    patch_z = min(z_unpadded // 16, feature_volume.shape[2] - 1)
+    return feature_volume[:, :, patch_z, :]
+
 def undo_all_transforms(volume_3D, transform_info):
     """
     Inverts robust_align_volume steps:
@@ -359,53 +475,6 @@ def apply_inverse_canonical_4d(prob_4d, transform_from_canonical):
     return reoriented
 
 # -------------------------------------------------
-# Data Generators
-# -------------------------------------------------
-class EpochDataGenerator(Sequence):
-    def __init__(self, x_data, y_data, mask_data, sample_names, batch_size):
-        self.x_data = x_data
-        self.y_data = y_data
-        self.mask_data = mask_data
-        self.batch_size = batch_size
-        self.sample_names = sample_names
-
-    def __len__(self):
-        return int(np.ceil(len(self.x_data) / self.batch_size))
-
-    def __getitem__(self, index):
-        start = index * self.batch_size
-        end = min(start + self.batch_size, len(self.x_data))
-        if start >= len(self.x_data):
-            raise StopIteration
-        return (self.x_data[start:end],
-                self.y_data[start:end],
-                self.mask_data[start:end],
-                self.sample_names[start:end])
-
-class ValDataGenerator(Sequence):
-    def __init__(self, x_data, y_data, mask_data, batch_size):
-        self.x_data = x_data
-        self.y_data = y_data
-        self.mask_data = mask_data
-        self.batch_size = batch_size
-
-    def __len__(self):
-        return int(np.ceil(len(self.x_data) / self.batch_size))
-
-    def __getitem__(self, index):
-        start = index * self.batch_size
-        end = min(start + self.batch_size, len(self.x_data))
-        x_batch = self.x_data[start:end]
-        mask_batch = self.mask_data[start:end]
-        
-        if self.y_data is not None:
-            y_batch = self.y_data[start:end]
-            return(x_batch, y_batch, mask_batch)
-        else:
-            y_batch = None
-            return (x_batch, mask_batch)
-
-# -------------------------------------------------
 # Helper functions (class presence checks, etc.)
 # -------------------------------------------------
 def slice_has_all_classes(slice_array, required_classes):
@@ -441,191 +510,8 @@ def passes_require_classes(combined_gt_slice, require_classes):
             raise ValueError(f"Invalid require_classes mode: {mode}")
     return True
 
-def get_ram_usage_percent():
-    return psutil.virtual_memory().percent
-
-def append_or_replace(
-    X_list, Y_list, M_list, sample_names,
-    X_item, Y_item, M_item, sample_name,
-    replace_index=None
-):
-    if replace_index is None:
-        X_list.append(X_item)
-        Y_list.append(Y_item)
-        M_list.append(M_item)
-        sample_names.append(sample_name)
-    else:
-        X_list[replace_index] = X_item
-        Y_list[replace_index] = Y_item
-        M_list[replace_index] = M_item
-        sample_names[replace_index] = sample_name
-
-# ------------------------------------------------- 
-# Training Data Loading (2.5D) 
-# ------------------------------------------------- 
-def load_train_slices(
-    idx,
-    volume_paths_list,
-    mask_paths,
-    gt_paths,
-    slicing_plane,
-    num_input_slices,
-    num_output_slices,
-    class_multiplication_factors=None,
-    require_classes=None
-):
-    """
-    Load all 2.5D slices from the scan at index `idx` for training,
-    with optional filtering and augmentation.
-    """
-    if class_multiplication_factors is None:
-        class_multiplication_factors = {}
-    if require_classes is None:
-        require_classes = {}
-
-    import os
-    sample_name = os.path.basename(mask_paths[idx]).replace('-brainmask.nii.gz', '')
-
-    # Decide how many slices to pad
-    half_in = num_input_slices // 2
-    half_out = num_output_slices // 2
-    pad_amt = max(half_in, half_out)
-
-    # 1) Robustly load + orient each channel
-    channel_volumes = []
-    for ch_path in volume_paths_list[idx]:
-        ch_data, _ = robust_align_volume(
-            ch_path,
-            plane=slicing_plane,
-            pad_amt=pad_amt,
-            enforce_canonical=True
-        )
-        #debug_plot_slices(ch_data, plane = slicing_plane)
-        channel_volumes.append(ch_data)
-
-    # 2) Robustly load + orient mask
-    mask_data, _ = robust_align_volume(
-        mask_paths[idx],
-        plane=slicing_plane,
-        pad_amt=pad_amt,
-        enforce_canonical=True
-    )
-
-    # 3) Robustly load + orient ground-truth
-    gt_data, _ = robust_align_volume(
-        gt_paths[idx],
-        plane=slicing_plane,
-        pad_amt=pad_amt,
-        enforce_canonical=True
-    )
-
-    # Identify relevant slices (mask>0)
-    relevant_z_indices = np.where(np.any(mask_data > 0, axis=(0,1)))[0]
-
-    X_scan_data = []
-    y_scan_data = []
-    mask_scan_data = []
-    scan_sample_names = []
-
-    # Slice offsets
-    start_in = -half_in
-    end_in   = start_in + num_input_slices
-    start_out = -half_out
-    end_out   = start_out + num_output_slices
-
-    for z_center in relevant_z_indices:
-        # (A) Build input window
-        input_slices = []
-        for offset in range(start_in, end_in):
-            z_in = z_center + offset
-            ch_slices = [ch_vol[:, :, z_in] for ch_vol in channel_volumes]
-            stacked_ch = np.stack(ch_slices, axis=-1)
-            input_slices.append(stacked_ch)
-        X_window = np.concatenate(input_slices, axis=-1)  
-
-        # (B) Build label window
-        gt_slices = []
-        mask_slices = []
-        for offset in range(start_out, end_out):
-            z_out = z_center + offset
-            gt_slices.append(gt_data[:, :, z_out].astype(np.int32))
-            mask_slices.append((mask_data[:, :, z_out] > 0.5).astype(np.int32))
-        Y_window = np.stack(gt_slices, axis=-1)[..., np.newaxis]  
-        M_window = np.stack(mask_slices, axis=-1)[..., np.newaxis]
-
-        # (C) Filter out if not containing required classes
-        combined_gt = np.squeeze(Y_window, axis=-1)
-        if not passes_require_classes(combined_gt, require_classes):
-            continue
-
-        # (D) Determine augmentation factor
-        augmentation_factor = 0
-        for key_tuple, factor_val in class_multiplication_factors.items():
-            if slice_has_all_classes(combined_gt, key_tuple):
-                augmentation_factor = factor_val
-                break
-
-        # (E) Check memory usage, append or replace
-        ram_usage = get_ram_usage_percent()
-        if ram_usage < 90.0:
-            replace_index = None
-        else:
-            if random.random() < 0.5:
-                # skip
-                continue
-            else:
-                replace_index = (
-                    random.randrange(len(X_scan_data))
-                    if len(X_scan_data) > 0
-                    else None
-                )
-
-        # Insert original
-        append_or_replace(
-            X_scan_data, y_scan_data, mask_scan_data, scan_sample_names,
-            X_window, Y_window, M_window, sample_name,
-            replace_index=replace_index
-        )
-
-        # (F) Augment if needed
-        for _ in range(augmentation_factor):
-            angle = np.random.uniform(0, 360)
-            # Rotate input
-            X_rot = rotate(X_window, angle, reshape=False, mode='constant', cval=0)
-            # Rotate output
-            Y_rot = np.zeros_like(Y_window)
-            M_rot = np.zeros_like(M_window)
-            for s in range(num_output_slices):
-                y2d = Y_window[:, :, s, 0]
-                m2d = M_window[:, :, s, 0]
-                y2d_rot = rotate(y2d, angle, reshape=False, mode='constant', cval=0, order=0)
-                m2d_rot = rotate(m2d, angle, reshape=False, mode='constant', cval=0, order=0)
-                Y_rot[:, :, s, 0] = y2d_rot
-                M_rot[:, :, s, 0] = m2d_rot
-
-            ram_usage_aug = get_ram_usage_percent()
-            if ram_usage_aug < 90.0:
-                replace_index_aug = None
-            else:
-                if random.random() < 0.5:
-                    continue
-                else:
-                    replace_index_aug = (
-                        random.randrange(len(X_scan_data))
-                        if len(X_scan_data) > 0
-                        else None
-                    )
-
-            append_or_replace(
-                X_scan_data, y_scan_data, mask_scan_data, scan_sample_names,
-                X_rot, Y_rot, M_rot, sample_name,
-                replace_index=replace_index_aug
-            )
-
-    return X_scan_data, y_scan_data, mask_scan_data, scan_sample_names
-
 # -------------------------------------------------
-# Validation Data Loading (2.5D, no augmentation)
+# Validation Data Loading (2.5D, no augmentation) — kept for inference path
 # -------------------------------------------------
 def load_val_slices(
     idx,
@@ -637,7 +523,9 @@ def load_val_slices(
     num_output_slices,
     return_transform_info=False,
     target_height=minimum_height_width,
-    target_width=minimum_height_width
+    target_width=minimum_height_width,
+    brainiac_paths_list=None,
+    append_modality_presence=False,
 ):
     """
     Load all 2.5D slices from the scan at index `idx` (without augmentation),
@@ -664,16 +552,32 @@ def load_val_slices(
 
     # 2) Robustly load + orient all channels
     channel_volumes = []
+    channel_presence = []
     for ch_path in volume_paths_list[idx]:
-        ch_data, _ = robust_align_volume(
-            ch_path,
-            plane=slicing_plane,
-            pad_amt=pad_amt,
-            enforce_canonical=True,
-            target_height=target_height,
-            target_width=target_width
-        )
+        if is_missing_channel_path(ch_path):
+            ch_data = np.zeros_like(mask_data, dtype=np.float32)
+            channel_presence.append(0.0)
+        else:
+            ch_data, _ = robust_align_volume(
+                ch_path,
+                plane=slicing_plane,
+                pad_amt=pad_amt,
+                enforce_canonical=True,
+                target_height=target_height,
+                target_width=target_width
+            )
+            channel_presence.append(1.0)
         channel_volumes.append(ch_data)
+    brainiac_volume = None
+    if brainiac_paths_list is not None:
+        brainiac_volume = load_brainiac_feature_volumes(
+            brainiac_paths_list[idx],
+            slicing_plane,
+            channel_volumes[0].shape,
+            pad_amt,
+            target_height=target_height,
+            target_width=target_width,
+        )
 
     # 3) Robustly load + orient ground-truth
     gt_data, _ = robust_align_volume(
@@ -689,6 +593,7 @@ def load_val_slices(
     relevant_z_indices = np.where(np.any(mask_data > 0, axis=(0,1)))[0]
 
     X_scan_data = []
+    B_scan_data = []
     y_scan_data = []
     mask_scan_data = []
     z_indices_used = []  # store which z_center each slice corresponds to
@@ -708,6 +613,14 @@ def load_val_slices(
             stacked_ch = np.stack(ch_slices, axis=-1)
             input_slices.append(stacked_ch)
         X_window = np.concatenate(input_slices, axis=-1)
+        if append_modality_presence:
+            presence_maps = np.broadcast_to(
+                np.asarray(channel_presence, dtype=np.float32),
+                X_window.shape[:2] + (len(channel_presence),),
+            )
+            X_window = np.concatenate([X_window, presence_maps], axis=-1)
+        if brainiac_volume is not None:
+            B_scan_data.append(brainiac_slice_for_center(brainiac_volume, z_center, pad_amt))
 
         # (B) Build label + mask window
         gt_slices = []
@@ -725,95 +638,431 @@ def load_val_slices(
         mask_scan_data.append(M_window)
         z_indices_used.append(z_center)
 
+    if brainiac_paths_list is not None and not return_transform_info:
+        return X_scan_data, B_scan_data, y_scan_data, mask_scan_data, z_indices_used
+    if brainiac_paths_list is not None:
+        return X_scan_data, B_scan_data, y_scan_data, mask_scan_data, z_indices_used, mask_info
     if not return_transform_info:
         return X_scan_data, y_scan_data, mask_scan_data, z_indices_used
     else:
         return X_scan_data, y_scan_data, mask_scan_data, z_indices_used, mask_info
 
+
+load_val_data = load_val_slices
+
+
 # -------------------------------------------------
-# Multi-threaded loaders for an epoch
+# Streaming infrastructure (replaces load_epoch_data / load_val_data)
 # -------------------------------------------------
-def load_epoch_data(
-    scan_indexes,
+
+def _save_scan_volumes_to_temp(
+    idx,
     volume_paths_list,
     mask_paths,
     gt_paths,
     slicing_plane,
     num_input_slices,
     num_output_slices,
-    num_classes,
-    class_multiplication_factors=None,
-    require_classes=None,
-    do_shuffle=True
+    brainiac_paths_list,
+    target_height,
+    target_width,
+    prefix="astril_vol_",
+    temp_base_dir=None,
 ):
-    X_epoch_list = []
-    y_epoch_list = []
-    mask_epoch_list = []
-    sample_names_list = []
+    """
+    Load and orient all NIfTI volumes for one scan, then write them to a temp
+    directory as memory-mappable .npy files.  Returns (tmp_dir, has_data, has_brainiac).
+    Only paths/small objects are ever sent back through the IPC pipe, avoiding
+    Windows WinError 1450.
+    """
+    import os as _os
+    half_in  = num_input_slices  // 2
+    half_out = num_output_slices // 2
+    pad_amt  = max(half_in, half_out)
+    has_brainiac = brainiac_paths_list is not None
 
-    with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = [
-            executor.submit(
-                load_train_slices,
-                idx,
-                volume_paths_list,
-                mask_paths,
-                gt_paths,
-                slicing_plane,
-                num_input_slices,
-                num_output_slices,
-                class_multiplication_factors,
-                require_classes
-            )
-            for idx in scan_indexes
-        ]
-        for future in futures:
-            X_scan, y_scan, m_scan, names_scan = future.result()
-            X_epoch_list.extend(X_scan)
-            y_epoch_list.extend(y_scan)
-            mask_epoch_list.extend(m_scan)
-            sample_names_list.extend(names_scan)
+    sample_name = _os.path.basename(mask_paths[idx]).replace('-brainmask.nii.gz', '')
 
-    if do_shuffle and len(X_epoch_list) > 0:
-        combined = list(zip(X_epoch_list, y_epoch_list, mask_epoch_list, sample_names_list))
-        random.shuffle(combined)
-        X_epoch_list, y_epoch_list, mask_epoch_list, sample_names_list = zip(*combined)
-        del combined
-        X_epoch_list = list(X_epoch_list)
-        y_epoch_list = list(y_epoch_list)
-        mask_epoch_list = list(mask_epoch_list)
-        sample_names_list = list(sample_names_list)
+    # Load mask first to find relevant z-indices
+    mask_vol, _ = robust_align_volume(
+        mask_paths[idx], plane=slicing_plane, pad_amt=pad_amt,
+        enforce_canonical=True, target_height=target_height, target_width=target_width,
+    )
+    relevant_z = np.where(np.any(mask_vol > 0, axis=(0, 1)))[0].astype(np.int32)
 
-    X_epoch_data = np.array(X_epoch_list, dtype=np.float32)
-    y_epoch_data = np.array(y_epoch_list, dtype=np.uint8)
-    mask_epoch_data = np.array(mask_epoch_list, dtype=bool)
-    epoch_sample_names = np.array(sample_names_list, dtype=object)
+    tmp_dir = tempfile.mkdtemp(prefix=prefix, dir=temp_base_dir)
 
-    del X_epoch_list, y_epoch_list, mask_epoch_list, sample_names_list
-    gc.collect()
+    if len(relevant_z) == 0:
+        return tmp_dir, False, has_brainiac
 
-    # Compute inverse-frequency class weights
-    class_counts = np.zeros(num_classes, dtype=np.float32)
-    for y_slice, m_slice in zip(y_epoch_data, mask_epoch_data):
-        valid_pixels = (m_slice > 0)
-        y_valid_slice = y_slice[valid_pixels]
-        for c in range(num_classes):
-            class_counts[c] += np.count_nonzero(y_valid_slice == c)
-
-    total_valid = np.sum(class_counts) + 1e-8
-    freqs = class_counts / total_valid
-    class_weights = np.zeros_like(freqs, dtype=np.float32)
-    for c in range(num_classes):
-        if freqs[c] > 0.0:
-            class_weights[c] = 1.0 / freqs[c]
+    # Load all channels and stack to (num_channels, H, W, D)
+    ch_vols = []
+    channel_presence = []
+    for ch_path in volume_paths_list[idx]:
+        if is_missing_channel_path(ch_path):
+            ch = np.zeros_like(mask_vol, dtype=np.float32)
+            channel_presence.append(False)
         else:
-            class_weights[c] = 1.0
-    class_weights = np.clip(class_weights, 0, 1000.0)
+            ch, _ = robust_align_volume(
+                ch_path, plane=slicing_plane, pad_amt=pad_amt,
+                enforce_canonical=True, target_height=target_height, target_width=target_width,
+            )
+            channel_presence.append(True)
+        ch_vols.append(ch)
+    vols = np.stack(ch_vols, axis=0).astype(np.float32)  # (C, H, W, D)
 
-    return X_epoch_data, y_epoch_data, mask_epoch_data, epoch_sample_names, class_weights
+    gt_vol, _ = robust_align_volume(
+        gt_paths[idx], plane=slicing_plane, pad_amt=pad_amt,
+        enforce_canonical=True, target_height=target_height, target_width=target_width,
+    )
+
+    np.save(_os.path.join(tmp_dir, 'vols.npy'), vols)
+    np.save(_os.path.join(tmp_dir, 'gt.npy'),   gt_vol.astype(np.int32))
+    np.save(_os.path.join(tmp_dir, 'mask.npy'), (mask_vol > 0.5).astype(np.uint8))
+    np.savez(
+        _os.path.join(tmp_dir, 'meta.npz'),
+        pad_amt      = np.int32(pad_amt),
+        num_channels = np.int32(len(ch_vols)),
+        sample_name  = np.array([sample_name], dtype=object),
+        relevant_z   = relevant_z,
+        channel_presence = np.asarray(channel_presence, dtype=np.uint8),
+    )
+
+    if has_brainiac:
+        brainiac_vol = load_brainiac_feature_volumes(
+            brainiac_paths_list[idx], slicing_plane, vols.shape[1:],
+            pad_amt, target_height=target_height, target_width=target_width,
+        )
+        if brainiac_vol is not None:
+            np.save(_os.path.join(tmp_dir, 'brainiac.npy'), brainiac_vol.astype(np.float32))
+
+    return tmp_dir, True, has_brainiac
 
 
-def load_val_data(
+def _dataloader_worker_init(worker_id):
+    """Seed numpy and random in each DataLoader worker for independent augmentation."""
+    seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def sample_optional_channel_dropout(
+    optional_channel_indices,
+    strategy="independent",
+    independent_probabilities=None,
+    subset_probabilities=None,
+    rng=None,
+):
+    """Choose optional modalities to drop for one fetched training slab."""
+    optional = sorted(set(int(index) for index in optional_channel_indices or []))
+    if not optional:
+        return []
+    rng = rng or random
+    if strategy == "independent":
+        probabilities = dict(independent_probabilities or {})
+        return [
+            index
+            for index in optional
+            if probabilities.get(index, 0.0) > 0
+            and rng.random() < probabilities.get(index, 0.0)
+        ]
+    if strategy != "subset":
+        raise ValueError(f"Unknown channel dropout strategy: {strategy}")
+
+    configured = dict(subset_probabilities or {"full": 1.0})
+    drop_counts = {
+        "full": 0,
+        "single": min(1, len(optional)),
+        "double": min(2, len(optional)),
+        "required_only": len(optional),
+    }
+    # Merge categories that map to the same count for one- or two-optional-channel models.
+    count_weights = {}
+    for category, weight in configured.items():
+        count = drop_counts.get(category)
+        if count is None or weight <= 0:
+            continue
+        count_weights[count] = count_weights.get(count, 0.0) + float(weight)
+    if not count_weights:
+        return []
+    counts = sorted(count_weights)
+    weights = [count_weights[count] for count in counts]
+    selected_count = rng.choices(counts, weights=weights, k=1)[0]
+    return sorted(rng.sample(optional, selected_count)) if selected_count else []
+
+
+class AstrilSliceDataset(torch.utils.data.Dataset):
+    """
+    Streams 2.5D slice windows from pre-loaded, memory-mapped NIfTI volumes.
+
+    scan_temp_dirs: list of paths created by _save_scan_volumes_to_temp.
+    Only file paths and small scalars/dicts are stored, so the Dataset pickles
+    cleanly into DataLoader workers on Windows (spawn mode).
+    """
+
+    def __init__(
+        self,
+        scan_temp_dirs,
+        num_input_slices,
+        num_output_slices,
+        class_multiplication_factors,
+        require_classes,
+        is_training,
+        use_flip_augmentation,
+        use_intensity_augmentation,
+        intensity_augmentation_strength,
+        use_rotation_augmentation,
+        rotation_degrees,
+        has_brainiac,
+        optional_channel_indices=None,
+        channel_dropout_probabilities=None,
+        channel_dropout_strategy="independent",
+        channel_dropout_subset_probabilities=None,
+        append_modality_presence=False,
+        brainiac_channel_indices=None,
+    ):
+        self.scan_temp_dirs               = list(scan_temp_dirs)
+        self.num_input_slices             = num_input_slices
+        self.num_output_slices            = num_output_slices
+        self.class_multiplication_factors = dict(class_multiplication_factors or {})
+        self.require_classes              = dict(require_classes or {})
+        self.is_training                  = is_training
+        self.use_flip_augmentation        = use_flip_augmentation
+        self.use_intensity_augmentation   = use_intensity_augmentation
+        self.intensity_augmentation_strength = intensity_augmentation_strength
+        self.use_rotation_augmentation    = use_rotation_augmentation
+        self.rotation_degrees             = float(rotation_degrees)
+        self.has_brainiac                 = has_brainiac
+        self.optional_channel_indices     = set(int(i) for i in (optional_channel_indices or []))
+        self.channel_dropout_probabilities = {
+            int(k): float(v) for k, v in dict(channel_dropout_probabilities or {}).items()
+        }
+        self.channel_dropout_strategy = str(channel_dropout_strategy)
+        self.channel_dropout_subset_probabilities = dict(
+            channel_dropout_subset_probabilities or {}
+        )
+        self.append_modality_presence = bool(append_modality_presence)
+        self.brainiac_channel_indices     = [int(i) for i in (brainiac_channel_indices or [])]
+        self._index = []          # list of (scan_idx, z_center)
+        self._scan_cache = {}
+        self.class_weights = None
+        self._build_index()
+
+    def _build_index(self):
+        import os as _os
+        half_out    = self.num_output_slices // 2
+        class_counts = {}
+
+        for scan_idx, tmp_dir in enumerate(self.scan_temp_dirs):
+            meta       = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
+            relevant_z = meta['relevant_z']
+            gt_vol     = np.load(_os.path.join(tmp_dir, 'gt.npy'),   mmap_mode='r')
+            mask_vol   = np.load(_os.path.join(tmp_dir, 'mask.npy'), mmap_mode='r')
+
+            for z_center in relevant_z:
+                z = int(z_center)
+                gt_center = gt_vol[:, :, z].astype(np.int32)
+
+                if self.require_classes:
+                    if not passes_require_classes(gt_center, self.require_classes):
+                        continue
+
+                # Oversample based on class_multiplication_factors (replaces rotation augmentation)
+                n_copies = 1
+                for key_tuple, factor_val in self.class_multiplication_factors.items():
+                    if slice_has_all_classes(gt_center, key_tuple):
+                        n_copies = 1 + int(factor_val)
+                        break
+
+                for _ in range(n_copies):
+                    self._index.append((scan_idx, z))
+
+                # Accumulate class pixel counts for class weight computation
+                mask_center = mask_vol[:, :, z] > 0
+                if mask_center.any():
+                    unique, cnts = np.unique(gt_center[mask_center], return_counts=True)
+                    for cls, cnt in zip(unique.tolist(), cnts.tolist()):
+                        class_counts[cls] = class_counts.get(cls, 0) + cnt
+
+        if len(self._index) == 0:
+            print("WARNING: AstrilSliceDataset has zero valid slice entries after filtering.")
+
+        # Inverse-frequency class weights
+        if class_counts:
+            n_cls  = max(class_counts.keys()) + 1
+            counts = np.array([class_counts.get(c, 0) for c in range(n_cls)], dtype=np.float64)
+            total  = counts.sum() + 1e-8
+            freqs  = counts / total
+            weights = np.where(freqs > 0, 1.0 / freqs, 1.0)
+            self.class_weights = np.clip(weights, 0, 1000.0).astype(np.float32)
+        else:
+            self.class_weights = np.ones(1, dtype=np.float32)
+
+    def __len__(self):
+        return len(self._index)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_scan_cache"] = {}
+        return state
+
+    def _get_scan_arrays(self, scan_idx):
+        import os as _os
+        tmp_dir = self.scan_temp_dirs[scan_idx]
+
+        # Cache only scalar metadata. Mmap handles are intentionally NOT cached:
+        # persistent handles in worker processes block shutil.rmtree on Windows
+        # (open mmaps hold a file lock), causing temp dirs to accumulate on disk.
+        cached_meta = self._scan_cache.get(scan_idx)
+        if cached_meta is None:
+            meta = np.load(_os.path.join(tmp_dir, 'meta.npz'), allow_pickle=True)
+            cached_meta = {
+                "pad_amt":    int(meta['pad_amt']),
+                "num_channels": int(meta['num_channels']),
+                "sample_name":  str(meta['sample_name'][0]),
+                "channel_presence": np.asarray(
+                    meta["channel_presence"]
+                    if "channel_presence" in meta.files
+                    else np.ones(int(meta['num_channels']), dtype=np.uint8),
+                    dtype=np.uint8,
+                ),
+                "has_brainiac_file": (
+                    self.has_brainiac
+                    and _os.path.exists(_os.path.join(tmp_dir, 'brainiac.npy'))
+                ),
+            }
+            self._scan_cache[scan_idx] = cached_meta
+
+        result = dict(cached_meta)
+        result["tmp_dir"] = tmp_dir
+        result["vols"]    = np.load(_os.path.join(tmp_dir, 'vols.npy'),  mmap_mode='r')
+        result["gt"]      = np.load(_os.path.join(tmp_dir, 'gt.npy'),    mmap_mode='r')
+        result["mask"]    = np.load(_os.path.join(tmp_dir, 'mask.npy'),  mmap_mode='r')
+        result["brainiac"] = None
+        if cached_meta["has_brainiac_file"]:
+            result["brainiac"] = np.load(
+                _os.path.join(tmp_dir, 'brainiac.npy'), mmap_mode='r'
+            )
+        return result
+
+    def __getitem__(self, i):
+        scan_idx, z_center = self._index[i]
+        arrays = self._get_scan_arrays(scan_idx)
+        pad_amt      = arrays["pad_amt"]
+        num_channels = arrays["num_channels"]
+        sample_name  = arrays["sample_name"]
+        vols         = arrays["vols"]  # (C, H, W, D)
+        gt_vol       = arrays["gt"]
+        mask_vol     = arrays["mask"]
+        channel_presence = arrays["channel_presence"].astype(np.float32).copy()
+
+        half_in  = self.num_input_slices  // 2
+        half_out = self.num_output_slices // 2
+
+        # Build X window: (H, W, C * num_input_slices)
+        input_planes = []
+        for offset in range(-half_in, -half_in + self.num_input_slices):
+            z_in = z_center + offset
+            ch_planes = [vols[c, :, :, z_in] for c in range(num_channels)]
+            input_planes.append(np.stack(ch_planes, axis=-1))  # (H, W, C)
+        X_window = np.concatenate(input_planes, axis=-1).copy().astype(np.float32)
+
+        # Build Y and M windows: (H, W, num_output_slices, 1)
+        gt_planes, mask_planes = [], []
+        for offset in range(-half_out, -half_out + self.num_output_slices):
+            z_out = z_center + offset
+            gt_planes.append(gt_vol[:, :, z_out].astype(np.int32))
+            mask_planes.append((mask_vol[:, :, z_out] > 0).astype(np.int32))
+        Y_window = np.stack(gt_planes,   axis=-1)[..., np.newaxis].copy()
+        M_window = np.stack(mask_planes, axis=-1)[..., np.newaxis].copy()
+
+        # BrainIAC: sentinel zeros when absent so the tuple arity is always 5
+        B_window = np.zeros((1,), dtype=np.float32)
+        brainiac_vol = arrays["brainiac"]
+        if self.has_brainiac and brainiac_vol is not None:
+            B_window = brainiac_slice_for_center(brainiac_vol, z_center, pad_amt).copy()
+
+        # Augmentation (training only)
+        if self.is_training:
+            dropped_channels = sample_optional_channel_dropout(
+                self.optional_channel_indices,
+                strategy=self.channel_dropout_strategy,
+                independent_probabilities=self.channel_dropout_probabilities,
+                subset_probabilities=self.channel_dropout_subset_probabilities,
+            )
+            if dropped_channels:
+                for ch_idx in dropped_channels:
+                    X_window[..., ch_idx::num_channels] = 0.0
+                    channel_presence[ch_idx] = 0.0
+                    if self.has_brainiac and B_window.ndim > 1 and ch_idx in self.brainiac_channel_indices:
+                        b_slot = self.brainiac_channel_indices.index(ch_idx)
+                        start = b_slot * 768
+                        end = start + 768
+                        if B_window.shape[-1] >= end:
+                            B_window[..., start:end] = 0.0
+
+            if self.use_rotation_augmentation and self.rotation_degrees > 0:
+                angle = float(np.random.uniform(-self.rotation_degrees, self.rotation_degrees))
+                X_window = scipy_rotate(
+                    X_window, angle, axes=(0, 1), reshape=False, order=1,
+                    mode="constant", cval=0.0,
+                ).astype(np.float32)
+                Y_window = scipy_rotate(
+                    Y_window, angle, axes=(0, 1), reshape=False, order=0,
+                    mode="constant", cval=0,
+                ).astype(np.int32)
+                M_window = scipy_rotate(
+                    M_window, angle, axes=(0, 1), reshape=False, order=0,
+                    mode="constant", cval=0,
+                ).astype(np.int32)
+                if self.has_brainiac and B_window.ndim > 1:
+                    B_window = scipy_rotate(
+                        B_window, angle, axes=(0, 1), reshape=False, order=1,
+                        mode="constant", cval=0.0,
+                    ).astype(np.float32)
+
+            if self.use_flip_augmentation:
+                for flip_axis in (0, 1):
+                    if random.random() > 0.5:
+                        X_window = np.flip(X_window, axis=flip_axis).copy()
+                        Y_window = np.flip(Y_window, axis=flip_axis).copy()
+                        M_window = np.flip(M_window, axis=flip_axis).copy()
+                        if self.has_brainiac and B_window.ndim > 1:
+                            B_window = np.flip(B_window, axis=flip_axis).copy()
+
+            if self.use_intensity_augmentation:
+                s   = self.intensity_augmentation_strength
+                std = float(X_window.std())
+                if std > 0:
+                    X_window = (X_window + np.random.normal(0, s * std, X_window.shape)).astype(np.float32)
+                contrast = 1.0 + float(np.random.uniform(-s, s))
+                X_window = (X_window * contrast).astype(np.float32)
+
+            # Intensity noise must not turn a deliberately missing modality into signal.
+            for ch_idx in np.flatnonzero(channel_presence < 0.5):
+                X_window[..., int(ch_idx)::num_channels] = 0.0
+
+        if self.append_modality_presence:
+            presence_maps = np.broadcast_to(
+                channel_presence,
+                X_window.shape[:2] + (num_channels,),
+            ).astype(np.float32, copy=False)
+            X_window = np.concatenate([X_window, presence_maps], axis=-1)
+
+        return X_window, B_window, Y_window, M_window, sample_name
+
+
+def compute_class_weights_from_dataset(dataset, num_classes):
+    """Return per-class inverse-frequency weights computed during Dataset index build."""
+    w = dataset.class_weights
+    if len(w) < num_classes:
+        padded = np.ones(num_classes, dtype=np.float32)
+        padded[:len(w)] = w
+        return padded
+    return w[:num_classes].copy()
+
+
+def load_epoch_dataset(
     scan_indexes,
     volume_paths_list,
     mask_paths,
@@ -821,70 +1070,133 @@ def load_val_data(
     slicing_plane,
     num_input_slices,
     num_output_slices,
-    return_transform_info=False,
-    target_height=minimum_height_width,
-    target_width=minimum_height_width
+    class_multiplication_factors,
+    require_classes,
+    use_flip_augmentation,
+    use_intensity_augmentation,
+    intensity_augmentation_strength,
+    use_rotation_augmentation,
+    rotation_degrees,
+    brainiac_paths_list,
+    target_height,
+    target_width,
+    executor,
+    temp_base_dir=None,
+    optional_channel_indices=None,
+    channel_dropout_probabilities=None,
+    channel_dropout_strategy="independent",
+    channel_dropout_subset_probabilities=None,
+    append_modality_presence=False,
+    brainiac_channel_indices=None,
 ):
     """
-    Multi-threaded loader for validation (or test) 2.5D slices.
-
-    If return_transform_info=True, then for each scan index we
-    also return the mask_info from the first subject. Usually
-    you'd only pass 1 subject in `scan_indexes` at a time
-    during inference, but the code still supports multiple.
+    Phase 1: load scan volumes in parallel via ProcessPoolExecutor into temp dirs.
+    Phase 2: construct AstrilSliceDataset wrapping those dirs.
+    Returns (dataset, temp_dirs).  Caller is responsible for shutil.rmtree on temp_dirs.
+    temp_base_dir: parent directory for temp scan dirs (defaults to system temp).
     """
-    from concurrent.futures import ThreadPoolExecutor
+    has_brainiac = brainiac_paths_list is not None
+    futures = [
+        executor.submit(
+            _save_scan_volumes_to_temp,
+            idx, volume_paths_list, mask_paths, gt_paths,
+            slicing_plane, num_input_slices, num_output_slices,
+            brainiac_paths_list, target_height, target_width,
+            "astril_vol_train_", temp_base_dir,
+        )
+        for idx in scan_indexes
+    ]
+    temp_dirs = []
+    for future in futures:
+        tmp_dir, has_data, _ = future.result()
+        if has_data:
+            temp_dirs.append(tmp_dir)
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    X_epoch_list = []
-    y_epoch_list = []
-    mask_epoch_list = []
-    z_indices_all = []
-    transform_infos = []
+    dataset = AstrilSliceDataset(
+        scan_temp_dirs=temp_dirs,
+        num_input_slices=num_input_slices,
+        num_output_slices=num_output_slices,
+        class_multiplication_factors=class_multiplication_factors,
+        require_classes=require_classes,
+        is_training=True,
+        use_flip_augmentation=use_flip_augmentation,
+        use_intensity_augmentation=use_intensity_augmentation,
+        intensity_augmentation_strength=intensity_augmentation_strength,
+        use_rotation_augmentation=use_rotation_augmentation,
+        rotation_degrees=rotation_degrees,
+        has_brainiac=has_brainiac,
+        optional_channel_indices=optional_channel_indices,
+        channel_dropout_probabilities=channel_dropout_probabilities,
+        channel_dropout_strategy=channel_dropout_strategy,
+        channel_dropout_subset_probabilities=channel_dropout_subset_probabilities,
+        append_modality_presence=append_modality_presence,
+        brainiac_channel_indices=brainiac_channel_indices,
+    )
+    return dataset, temp_dirs
 
-    with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = []
-        for idx in scan_indexes:
-            futures.append(executor.submit(
-                load_val_slices,
-                idx,
-                volume_paths_list,
-                mask_paths,
-                gt_paths,
-                slicing_plane,
-                num_input_slices,
-                num_output_slices,
-                return_transform_info,
-                target_height=target_height,
-                target_width=target_width
-            ))
 
-        for future in futures:
-            result = future.result()
-            if return_transform_info:
-                (X_scan, y_scan, m_scan, z_inds, t_info) = result
-                transform_infos.append(t_info)
-            else:
-                (X_scan, y_scan, m_scan, z_inds) = result
+def load_val_dataset(
+    scan_indexes,
+    volume_paths_list,
+    mask_paths,
+    gt_paths,
+    slicing_plane,
+    num_input_slices,
+    num_output_slices,
+    brainiac_paths_list,
+    target_height,
+    target_width,
+    executor,
+    temp_base_dir=None,
+    optional_channel_indices=None,
+    append_modality_presence=False,
+    brainiac_channel_indices=None,
+):
+    """Parallel volume loading for validation; returns (AstrilSliceDataset, temp_dirs)."""
+    has_brainiac = brainiac_paths_list is not None
+    futures = [
+        executor.submit(
+            _save_scan_volumes_to_temp,
+            idx, volume_paths_list, mask_paths, gt_paths,
+            slicing_plane, num_input_slices, num_output_slices,
+            brainiac_paths_list, target_height, target_width,
+            "astril_vol_val_", temp_base_dir,
+        )
+        for idx in scan_indexes
+    ]
+    temp_dirs = []
+    for future in futures:
+        tmp_dir, has_data, _ = future.result()
+        if has_data:
+            temp_dirs.append(tmp_dir)
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-            X_epoch_list.extend(X_scan)
-            y_epoch_list.extend(y_scan)
-            mask_epoch_list.extend(m_scan)
-            z_indices_all.extend(z_inds)
+    dataset = AstrilSliceDataset(
+        scan_temp_dirs=temp_dirs,
+        num_input_slices=num_input_slices,
+        num_output_slices=num_output_slices,
+        class_multiplication_factors={},
+        require_classes={},
+        is_training=False,
+        use_flip_augmentation=False,
+        use_intensity_augmentation=False,
+        intensity_augmentation_strength=0.0,
+        use_rotation_augmentation=False,
+        rotation_degrees=0.0,
+        has_brainiac=has_brainiac,
+        optional_channel_indices=optional_channel_indices,
+        channel_dropout_probabilities={},
+        channel_dropout_strategy="independent",
+        channel_dropout_subset_probabilities={},
+        append_modality_presence=append_modality_presence,
+        brainiac_channel_indices=brainiac_channel_indices,
+    )
+    return dataset, temp_dirs
 
-    X_epoch_data = np.array(X_epoch_list, dtype=np.float32)
-    y_epoch_data = np.array(y_epoch_list, dtype=np.uint8)
-    mask_epoch_data = np.array(mask_epoch_list, dtype=bool)
-    z_indices_all = np.array(z_indices_all, dtype=np.int32)
 
-    if return_transform_info:
-        return (X_epoch_data, y_epoch_data, mask_epoch_data, z_indices_all, transform_infos)
-    else:
-        return (X_epoch_data, y_epoch_data, mask_epoch_data, z_indices_all)
-
-        
-# -------------------------------------------------
-# Updated detect_input_shape to match robust approach
-# -------------------------------------------------
 def detect_input_shape(sample_file_path, slicing_plane, num_channels):
     """
     Detect a representative input shape (height, width, num_channels) 

@@ -17,6 +17,38 @@ astril is a python package designed to streamline radiology image pre-processing
 
 A detailed description of the package and instructions for its use will be provided in the coming months as we finalize the package and its associated manuscript.
 
+### Default 2.5-D training architecture
+
+New training configurations use `residual_context_unext_25d`. The model keeps
+Astril's center-slice 2.5-D workflow while adding an ordered-slab 3-D context
+stem, a 2-D GroupNorm residual encoder/decoder, identity-initialized residual
+skip attention, native half/quarter-resolution deep supervision, and explicit
+modality-presence inputs. The generated defaults use seven input slices, two
+blocks per level, two dilated bottleneck blocks, EMA validation/checkpoint
+weights, and category-controlled optional-modality dropout:
+
+```ini
+architecture_type = residual_context_unext_25d
+num_input_slices = 7
+base_num_filters = 32
+encoder_level_factors = 1,2,4,8
+center_depth = 2
+blocks_per_level = 2
+skip_attention_type = residual
+use_modality_presence_encoding = true
+use_deep_supervision = true
+deep_supervision_weights = 0.25,0.125
+channel_dropout_strategy = subset
+channel_dropout_subset_probabilities = full:0.50,single:0.25,double:0.15,required_only:0.10
+use_ema = true
+ema_decay = 0.999
+```
+
+Legacy `dynamic_attention_resunet` and migrated TensorFlow checkpoints remain
+loadable. New multi-plane segmentation configurations default to
+`average_logit`; optional `merging_weights` can assign one non-negative weight
+to each axial, coronal, or sagittal model.
+
 ### General Workflow (rough draft)
 ---
 #### Format for radiology image inputs:

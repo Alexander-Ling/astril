@@ -1,8 +1,6 @@
 import os
 import argparse
-import numpy as np
 from pathlib import Path
-import nibabel as nib
 import ast
 
 def match_pattern(directory, pattern):
@@ -52,6 +50,8 @@ def remap_gt_classes(trainDataDirectory, gtPattern, classRemapDict, outputPatter
         overwrite_existing_outputs (bool): If True, overwrite outputs that already exist.
                                              Defaults to False (skip if exists).
     """
+    import numpy as np
+    import nibabel as nib
     # Parse classRemapDict
     remap_dict = parse_dict_string(classRemapDict)
     if not remap_dict:
@@ -94,7 +94,7 @@ def remap_gt_classes(trainDataDirectory, gtPattern, classRemapDict, outputPatter
         nib.save(nib.Nifti1Image(remapped_data, affine), str(output_file))
         print(f"Saved remapped file to: {output_file}")
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Remap ground truth classes in segmentation files.")
     parser.add_argument("--trainDataDirectory", required=True, help="Directory containing training data.")
     parser.add_argument("--gtPattern", required=True, help="Pattern for ground truth files.")
@@ -115,3 +115,7 @@ if __name__ == "__main__":
         outputPattern=args.outputPattern,
         overwrite_existing_outputs=args.overwrite_existing_outputs
     )
+
+
+if __name__ == "__main__":
+    main()

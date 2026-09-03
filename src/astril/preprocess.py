@@ -31,14 +31,26 @@ from typing import List, Dict
 # Function to normalize an MRI image using only the masked region
 # -----------------------------------------------------------------
 
-def normalize_masked_image(input_image_path, mask_path, output_path=None, zero_outside_mask=False):
+def normalize_masked_image(
+    input_image_path,
+    mask_path,
+    output_path=None,
+    zero_outside_mask=False,
+    *,
+    method="robust_zscore",
+    percentiles=(0.1, 99.9),
+    z_clip=5.0,
+):
     # Lazy imports
     import nibabel as nib
     import numpy as np
     """
     Normalize an MRI volume using the provided mask.
-    Voxels inside the mask are zero-mean, unit-variance normalized.
-    Voxels outside the mask are set to 0.
+
+    By default, finite in-mask values are winsorized at the 0.1/99.9th
+    percentiles before estimating mean/std and applying the same transform to
+    foreground and background. ``method='zscore'`` retains legacy untrimmed
+    mean/std behavior.
 
     Args:
         input_image_path (str): Path to the input NIfTI file
@@ -57,19 +69,15 @@ def normalize_masked_image(input_image_path, mask_path, output_path=None, zero_o
     if data.shape != mask_data.shape:
         raise ValueError(f"Shape mismatch: image {data.shape} vs mask {mask_data.shape}")
 
-    brain_values = data[mask_data > 0]
-    if brain_values.size == 0:
-        raise ValueError("Mask contains no non-zero voxels!")
+    from astril.preprocessing_utils import _normalize_masked_frame
 
-    mean = np.mean(brain_values)
-    std = np.std(brain_values)
-    if std == 0:
-        raise ValueError("Standard deviation within mask is zero.")
-
+    mask = mask_data > 0
+    normalized_data = _normalize_masked_frame(
+        data, mask, method=method, percentiles=percentiles, z_clip=z_clip
+    )
     if zero_outside_mask:
-        normalized_data = np.where(mask_data > 0, (data - mean) / std, 0)
-    else:
-        normalized_data = (data - mean) / std
+        normalized_data = normalized_data.copy()
+        normalized_data[~mask] = 0.0
 
     normalized_img = nib.Nifti1Image(normalized_data, affine=img.affine, header=img.header)
 
@@ -6875,15 +6883,29 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     # ---------- normalize ----------
     p = sub.add_parser(
         "normalize",
-        help="Normalize an MRI volume using a binary mask (zero-mean/unit-variance in-mask).",
+        help="Robustly normalize an MRI volume using a binary mask.",
         formatter_class=_SmartFormatter,
     )
     p.add_argument("--input", required=True, help="Input NIfTI image (.nii|.nii.gz).")
     p.add_argument("--mask", required=True, help="Binary mask NIfTI (same shape; >0=in brain).")
     p.add_argument("--output", required=True, help="Output NIfTI path for normalized image.")
     p.add_argument("--zero_outside_mask", action="store_true", help="Set voxels outside masked region to 0.")
+    p.add_argument("--method", choices=("robust_zscore", "zscore"), default="robust_zscore",
+                   help="Normalization method (default: robust_zscore).")
+    p.add_argument("--percentiles", type=float, nargs=2, metavar=("LOW", "HIGH"), default=(0.1, 99.9),
+                   help="In-mask winsorization percentiles for robust_zscore (default: 0.1 99.9).")
+    p.add_argument("--z_clip", type=float, default=5.0,
+                   help="Symmetric final z-score limit for robust_zscore (default: 5.0).")
     def _run_normalize(a):
-        normalize_masked_image(a.input, a.mask, a.output, a.zero_outside_mask)
+        normalize_masked_image(
+            a.input,
+            a.mask,
+            a.output,
+            a.zero_outside_mask,
+            method=a.method,
+            percentiles=a.percentiles,
+            z_clip=a.z_clip,
+        )
     p.set_defaults(func=_run_normalize)
 
     # ---------- resize ----------
