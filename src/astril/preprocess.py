@@ -4496,9 +4496,656 @@ def summarize_exam_series(dicom_exam_dir, mr_subdir="MR", to_csv=None, verbose=F
     return df
 
 # ------------------------------------------------------------------------
+# organize_dicoms
+# ------------------------------------------------------------------------
+def organize_dicoms(
+    root_dir: str,
+    out_dir: str,
+    index_out: str | None = None,
+    quarantine_dir: str | None = None,
+    log_out: str | None = None,
+    unresolved_out: str | None = None,
+    dry_run: bool = False,
+    show_progress: bool = True,
+    n_workers: int | None = None,
+):
+    """Create a metadata-derived, indexed copy of a DICOM library.
+
+    Source directory names are treated as provenance only.  Files are routed
+    using PatientID, StudyInstanceUID, and SeriesInstanceUID into a stable
+    ``Patient/Exam/Series`` tree.  Files with missing identity metadata, or
+    UID conflicts observed within the library, are quarantined and reported.
+    ``unresolved_out`` receives a separate report containing every row that
+    was not copied cleanly (including conflicts and interrupted work).
+    """
+    import hashlib
+    import filecmp
+    import signal
+    import threading
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .preprocessing_utils import (
+        _safe_dcmread, _get_attr, _progress, _sanitize_label,
+        _parse_dt, _to_list_upper, _collect_imgtype_flags, _vendor_hints,
+        _get_pixel_spacing, _get_slice_metrics, _norm_text, _name_tokens,
+        _detect_fspgr, _detect_plane, _plane_from_iop,
+    )
+
+    source_root = os.path.abspath(root_dir)
+    normalized_root = os.path.abspath(out_dir)
+    quarantine_root = os.path.abspath(quarantine_dir or os.path.join(normalized_root, "_quarantine"))
+    os.makedirs(normalized_root, exist_ok=True)
+
+    def _clean(value, fallback):
+        value = str(value or "").strip()
+        return value if value else fallback
+
+    def _token(value, fallback, max_len=80):
+        value = _clean(value, fallback)
+        try:
+            value = _sanitize_label(value)
+        except Exception:
+            value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+        value = value.strip("._-")[:max_len] or fallback
+        return value
+
+    def _short(value):
+        return hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:10]
+
+    def _sequence_type(fields):
+        """Return (normalized type, evidence source) using conservative fallbacks."""
+        modality = str(fields.get("modality", "") or "").strip().upper()
+        modality_map = {
+            "MR": "MRI", "MRI": "MRI", "CT": "CT", "US": "Ultrasound",
+            "PT": "PET", "PET": "PET", "NM": "NuclearMedicine",
+            "XA": "XRayAngiography", "CR": "XRay", "DX": "XRay", "MG": "XRay",
+        }
+        if modality in modality_map:
+            return modality_map[modality], "modality"
+
+        sop_class = str(fields.get("sop_class_uid", "") or "").strip()
+        sop_prefix_map = {
+            "1.2.840.10008.5.1.4.1.1.4": "MRI",
+            "1.2.840.10008.5.1.4.1.1.2": "CT",
+            "1.2.840.10008.5.1.4.1.1.6": "Ultrasound",
+            "1.2.840.10008.5.1.4.1.1.20": "XRay",
+        }
+        for prefix, sequence_type in sop_prefix_map.items():
+            if sop_class == prefix or sop_class.startswith(prefix + "."):
+                return sequence_type, "sop_class"
+
+        description = " ".join(str(fields.get(k, "") or "") for k in ("series_description", "protocol_name")).lower()
+        keyword_map = (
+            (("ultrasound", "sonography", "us "), "Ultrasound"),
+            (("pet", "positron"), "PET"),
+            (("computed tomography", " ct", "ct "), "CT"),
+            (("magnetic resonance", " mri", "mr ", "fmri"), "MRI"),
+            (("x-ray", "xray", "radiograph"), "XRay"),
+        )
+        for keywords, sequence_type in keyword_map:
+            if any(keyword in description for keyword in keywords):
+                return sequence_type, "description"
+        return "Unknown", "unknown"
+
+    def _metadata(path):
+        ds = _safe_dcmread(path)
+        if ds is None:
+            return None, "not_readable_dicom"
+
+        def _raw(key):
+            return _get_attr(ds, key).strip()
+
+        def _multi(key):
+            try:
+                value = getattr(ds, key, None)
+                if value is None:
+                    return ""
+                if isinstance(value, (list, tuple)):
+                    return ";".join(str(item).strip() for item in value)
+                return str(value).strip()
+            except Exception:
+                return ""
+
+        image_type_values = _to_list_upper(getattr(ds, "ImageType", []))
+        image_type = ";".join(image_type_values)
+        imgtype_flags = ";".join(sorted(_collect_imgtype_flags(ds)))
+        vendor = _vendor_hints(ds)
+        pixel_row, pixel_col = _get_pixel_spacing(ds)
+        slice_thickness, spacing_between, num_frames = _get_slice_metrics(ds)
+        _acq_dt, acq_dt_iso = _parse_dt(ds)
+
+        # Match the classifier's Enhanced/multiframe estimate of slices per
+        # 3-D volume while this DICOM header is already in memory.
+        n_slices_per_vol = None
+        try:
+            pffg = getattr(ds, "PerFrameFunctionalGroupsSequence", None)
+            if num_frames and pffg:
+                iop = None
+                sfg = getattr(ds, "SharedFunctionalGroupsSequence", None)
+                if sfg:
+                    orientation = getattr(sfg[0], "PlaneOrientationSequence", None)
+                    if orientation:
+                        iop = getattr(orientation[0], "ImageOrientationPatient", None)
+                if iop is None:
+                    iop = getattr(ds, "ImageOrientationPatient", None)
+                normal = None
+                if iop and len(iop) >= 6:
+                    import numpy as _np
+                    normal = _np.cross(_np.asarray(iop[:3], dtype=float), _np.asarray(iop[3:6], dtype=float))
+                    norm = float(_np.linalg.norm(normal))
+                    normal = normal / norm if norm > 0 else None
+                positions = []
+                for item in pffg[:min(int(num_frames), 1500)]:
+                    plane = getattr(item, "PlanePositionSequence", None)
+                    ipp = getattr(plane[0], "ImagePositionPatient", None) if plane else None
+                    if ipp is not None:
+                        try:
+                            if normal is not None:
+                                import numpy as _np
+                                positions.append(float(_np.dot(_np.asarray(ipp, dtype=float), normal)))
+                            else:
+                                positions.append(float(ipp[2]))
+                        except Exception:
+                            pass
+                if positions:
+                    bin_mm = float(spacing_between or slice_thickness or 0.2) / 2.0
+                    if bin_mm <= 0:
+                        bin_mm = 0.2
+                    n_slices_per_vol = len({round(position / bin_mm) for position in positions})
+        except Exception:
+            n_slices_per_vol = None
+        sequence_name = _raw("SequenceName")
+        tokens = _name_tokens(_norm_text(_raw("SeriesDescription"), _raw("ProtocolName"), sequence_name))
+
+        fields = {
+            "patient_id": _raw("PatientID"), "patient_name": _raw("PatientName"),
+            "study_uid": _raw("StudyInstanceUID"), "study_id": _raw("StudyID"),
+            "study_date": _raw("StudyDate"), "series_uid": _raw("SeriesInstanceUID"),
+            "series_number": _raw("SeriesNumber"), "series_description": _raw("SeriesDescription"),
+            "protocol_name": _raw("ProtocolName"), "modality": _raw("Modality"),
+            "sop_class_uid": _raw("SOPClassUID"), "sop_uid": _raw("SOPInstanceUID"),
+            "manufacturer": _raw("Manufacturer"), "acq_dt_iso": acq_dt_iso or "",
+            "sequence_name": sequence_name, "image_type": image_type, "imgtype_flags": imgtype_flags,
+            "echo_time": _raw("EchoTime"), "repetition_time": _raw("RepetitionTime"),
+            "inversion_time": _raw("InversionTime"), "flip_angle": _raw("FlipAngle"),
+            "diffusion_b_value": vendor.get("b_value"),
+            "primary_secondary": "PRIMARY" if "PRIMARY" in image_type_values else (
+                "SECONDARY" if "SECONDARY" in image_type_values else ""
+            ),
+            "is_fspgr": _detect_fspgr(tokens, vendor.get("pulse_sequence_name"), _raw("ProtocolName")),
+            "plane": _detect_plane(tokens) or _plane_from_iop(ds),
+            "rows_px": _raw("Rows"), "cols_px": _raw("Columns"),
+            "pixdim_row_mm": pixel_row, "pixdim_col_mm": pixel_col,
+            "slice_thickness_mm": slice_thickness, "spacing_between_slices_mm": spacing_between,
+            "z_spacing_mm": spacing_between or slice_thickness,
+            "num_frames": num_frames,
+            "n_slices_per_vol_est": n_slices_per_vol,
+            "pixel_spacing": _multi("PixelSpacing"),
+            "slice_thickness": _raw("SliceThickness"),
+            "spacing_between_slices": _raw("SpacingBetweenSlices"),
+            "images_in_acq": _raw("ImagesInAcquisition"),
+            "locations_in_acq": _raw("LocationsInAcquisition"),
+            "mr_acq_type": vendor.get("mr_acq_type"),
+            "pulse_sequence_name": vendor.get("pulse_sequence_name"),
+            "scanning_sequence": vendor.get("scanning_sequence"),
+            "sequence_variant": vendor.get("sequence_variant"),
+            "scan_options": vendor.get("scan_options"),
+            "acquisition_contrast": vendor.get("acquisition_contrast"),
+            "contrast_agent": vendor.get("contrast_agent"),
+            "contrast_volume": vendor.get("contrast_volume"),
+            "study_description": _raw("StudyDescription"),
+            "procedure_step_description": _raw("PerformedProcedureStepDescription"),
+        }
+        fields["sequence_type"], fields["sequence_type_source"] = _sequence_type(fields)
+        missing = [k for k in ("patient_id", "study_uid", "series_uid") if not fields[k]]
+        if missing:
+            return fields, "missing_required:" + ",".join(missing)
+        return fields, ""
+
+    index_columns = [
+        "source_path", "source_relpath", "normalized_path", "quarantine_path",
+        "patient_id", "patient_name", "study_instance_uid", "study_id", "study_date",
+        "series_instance_uid", "series_number", "series_description", "protocol_name",
+        "modality", "sop_class_uid", "sequence_type", "sequence_type_source",
+        "sop_instance_uid", "manufacturer", "acq_dt_iso", "sequence_name", "image_type", "imgtype_flags",
+        "echo_time", "repetition_time", "inversion_time", "flip_angle", "b_value",
+        "primary_secondary", "is_fspgr", "plane", "rows_px", "cols_px", "pixel_spacing",
+        "pixdim_row_mm", "pixdim_col_mm", "slice_thickness_mm", "spacing_between_slices_mm", "z_spacing_mm", "n_slices_per_vol_est",
+        "spacing_between_slices", "num_frames", "images_in_acq", "locations_in_acq",
+        "mr_acq_type", "pulse_sequence_name", "scanning_sequence", "sequence_variant",
+        "scan_options", "acquisition_contrast", "contrast_agent", "contrast_volume",
+        "study_description", "procedure_step_description", "status", "error",
+    ]
+
+    def _save_index(df):
+        if not index_out:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(index_out)) or ".", exist_ok=True)
+        df = df.reindex(columns=index_columns)
+        ext = os.path.splitext(index_out)[1].lower()
+        if ext == ".csv":
+            df.to_csv(index_out, index=False)
+        elif ext in (".tsv", ".txt"):
+            df.to_csv(index_out, sep="\t", index=False)
+        else:
+            raise ValueError("organize_dicoms index_out must be a CSV or TSV path for bounded-memory processing")
+
+    def _save_unresolved(df):
+        report_path = unresolved_out
+        if report_path is None:
+            if index_out:
+                report_path = os.path.splitext(index_out)[0] + "_unresolved.csv"
+            else:
+                report_path = os.path.join(normalized_root, "unresolved_dicom_report.csv")
+        statuses_ok = {"copied", "skipped_existing", "planned"}
+        unresolved = df[
+            ~df["status"].astype(str).isin(statuses_ok)
+            | df["error"].astype(str).str.strip().ne("")
+        ].copy()
+        os.makedirs(os.path.dirname(os.path.abspath(report_path)) or ".", exist_ok=True)
+        ext = os.path.splitext(report_path)[1].lower()
+        if ext == ".csv":
+            unresolved.to_csv(report_path, index=False)
+        elif ext in (".tsv", ".txt"):
+            unresolved.to_csv(report_path, sep="\t", index=False)
+        else:
+            raise ValueError("unresolved_out must be a CSV or TSV path for bounded-memory processing")
+        return report_path
+
+    def _metadata_only_rows(metadata_records, status):
+        rows = []
+        for path, fields, error in metadata_records:
+            fields = fields or {}
+            rows.append({
+                "source_path": path,
+                "source_relpath": os.path.relpath(path, source_root),
+                "normalized_path": "",
+                "quarantine_path": "",
+                "patient_id": fields.get("patient_id", ""),
+                "patient_name": fields.get("patient_name", ""),
+                "study_instance_uid": fields.get("study_uid", ""),
+                "study_id": fields.get("study_id", ""),
+                "study_date": fields.get("study_date", ""),
+                "series_instance_uid": fields.get("series_uid", ""),
+                "series_number": fields.get("series_number", ""),
+                "series_description": fields.get("series_description", ""),
+                "protocol_name": fields.get("protocol_name", ""),
+                "modality": fields.get("modality", ""),
+                "sop_class_uid": fields.get("sop_class_uid", ""),
+                "sequence_type": fields.get("sequence_type", "Unknown"),
+                "sequence_type_source": fields.get("sequence_type_source", "unknown"),
+                "sop_instance_uid": fields.get("sop_uid", ""),
+                "manufacturer": fields.get("manufacturer", ""),
+                "acq_dt_iso": fields.get("acq_dt_iso", ""),
+                "sequence_name": fields.get("sequence_name", ""),
+                "image_type": fields.get("image_type", ""),
+                "imgtype_flags": fields.get("imgtype_flags", ""),
+                "echo_time": fields.get("echo_time", ""),
+                "repetition_time": fields.get("repetition_time", ""),
+                "inversion_time": fields.get("inversion_time", ""),
+                "flip_angle": fields.get("flip_angle", ""),
+                "b_value": fields.get("diffusion_b_value", ""),
+                "primary_secondary": fields.get("primary_secondary", ""),
+                "is_fspgr": fields.get("is_fspgr", False),
+                "plane": fields.get("plane", ""),
+                "rows_px": fields.get("rows_px", ""),
+                "cols_px": fields.get("cols_px", ""),
+                "pixel_spacing": fields.get("pixel_spacing", ""),
+                "pixdim_row_mm": fields.get("pixdim_row_mm", ""),
+                "pixdim_col_mm": fields.get("pixdim_col_mm", ""),
+                "slice_thickness_mm": fields.get("slice_thickness_mm", ""),
+                "spacing_between_slices_mm": fields.get("spacing_between_slices_mm", ""),
+                "z_spacing_mm": fields.get("z_spacing_mm", ""),
+                "n_slices_per_vol_est": fields.get("n_slices_per_vol_est", ""),
+                "slice_thickness": fields.get("slice_thickness", ""),
+                "spacing_between_slices": fields.get("spacing_between_slices", ""),
+                "num_frames": fields.get("num_frames", ""),
+                "images_in_acq": fields.get("images_in_acq", ""),
+                "locations_in_acq": fields.get("locations_in_acq", ""),
+                "mr_acq_type": fields.get("mr_acq_type", ""),
+                "pulse_sequence_name": fields.get("pulse_sequence_name", ""),
+                "scanning_sequence": fields.get("scanning_sequence", ""),
+                "sequence_variant": fields.get("sequence_variant", ""),
+                "scan_options": fields.get("scan_options", ""),
+                "acquisition_contrast": fields.get("acquisition_contrast", ""),
+                "contrast_agent": fields.get("contrast_agent", ""),
+                "contrast_volume": fields.get("contrast_volume", ""),
+                "study_description": fields.get("study_description", ""),
+                "procedure_step_description": fields.get("procedure_step_description", ""),
+                "status": status,
+                "error": error or "",
+            })
+        return pd.DataFrame(rows, columns=index_columns)
+
+    def _copy_with_interrupt_cleanup(source, destination):
+        existed = os.path.exists(destination)
+        try:
+            shutil.copy2(source, destination)
+        except KeyboardInterrupt:
+            if not existed:
+                try:
+                    if os.path.exists(destination):
+                        os.remove(destination)
+                except Exception:
+                    pass
+            raise
+
+    def _install_interrupt_guard():
+        """Convert Ctrl+C into a cooperative stop request for the current phase."""
+        stop_requested = threading.Event()
+        previous = None
+        installed = False
+        try:
+            previous = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, lambda _signum, _frame: stop_requested.set())
+            installed = True
+        except (ValueError, AttributeError):
+            # signal handlers can only be installed from the main thread.
+            pass
+
+        def restore():
+            if installed:
+                signal.signal(signal.SIGINT, previous)
+
+        return stop_requested, restore
+
+    paths = []
+    excluded_roots = {os.path.normcase(normalized_root), os.path.normcase(quarantine_root)}
+    for curr, dirs, files in os.walk(source_root):
+        dirs[:] = [d for d in dirs if os.path.normcase(os.path.join(curr, d)) not in excluded_roots]
+        paths.extend(os.path.join(curr, name) for name in sorted(files))
+
+    # Keep the complete metadata scan on disk. This prevents a large library
+    # from requiring one Python object per DICOM before collision analysis and
+    # copying can begin.
+    import json
+    import sqlite3
+    import tempfile
+    stage_path = tempfile.mkstemp(prefix="astril_organize_", suffix=".sqlite3")[1]
+    stage_db = sqlite3.connect(stage_path)
+    stage_db.execute("PRAGMA synchronous = NORMAL")
+    stage_db.execute("CREATE TABLE records (ordinal INTEGER PRIMARY KEY, path TEXT, fields TEXT, error TEXT)")
+    stage_db.commit()
+    stage_buffer = []
+    stage_batch_size = 1000
+
+    def _flush_stage():
+        if not stage_buffer:
+            return
+        stage_db.executemany(
+            "INSERT INTO records (path, fields, error) VALUES (?, ?, ?)",
+            stage_buffer,
+        )
+        stage_db.commit()
+        stage_buffer.clear()
+
+    def _stage(record):
+        path, fields, error = record
+        stage_buffer.append(
+            (path, json.dumps(fields or {}, default=str), error or "")
+        )
+        if len(stage_buffer) >= stage_batch_size:
+            _flush_stage()
+
+    def _iter_staged():
+        for path, fields, error in stage_db.execute("SELECT path, fields, error FROM records ORDER BY ordinal"):
+            yield path, json.loads(fields), error
+
+    def _read_one(path):
+        fields, error = _metadata(path)
+        return path, fields, error
+
+    workers = n_workers or min(32, max(1, (os.cpu_count() or 4) * 4))
+    read_stop, restore_read_signal = _install_interrupt_guard()
+    try:
+        if workers > 1 and paths:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            futures = [pool.submit(_read_one, path) for path in paths]
+            try:
+                iterator = _progress(as_completed(futures), total=len(futures), desc="Reading DICOM metadata", unit="file", enable=show_progress)
+                for future in iterator:
+                    if read_stop.is_set():
+                        for pending in futures:
+                            pending.cancel()
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        _flush_stage()
+                        partial = _metadata_only_rows(_iter_staged(), "interrupted_metadata")
+                        _save_index(partial)
+                        _save_unresolved(partial)
+                        restore_read_signal()
+                        print(f"[organize_dicoms] Interrupted during metadata scan; saved partial index: {index_out or '(not requested)'}")
+                        return partial
+                    _stage(future.result())
+            except KeyboardInterrupt:
+                for future in futures:
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                _flush_stage()
+                partial = _metadata_only_rows(_iter_staged(), "interrupted_metadata")
+                _save_index(partial)
+                _save_unresolved(partial)
+                restore_read_signal()
+                print(f"[organize_dicoms] Interrupted during metadata scan; saved partial index: {index_out or '(not requested)'}")
+                return partial
+            else:
+                pool.shutdown(wait=True)
+        else:
+                for path in _progress(paths, total=len(paths), desc="Reading DICOM metadata", unit="file", enable=show_progress):
+                    if read_stop.is_set():
+                        _flush_stage()
+                        partial = _metadata_only_rows(_iter_staged(), "interrupted_metadata")
+                        _save_index(partial)
+                        _save_unresolved(partial)
+                        restore_read_signal()
+                        print(f"[organize_dicoms] Interrupted during metadata scan; saved partial index: {index_out or '(not requested)'}")
+                        return partial
+                    _stage(_read_one(path))
+        restore_read_signal()
+    except KeyboardInterrupt:
+        restore_read_signal()
+        _flush_stage()
+        partial = _metadata_only_rows(_iter_staged(), "interrupted_metadata")
+        _save_index(partial)
+        _save_unresolved(partial)
+        print(f"[organize_dicoms] Interrupted during metadata scan; saved partial index: {index_out or '(not requested)'}")
+        return partial
+
+    _flush_stage()
+
+    # A UID must not silently map to more than one parent identity.
+    study_identity = {}
+    series_identity = {}
+    for _path, fields, error in _iter_staged():
+        if not fields or error or not fields.get("sop_uid"):
+            continue
+        study_identity.setdefault(fields["study_uid"], set()).add(fields["patient_id"])
+        series_identity.setdefault(fields["series_uid"], set()).add((fields["patient_id"], fields["study_uid"]))
+    conflicts = {
+        "study": {k for k, v in study_identity.items() if len(v) > 1},
+        "series": {k for k, v in series_identity.items() if len(v) > 1},
+    }
+
+    # A repeated SeriesInstanceUID can represent duplicate copies of one
+    # acquisition that were exported under different StudyInstanceUIDs.  In
+    # that case retain the largest parent group and quarantine the competing
+    # groups rather than losing the entire series.  Counts are based on files
+    # with readable metadata; ties are resolved deterministically by parent
+    # identity so repeated runs make the same choice.
+    series_parent_counts = {}
+    for _path, fields, error in _iter_staged():
+        if not fields or error or not fields.get("sop_uid"):
+            continue
+        series_uid = fields["series_uid"]
+        if series_uid not in conflicts["series"]:
+            continue
+        parent = (fields["patient_id"], fields["study_uid"])
+        series_parent_counts.setdefault(series_uid, {})[parent] = (
+            series_parent_counts.setdefault(series_uid, {}).get(parent, 0) + 1
+        )
+    series_parent_winners = {
+        series_uid: sorted(
+            parent_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        )[0][0]
+        for series_uid, parent_counts in series_parent_counts.items()
+        if parent_counts
+    }
+
+    rows = []
+    destinations = {}
+    transfer_desc = "Copying DICOM files" if not dry_run else "Planning DICOM files"
+    copy_stop, restore_copy_signal = _install_interrupt_guard()
+    for path, fields, error in _progress(
+        _iter_staged(),
+        total=len(paths),
+        desc=transfer_desc,
+        unit="file",
+        enable=show_progress,
+    ):
+        if copy_stop.is_set():
+            restore_copy_signal()
+            df = pd.DataFrame(rows, columns=index_columns)
+            _save_index(df)
+            _save_unresolved(df)
+            print(f"[organize_dicoms] Interrupted during file copy; saved partial index: {index_out or '(not requested)'}")
+            return df
+        rel_source = os.path.relpath(path, source_root)
+        status = "quarantined" if error else "planned"
+        reason = error
+        destination = ""
+        if fields and not error:
+            if fields["study_uid"] in conflicts["study"]:
+                reason, status = "conflicting_patient_for_study_uid", "quarantined"
+            elif (
+                fields["series_uid"] in conflicts["series"]
+                and series_parent_winners.get(fields["series_uid"])
+                != (fields["patient_id"], fields["study_uid"])
+            ):
+                series_uid = fields["series_uid"]
+                parent = (fields["patient_id"], fields["study_uid"])
+                retained_parent = series_parent_winners.get(series_uid)
+                retained_count = series_parent_counts.get(series_uid, {}).get(retained_parent, 0)
+                reason = (
+                    "conflicting_parent_for_series_uid; "
+                    f"retained_parent_patient_id={retained_parent[0]}; "
+                    f"retained_parent_study_instance_uid={retained_parent[1]}; "
+                    f"retained_parent_file_count={retained_count}"
+                )
+                status = "quarantined"
+            else:
+                patient_folder = "Patient_{}_{}".format(_token(fields["patient_id"], "unknown"), _short(fields["patient_id"]))
+                # StudyDate/StudyID can vary between files in one study; use
+                # only StudyInstanceUID for exam directory identity.
+                exam_folder = "Exam_{}".format(_short(fields["study_uid"]))
+                series_label = fields["series_description"] or fields["modality"] or "series"
+                series_no = _token(fields["series_number"], "0")
+                series_folder = "Series_{}_{}_{}".format(series_no, _token(series_label, "series"), _short(fields["series_uid"]))
+                destination = os.path.join(normalized_root, patient_folder, exam_folder, series_folder, os.path.basename(path))
+                destinations.setdefault(fields["sop_uid"], []).append(destination)
+                status = "planned" if dry_run else "copied"
+
+        if status == "quarantined":
+            destination = os.path.join(quarantine_root, rel_source)
+            if not dry_run:
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                if not os.path.exists(destination):
+                    _copy_with_interrupt_cleanup(path, destination)
+        elif not dry_run:
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            if os.path.exists(destination):
+                if filecmp.cmp(path, destination, shallow=False):
+                    status = "skipped_existing"
+                else:
+                    status, reason = "conflict", "destination_exists_with_different_content"
+            else:
+                _copy_with_interrupt_cleanup(path, destination)
+
+        rows.append({
+            "source_path": path,
+            "source_relpath": rel_source,
+            "normalized_path": destination if status != "quarantined" else "",
+            "quarantine_path": destination if status == "quarantined" else "",
+            "patient_id": fields.get("patient_id", "") if fields else "",
+            "patient_name": fields.get("patient_name", "") if fields else "",
+            "study_instance_uid": fields.get("study_uid", "") if fields else "",
+            "study_id": fields.get("study_id", "") if fields else "",
+            "study_date": fields.get("study_date", "") if fields else "",
+            "series_instance_uid": fields.get("series_uid", "") if fields else "",
+            "series_number": fields.get("series_number", "") if fields else "",
+            "series_description": fields.get("series_description", "") if fields else "",
+            "protocol_name": fields.get("protocol_name", "") if fields else "",
+            "modality": fields.get("modality", "") if fields else "",
+            "sop_class_uid": fields.get("sop_class_uid", "") if fields else "",
+            "sequence_type": fields.get("sequence_type", "Unknown") if fields else "Unknown",
+            "sequence_type_source": fields.get("sequence_type_source", "unknown") if fields else "unknown",
+            "sop_instance_uid": fields.get("sop_uid", "") if fields else "",
+            "manufacturer": fields.get("manufacturer", "") if fields else "",
+            "acq_dt_iso": fields.get("acq_dt_iso", "") if fields else "",
+            "sequence_name": fields.get("sequence_name", "") if fields else "",
+            "image_type": fields.get("image_type", "") if fields else "",
+            "imgtype_flags": fields.get("imgtype_flags", "") if fields else "",
+            "echo_time": fields.get("echo_time", "") if fields else "",
+            "repetition_time": fields.get("repetition_time", "") if fields else "",
+            "inversion_time": fields.get("inversion_time", "") if fields else "",
+            "flip_angle": fields.get("flip_angle", "") if fields else "",
+            "b_value": fields.get("diffusion_b_value", "") if fields else "",
+            "primary_secondary": fields.get("primary_secondary", "") if fields else "",
+            "is_fspgr": fields.get("is_fspgr", False) if fields else False,
+            "plane": fields.get("plane", "") if fields else "",
+            "rows_px": fields.get("rows_px", "") if fields else "",
+            "cols_px": fields.get("cols_px", "") if fields else "",
+            "pixel_spacing": fields.get("pixel_spacing", "") if fields else "",
+            "pixdim_row_mm": fields.get("pixdim_row_mm", "") if fields else "",
+            "pixdim_col_mm": fields.get("pixdim_col_mm", "") if fields else "",
+            "slice_thickness_mm": fields.get("slice_thickness_mm", "") if fields else "",
+            "spacing_between_slices_mm": fields.get("spacing_between_slices_mm", "") if fields else "",
+            "z_spacing_mm": fields.get("z_spacing_mm", "") if fields else "",
+            "n_slices_per_vol_est": fields.get("n_slices_per_vol_est", "") if fields else "",
+            "slice_thickness": fields.get("slice_thickness", "") if fields else "",
+            "spacing_between_slices": fields.get("spacing_between_slices", "") if fields else "",
+            "num_frames": fields.get("num_frames", "") if fields else "",
+            "images_in_acq": fields.get("images_in_acq", "") if fields else "",
+            "locations_in_acq": fields.get("locations_in_acq", "") if fields else "",
+            "mr_acq_type": fields.get("mr_acq_type", "") if fields else "",
+            "pulse_sequence_name": fields.get("pulse_sequence_name", "") if fields else "",
+            "scanning_sequence": fields.get("scanning_sequence", "") if fields else "",
+            "sequence_variant": fields.get("sequence_variant", "") if fields else "",
+            "scan_options": fields.get("scan_options", "") if fields else "",
+            "acquisition_contrast": fields.get("acquisition_contrast", "") if fields else "",
+            "contrast_agent": fields.get("contrast_agent", "") if fields else "",
+            "contrast_volume": fields.get("contrast_volume", "") if fields else "",
+            "study_description": fields.get("study_description", "") if fields else "",
+            "procedure_step_description": fields.get("procedure_step_description", "") if fields else "",
+            "status": status,
+            "error": reason,
+        })
+
+    # Duplicate SOP instances are retained once and marked in the index.
+    for sop_uid, paths_for_uid in destinations.items():
+        if sop_uid and len(paths_for_uid) > 1:
+            for row in rows:
+                if row["sop_instance_uid"] == sop_uid and row["status"] in {"copied", "planned", "skipped_existing"}:
+                    row["status"], row["error"] = "duplicate_sop", "duplicate_sop_instance"
+
+    restore_copy_signal()
+    df = pd.DataFrame(rows, columns=index_columns)
+    _save_index(df)
+    _save_unresolved(df)
+    if log_out:
+        os.makedirs(os.path.dirname(os.path.abspath(log_out)) or ".", exist_ok=True)
+        df.to_csv(log_out, index=False)
+    try:
+        stage_db.close()
+        os.remove(stage_path)
+    except Exception:
+        pass
+    return df
+
+
+# ------------------------------------------------------------------------
 # create_patient_metadata
 # ------------------------------------------------------------------------
-def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previous=False, subdirs=None, exclude_empty=False, show_progress=True, n_workers=None):
+def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previous=False, subdirs=None, exclude_empty=False, show_progress=True, n_workers=None, index_path=None):
     """
     Build a per-patient metadata table by scanning {root_dir}/{Patient_folder}/.../MR/{series}.
     Columns:
@@ -4507,6 +5154,8 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
       - patientName (lowercased unique names from DICOM)
       - dicomPatientID (lowercased unique IDs from DICOM)
       - day0Date (blank unless prefilled from previous tables)
+    If ``index_path`` is supplied, patient rows are generated from a
+    metadata-driven organizer index rather than folder names.
     Args:
         n_workers (int | None): If >1, use a thread pool with this many workers to scan
             patient folders concurrently. If None, choose a sensible default for I/O.
@@ -4528,8 +5177,56 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
     root_dir = os.path.abspath(root_dir)
     rows = []
 
-    # Gather top-level patient folders
-    patient_folders = sorted([d.path for d in os.scandir(root_dir) if d.is_dir()])
+    index_mode = bool(index_path)
+    if index_path:
+        index = _read_table(index_path)
+        required_index = {"patient_id", "patient_name", "normalized_path", "status"}
+        missing_index = required_index - set(map(str, index.columns))
+        if missing_index:
+            raise ValueError(f"DICOM index is missing required columns: {sorted(missing_index)}")
+        valid = index[index["status"].astype(str).isin(["copied", "skipped_existing", "duplicate_sop"])].copy()
+        if valid.empty:
+            patient_folders = []
+        else:
+            root_dir = os.path.abspath(root_dir)
+            patient_groups = {}
+            for _, item in valid.iterrows():
+                normalized_path = str(item.get("normalized_path", "")).strip()
+                if not normalized_path:
+                    continue
+                # normalized file -> Series -> Exam -> Patient
+                patient_dir = os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.abspath(normalized_path)))
+                )
+                key = os.path.normcase(os.path.normpath(patient_dir))
+                group = patient_groups.setdefault(key, {
+                    "patient_dir": patient_dir,
+                    "patient_ids": set(),
+                    "patient_names": set(),
+                })
+                patient_id = _clean_lower(str(item.get("patient_id", "")))
+                patient_name = _normalize_patient_name(str(item.get("patient_name", "")))
+                if patient_id:
+                    group["patient_ids"].add(patient_id)
+                if patient_name:
+                    group["patient_names"].add(patient_name)
+
+            for group in sorted(patient_groups.values(), key=lambda value: value["patient_dir"]):
+                patient_dir = group["patient_dir"]
+                try:
+                    rel_dir = os.path.relpath(patient_dir, root_dir)
+                except ValueError:
+                    rel_dir = patient_dir
+                rows.append(dict(
+                    Directory=rel_dir,
+                    patientID="",
+                    patientName="; ".join(sorted(group["patient_names"])),
+                    dicomPatientID="; ".join(sorted(group["patient_ids"])),
+                    day0Date="",
+                ))
+            patient_folders = []
+    else:
+        patient_folders = sorted([d.path for d in os.scandir(root_dir) if d.is_dir()])
 
     def _scan_one_patient(pf: str):
         """Return a row dict for one patient folder, or None if skipped."""
@@ -4593,7 +5290,18 @@ def create_patient_metadata(root_dir, out_path, previous_paths=None, omit_previo
         except Exception:
             n_workers = 8
 
-    if use_threads and n_workers > 1:
+    if index_mode:
+        # Rows were already built from the index; this progress bar reflects
+        # unique patient directories rather than rescanning for MR folders.
+        for _ in _progress(
+            rows,
+            total=len(rows),
+            desc="Scanning patients",
+            unit="patient",
+            enable=show_progress,
+        ):
+            pass
+    elif use_threads and n_workers > 1:
         # Threaded path: submit each patient folder
         results = []
         with ThreadPoolExecutor(max_workers=n_workers) as _pool:
@@ -5047,12 +5755,12 @@ def plan_dicom_to_nifti_conversion(
     patient_metadata: str,
     root_dir: str,
     out_dir: str,
+    dicom_index: str,
+    plan_out: str,
     n_workers: int | None = None,
-    plan_out: str | None = None,
     show_progress: bool = True,
     previous_plans: list[str] | None = None,
     ignore_previous: bool = False,
-    include_mr_subdirs: list[str] | None = None,
     min_slices: int = 10,
     use_actual_exam_ids: bool = False,
     add_missing_derived: bool = False,
@@ -5076,9 +5784,6 @@ def plan_dicom_to_nifti_conversion(
       - ignore_previous: when True, discovered exams present in previous_plans
         are skipped entirely; when False, rows for those exams are copied from
         the previous plan(s) into the new plan without reprocessing.
-      - include_mr_subdirs: list[str] | None
-        If provided, only exams whose 'mr_subdir_name' (case-insensitive) is in this list
-        will be planned.
       - min_slices: int
         Minimum number of slices a sequence must have to be considered for selection.
         (Rows remain in the plan; the threshold only affects 'selected_for_conversion'.)
@@ -5088,6 +5793,8 @@ def plan_dicom_to_nifti_conversion(
       - unexpected_multiframe_policy: str
         Policy for series that are expected to be single-frame/3D but convert to multi-frame/4D.
         One of: 'keep_first' (default; keep frame 0 with a warning) or 'skip' (skip conversion with a warning).
+      - dicom_index: required CSV/TSV index from organize_dicoms(). Exam
+        discovery and series metadata are driven by the index.
 
     Returns:
       pandas.DataFrame with one row per discovered series, including:
@@ -5096,13 +5803,21 @@ def plan_dicom_to_nifti_conversion(
         plane, n_slices, confidence, timepoint_days, selected_for_conversion (bool),
         proposed_nifti_path. Rows are grouped by ExamDirectory (blank line "-" between exams).
     """
-    import os, re, csv as _csv
+    import os
+    if not dicom_index:
+        raise ValueError("dicom_index is required; run organize_dicoms first")
+    if not plan_out:
+        raise ValueError("plan_out is required; planner output is streamed to CSV/TSV to bound memory usage")
+    if os.path.splitext(plan_out)[1].lower() not in (".csv", ".tsv", ".txt"):
+        raise ValueError("plan_out must be a CSV or TSV path for bounded-memory planning")
+    import re, csv as _csv
     from datetime import datetime, date
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from .preprocessing_utils import (
         classify_exam_series,           # returns labeled per-series rows
+        classify_series_metadata,       # classifies organizer-provided metadata
         _read_table, _save_table,       # robust I/O helpers
         _progress,                      # optional tqdm wrapper
         enumerate_supported_derivatives,
@@ -5237,6 +5952,7 @@ def plan_dicom_to_nifti_conversion(
     _VIEW_CLUSTER = [
         "ExamDirectory","ExamAlias","patientID","timepoint_days","series_identifier",
         "final_label","plane","is_derived","matrix","voxel_mm","n_slices",
+        "sequence_type","sequence_type_source",
         "selected_for_conversion","proposed_nifti_path",
         "unexpected_multiframe_policy",
         # show derivation info when present
@@ -5255,6 +5971,51 @@ def plan_dicom_to_nifti_conversion(
     # ---------- setup ----------
     root_dir = os.path.abspath(root_dir)
     out_dir  = os.path.abspath(out_dir)
+
+    indexed_exams = None
+    indexed_series_types = {}
+    indexed_db = None
+    indexed_db_path = None
+    if dicom_index:
+        import sqlite3
+        import tempfile
+        ext = os.path.splitext(dicom_index)[1].lower()
+        if ext not in (".csv", ".tsv", ".txt"):
+            raise ValueError("Indexed planning requires a CSV/TSV organization index")
+        delimiter = "\t" if ext in (".tsv", ".txt") else ","
+        indexed_db_path = tempfile.mkstemp(prefix="astril_index_", suffix=".sqlite3")[1]
+        # The planner may query one indexed exam per worker. The database is
+        # fully populated before worker threads start, so this connection is
+        # read-only from that point onward; allow serialized cross-thread reads.
+        indexed_db = sqlite3.connect(indexed_db_path, check_same_thread=False)
+        first = True
+        for chunk in pd.read_csv(dicom_index, sep=delimiter, dtype=str, keep_default_na=False, chunksize=10000):
+            required_index = {"normalized_path", "status"}
+            missing_index = required_index - set(map(str, chunk.columns))
+            if missing_index:
+                indexed_db.close()
+                os.remove(indexed_db_path)
+                raise ValueError(f"DICOM index is missing required columns: {sorted(missing_index)}")
+            chunk = chunk.copy()
+            valid = chunk[chunk["status"].astype(str).isin({"copied", "skipped_existing", "duplicate_sop"})].copy()
+            if valid.empty:
+                continue
+            normalized_paths = valid["normalized_path"].astype(str).map(os.path.abspath)
+            series_dirs = normalized_paths.map(os.path.dirname)
+            exam_abs = series_dirs.map(os.path.dirname)
+            patient_abs = exam_abs.map(os.path.dirname)
+            valid["_series_dir"] = series_dirs.values
+            valid["_exam_abs"] = exam_abs.values
+            valid["_patient_rel"] = patient_abs.map(lambda p: os.path.relpath(p, root_dir)).values
+            valid["_exam_rel"] = exam_abs.map(lambda p: os.path.relpath(p, root_dir)).values
+            valid.to_sql("index_rows", indexed_db, if_exists="replace" if first else "append", index=False)
+            first = False
+        if first:
+            pd.DataFrame(columns=["normalized_path", "status", "_series_dir", "_exam_abs", "_patient_rel", "_exam_rel"]).to_sql("index_rows", indexed_db, if_exists="replace", index=False)
+        indexed_db.execute("CREATE INDEX IF NOT EXISTS idx_index_rows_patient_exam ON index_rows (_patient_rel, _exam_rel)")
+        indexed_db.execute("CREATE INDEX IF NOT EXISTS idx_index_rows_series ON index_rows (_series_dir)")
+        indexed_db.commit()
+        indexed_exams = indexed_db
 
     # threads tuned for I/O
     if n_workers is None:
@@ -5326,6 +6087,21 @@ def plan_dicom_to_nifti_conversion(
         patient_abs = os.path.join(root_dir, patient_rel)
         if not os.path.isdir(patient_abs):
             return []
+        if indexed_exams is not None:
+            indexed_rows = pd.read_sql_query(
+                "SELECT DISTINCT _exam_rel, _exam_abs FROM index_rows WHERE _patient_rel = ?",
+                indexed_exams,
+                params=[str(patient_rel)],
+            )
+            return [{
+                "Directory": patient_rel,
+                "ExamDirectory": exam_rel,
+                "patientID": row["patientID"],
+                "day0Date": row["day0Date"],
+                "_day0": row["_day0"],
+                "mr_subdir_name": None,
+                "exam_abs": exam_abs,
+            } for exam_rel, exam_abs in sorted(indexed_rows.itertuples(index=False, name=None))]
         out = []
         for exam_abs, mr_name in _discover_exams(patient_abs):
             exam_rel = os.path.relpath(exam_abs, root_dir)
@@ -5363,10 +6139,6 @@ def plan_dicom_to_nifti_conversion(
 
 
     # Optional MR-subdir filter (case-insensitive)
-    if include_mr_subdirs:
-        want = {s.lower().strip() for s in include_mr_subdirs if s}
-        exams = [rec for rec in exams if str(rec.get("mr_subdir_name","")).lower().strip() in want]
-
     # ---------- previous plan handling ----------
     prev_tables = []
     prev_exam_keys = set()
@@ -5463,8 +6235,129 @@ def plan_dicom_to_nifti_conversion(
 
     _open_stream(plan_out)
 
+    def _indexed_series_metadata(exam_rel):
+        """Return one classifier-compatible raw record per indexed series."""
+        if indexed_exams is None:
+            return None
+        indexed = pd.read_sql_query(
+            "SELECT * FROM index_rows WHERE _exam_rel = ? ORDER BY _series_dir, normalized_path",
+            indexed_exams,
+            params=[str(exam_rel)],
+        )
+        if indexed.empty:
+            return pd.DataFrame()
+        records = []
+        for series_dir, group in indexed.groupby("_series_dir", sort=True):
+            representative = group.iloc[0]
+            def value(name, default=""):
+                return representative.get(name, default)
+            def numeric(name):
+                values = []
+                for candidate in group[name].tolist() if name in group.columns else []:
+                    try:
+                        if str(candidate).strip():
+                            values.append(float(candidate))
+                    except (TypeError, ValueError):
+                        continue
+                return max(values) if values else None
+            def first_numeric(name):
+                try:
+                    candidate = representative.get(name, "")
+                    return float(candidate) if str(candidate).strip() else None
+                except (TypeError, ValueError):
+                    return None
+            def median_numeric(name):
+                values = []
+                for candidate in group[name].tolist() if name in group.columns else []:
+                    try:
+                        if str(candidate).strip():
+                            values.append(float(candidate))
+                    except (TypeError, ValueError):
+                        continue
+                if not values:
+                    return None
+                return float(pd.Series(values).median())
+            pixel_spacing = str(value("pixel_spacing", "")).replace(",", ";").split(";")
+            row = {
+                "folder": series_dir,
+                "series_root": series_dir,
+                "series_number": value("series_number"),
+                "acq_dt_iso": value("acq_dt_iso"),
+                "acq_dt": pd.to_datetime(value("acq_dt_iso"), errors="coerce"),
+                "manufacturer": value("manufacturer"),
+                "modality": value("modality"),
+                "series_description": value("series_description"),
+                "protocol_name": value("protocol_name"),
+                "sequence_name": value("sequence_name"),
+                "image_type": value("image_type"),
+                "imgtype_flags": value("imgtype_flags"),
+                "te": numeric("echo_time"), "tr": numeric("repetition_time"),
+                "ti": numeric("inversion_time"), "flip_angle": numeric("flip_angle"),
+                "b_value": numeric("b_value"),
+                "primary_secondary": value("primary_secondary"),
+                "is_fspgr": str(value("is_fspgr", "")).strip().lower() in {"1", "true", "yes"},
+                "plane": value("plane"),
+                "rows_px": numeric("rows_px"), "cols_px": numeric("cols_px"),
+                "pixdim_row_mm": first_numeric("pixdim_row_mm") or median_numeric("pixdim_row_mm") or (float(pixel_spacing[0]) if pixel_spacing and pixel_spacing[0] else None),
+                "pixdim_col_mm": first_numeric("pixdim_col_mm") or median_numeric("pixdim_col_mm") or (float(pixel_spacing[1]) if len(pixel_spacing) > 1 and pixel_spacing[1] else None),
+                "slice_thickness_mm": numeric("slice_thickness_mm") or numeric("slice_thickness"),
+                "spacing_between_slices_mm": numeric("spacing_between_slices_mm") or numeric("spacing_between_slices"),
+                "z_spacing_mm": numeric("z_spacing_mm") or numeric("spacing_between_slices_mm") or numeric("spacing_between_slices") or numeric("slice_thickness_mm") or numeric("slice_thickness"),
+                "num_frames": numeric("num_frames"),
+                "images_in_acq": numeric("images_in_acq"),
+                "locations_in_acq": numeric("locations_in_acq"),
+                "num_dicoms": len(group),
+                # Match the legacy classifier's preference for explicit image
+                # counts, which is essential for one-file Enhanced/multiframe
+                # series. Fall back to the number of indexed files.
+                "n_slices_est": max(
+                    [len(group)] + [int(numeric(name) or 0) for name in
+                                     ("num_frames", "images_in_acq", "locations_in_acq")]
+                ),
+                "n_slices_per_vol_est": int(first_numeric("n_slices_per_vol_est") or max(
+                    [len(group)] + [int(numeric(name) or 0) for name in
+                                     ("images_in_acq", "locations_in_acq")]
+                )),
+                "pulse_sequence_name": value("pulse_sequence_name"),
+                "scanning_sequence": value("scanning_sequence"),
+                "sequence_variant": value("sequence_variant"),
+                "scan_options": value("scan_options"),
+                "mr_acq_type": value("mr_acq_type"),
+                "contrast_agent": value("contrast_agent"),
+                "contrast_volume": value("contrast_volume"),
+                "acquisition_contrast": value("acquisition_contrast"),
+            }
+            indexed_series_types[os.path.normcase(os.path.normpath(series_dir))] = (
+                str(value("sequence_type", "Unknown")).strip() or "Unknown",
+                str(value("sequence_type_source", "unknown")).strip() or "unknown",
+            )
+            records.append(row)
+        return pd.DataFrame(records)
+
+    plan_summary = {
+        "plan_out": os.path.abspath(plan_out),
+        "n_exams": 0,
+        "n_series": 0,
+        "n_selected": 0,
+        "n_derived": 0,
+        "n_errors": 0,
+    }
+
+    def _consume_plan_block(df):
+        """Stream one exam block and update counters without retaining it."""
+        if df is None or df.empty:
+            return
+        plan_summary["n_exams"] += 1
+        plan_summary["n_series"] += int(len(df))
+        if "selected_for_conversion" in df.columns:
+            plan_summary["n_selected"] += int(df["selected_for_conversion"].fillna(False).astype(bool).sum())
+        if "is_derived" in df.columns:
+            plan_summary["n_derived"] += int(df["is_derived"].fillna(False).astype(bool).sum())
+        if "error" in df.columns:
+            plan_summary["n_errors"] += int(df["error"].fillna("").astype(str).str.strip().ne("").sum())
+        _stream_block(df)
+
     # If reusing previous plans, stream those rows first (without recomputing)
-    all_results = []
     if exams_to_reuse and prev_tables:
         prev_tables = [t for t in prev_tables if t is not None and not t.empty]
         prev_all = pd.concat(prev_tables, axis=0, ignore_index=True) if prev_tables else pd.DataFrame(columns=HEADER)
@@ -5482,7 +6375,7 @@ def plan_dicom_to_nifti_conversion(
                 continue
             # enforce header & stream
             _stream_block(sub)
-            all_results.append(sub)
+            _consume_plan_block(sub)
 
     # ---------- phase 2: process exams (progress over exams) ----------
     def _process_exam(rec) -> pd.DataFrame:
@@ -5496,7 +6389,10 @@ def plan_dicom_to_nifti_conversion(
             _log(stage, f"patient={pid} exam='{exam_rel}' mr='{mr_name}': {msg}")
 
         try:
-            df = classify_exam_series(exam_abs, mr_subdir=mr_name, verbose=False)
+            if indexed_exams is not None:
+                df = classify_series_metadata(_indexed_series_metadata(exam_rel), verbose=False)
+            else:
+                df = classify_exam_series(exam_abs, mr_subdir=mr_name, verbose=False)
         except Exception as e:
             _elog("CLASSIFY", f"ERROR classify_exam_series: {type(e).__name__}: {e}")
             return _pd.DataFrame([{
@@ -5521,6 +6417,12 @@ def plan_dicom_to_nifti_conversion(
         df["day0Date"]        = rec["day0Date"]
         df["mr_subdir_name"]  = mr_name
         df["series_identifier"] = df["folder"].map(lambda p: os.path.basename(str(p)) if pd.notna(p) else "")
+        def _indexed_sequence_type(folder):
+            key = os.path.normcase(os.path.normpath(str(folder)))
+            return indexed_series_types.get(key, ("Unknown", "unknown"))
+        sequence_info = df["folder"].map(_indexed_sequence_type)
+        df["sequence_type"] = sequence_info.map(lambda value: value[0])
+        df["sequence_type_source"] = sequence_info.map(lambda value: value[1])
         # Quick classification summary
         try:
             n_total = len(df)
@@ -5932,7 +6834,6 @@ def plan_dicom_to_nifti_conversion(
         return df
 
     # Process all new exams
-    results = []
     if exams_to_process:
         if n_workers > 1:
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -5941,8 +6842,7 @@ def plan_dicom_to_nifti_conversion(
                     try:
                         df = fut.result()
                         if df is not None and not df.empty:
-                            results.append(df)
-                            _stream_block(df)  # stream per-exam block + blank line
+                            _consume_plan_block(df)
                     except Exception as e:
                         print(f"[plan:ERROR] {e.__class__.__name__}: {e}")
                         raise
@@ -5950,39 +6850,7 @@ def plan_dicom_to_nifti_conversion(
             for r in _progress(exams_to_process, total=len(exams_to_process), desc="Processing exams", unit="exam", enable=show_progress):
                 df = _process_exam(r)
                 if df is not None and not df.empty:
-                    results.append(df)
-                    _stream_block(df)
-
-    # Combine everything for return value — normalize to HEADER first and
-    # exclude empty AND all-NA frames to avoid pandas concat FutureWarning.
-    normalized = []
-    for df in (all_results + results):
-        if df is None or df.empty:
-            continue
-        df2 = df.reindex(columns=HEADER)
-        # if *every* cell is NA, skip (prevents the deprecation warning)
-        if not df2.notna().to_numpy().any():
-            continue
-        normalized.append(df2)
-
-    out_df = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame(columns=HEADER)
-
-    # If we couldn’t stream (e.g., .xlsx), write once at end with exam separators
-    if plan_out and (plan_fh is None):
-        # order: per exam by series_number then acq_dt
-        sort_cols = [c for c in ["ExamDirectory","series_number","acq_dt"] if c in out_df.columns]
-        out_df = out_df.sort_values(sort_cols, kind="mergesort", na_position="last").reset_index(drop=True)
-
-        # blank line between ExamDirectory groups
-        def _with_sep(df):
-            if "ExamDirectory" not in df.columns:
-                return df
-            blocks = []
-            for _, g in df.groupby("ExamDirectory", sort=False, dropna=False):
-                blocks.append(g)
-                blocks.append(pd.DataFrame([{c: "" for c in df.columns}]))
-            return pd.concat(blocks, ignore_index=True)
-        _save_table(_with_sep(out_df), plan_out)
+                    _consume_plan_block(df)
 
     # close stream if open
     try:
@@ -5991,7 +6859,13 @@ def plan_dicom_to_nifti_conversion(
     except Exception:
         pass
 
-    return out_df
+    if indexed_db is not None:
+        try:
+            indexed_db.close()
+            os.remove(indexed_db_path)
+        except Exception:
+            pass
+    return plan_summary
 
 # ------------------------------------------------------------
 # Convert a single DICOM series to NIFTI
@@ -7182,6 +8056,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
     p.add_argument("--previousMetadata", nargs="*", default=[], help="Zero or more prior tables to prefill from")
     p.add_argument("--omitPrevious", action="store_true", help="Omit rows already present in previous tables")
     p.add_argument("--subdirs", nargs="+", default=["MR"], help="Subfolder names to search under each patient folder")
+    p.add_argument("--index", default=None, help="Optional organize_dicoms() index; derive patient rows from DICOM metadata")
     p.add_argument("--excludeEmpty", action="store_true", help="Drop patient folders with no DICOM series found")
     p.add_argument("--n_workers", type=int, default=None, help="Threads for scanning (I/O bound). Set 1 to disable.")
     def _run_cpm(a):
@@ -7193,6 +8068,7 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             subdirs=a.subdirs,
             exclude_empty=a.excludeEmpty,
             n_workers=a.n_workers,
+            index_path=a.index,
         )
     p.set_defaults(func=_run_cpm)
 
@@ -7219,12 +8095,40 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
         )
     p.set_defaults(func=_run_demix)
 
+    # ---- organize_dicoms
+    p = sub.add_parser(
+        "organize_dicoms",
+        help="Create a metadata-derived Patient/Exam/Series copy and DICOM index.", formatter_class=_SmartFormatter)
+    p.add_argument("--dir", required=True, help="Source directory; source folder names are ignored for identity")
+    p.add_argument("--outDir", required=True, help="Normalized output directory")
+    p.add_argument("--indexOut", required=True, help="Output index (.csv|.tsv|.xlsx)")
+    p.add_argument("--quarantineDir", default=None, help="Directory for files missing or conflicting required metadata")
+    p.add_argument("--logOut", default=None, help="Optional copy of the complete organizer index")
+    p.add_argument("--unresolvedOut", default=None, help="Optional unresolved-file report (.csv|.tsv|.xlsx); defaults beside the index")
+    p.add_argument("--dryRun", action="store_true", help="Read and index metadata without copying files")
+    p.add_argument("--n_workers", type=int, default=None, help="Threads for metadata reads and copies")
+    p.add_argument("--noProgress", action="store_true", help="Disable progress bar")
+    def _run_organize(a):
+        organize_dicoms(
+            root_dir=a.dir,
+            out_dir=a.outDir,
+            index_out=a.indexOut,
+            quarantine_dir=a.quarantineDir,
+            log_out=a.logOut,
+            unresolved_out=a.unresolvedOut,
+            dry_run=a.dryRun,
+            n_workers=a.n_workers,
+            show_progress=not a.noProgress,
+        )
+    p.set_defaults(func=_run_organize)
+
     # ---- plan_dicom_to_nifti_conversion
     p = sub.add_parser(
         "plan_dicom_to_nifti_conversion",
         help="Discover/select DICOM series to convert and (optionally) derived products; stream a plan file.", formatter_class=_SmartFormatter)
     p.add_argument("--patientMetadata", required=True, help="Table from create_patient_metadata() (filled in)")
     p.add_argument("--dir", required=True, help="Root DICOM directory; must contain subfolders in 'Directory' column")
+    p.add_argument("--dicomIndex", required=True, help="CSV/TSV index produced by organize_dicoms()")
     p.add_argument("--outDir", required=True, help="Planned destination root for converted files")
     p.add_argument("--planOut", required=True, help="Where to write the plan (.csv|.tsv|.xlsx). .csv|.tsv files will be streamed; .xlsx files will only write after function is complete.")
     p.add_argument("--n_workers", type=int, default=None, help="Threads per exam (I/O bound)")
@@ -7233,8 +8137,6 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
                     help="0+ previous plan files to reuse/skip exam directories from.")
     p.add_argument("--ignorePrevious", action="store_true",
                     help="Skip exams already present in previous plan files (instead of reusing their rows).")
-    p.add_argument("--mrSubdirs", nargs="*", default=None,
-                    help="Only include these MR subfolder names (case-insensitive).")
     p.add_argument("--minSlices", type=int, default=10,
                     help="Minimum slices required to consider a sequence for selection.")
     p.add_argument(
@@ -7265,12 +8167,12 @@ def _build_cli_parser() -> "argparse.ArgumentParser":
             show_progress=not a.noProgress,
             previous_plans=getattr(a, "previousPlan", None),
             ignore_previous=getattr(a, "ignorePrevious", False),
-            include_mr_subdirs=getattr(a, "mrSubdirs", None),
             min_slices=getattr(a, "minSlices", 10),
             use_actual_exam_ids=getattr(a, "use_actual_exam_ids", False),
             add_missing_derived=getattr(a, "add_missing_derived", False),
             make_derived_from_scratch=getattr(a, "make_derived_from_scratch", False),
             unexpected_multiframe_policy=getattr(a, "unexpectedMultiframePolicy", "keep_first"),
+            dicom_index=getattr(a, "dicomIndex", None),
         )
     p.set_defaults(func=_run_plan)
 

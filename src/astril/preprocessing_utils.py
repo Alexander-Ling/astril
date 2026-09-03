@@ -1314,7 +1314,7 @@ def _estimate_z_spacing_from_positions(series_folder: str) -> Tuple[Optional[flo
 # Primary function for DICOM file classification
 # ------------------------------------------------------------------------
 
-def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
+def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False, preloaded_rows=None):
     """
     Unified 'read-everything-and-classify' in one function.
 
@@ -1334,10 +1334,11 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
         raise FileNotFoundError(f"Series parent folder not found: {mr_dir}")
 
     rows = []
+    ds = None
     # IMPORTANT: Keep this as a shallow directory listing. Each immediate child of the
     # chosen series parent is treated as one candidate series root. This supports both
     # Exam/MR/Series/... and Exam/Series/... layouts without scanning the entire tree.
-    for series_root in sorted([os.path.join(mr_dir, d) for d in os.listdir(mr_dir) if os.path.isdir(os.path.join(mr_dir, d))]):
+    for series_root in sorted([os.path.join(mr_dir, d) for d in os.listdir(mr_dir) if os.path.isdir(os.path.join(mr_dir, d))]) if preloaded_rows is None else []:
         series_folder = series_root
         dicom_dir = _resolve_dicom_series_dir(series_folder)
         if not dicom_dir:
@@ -1521,8 +1522,22 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             _contrast_tokens=contrast_tokens,
         ))
 
+    if preloaded_rows is not None:
+        rows = [dict(row) for row in preloaded_rows]
+
     if not rows:
         return pd.DataFrame()
+
+    # Indexed callers provide the raw fields but not the transient token
+    # streams used by the classifier. Recreate those streams without touching
+    # the DICOM files.
+    for row in rows:
+        if not row.get("_tokens"):
+            combo = _norm_text(row.get("series_description"), row.get("protocol_name"), row.get("sequence_name"))
+            row["_tokens"] = _name_tokens(combo)
+        if not row.get("_contrast_tokens"):
+            combo = _norm_text(row.get("series_description"), row.get("sequence_name"))
+            row["_contrast_tokens"] = _name_tokens(combo)
 
     df = pd.DataFrame(rows)
 
@@ -1658,7 +1673,12 @@ def _classify_all_series_once(exam_dir, mr_subdir="MR", verbose=False):
             or imgtype_has_diff
         )
         if not dwi_hit:
-            vh = _vendor_hints(ds)
+            vh = _vendor_hints(ds) if ds is not None else {
+                "pulse_sequence_name": r.get("pulse_sequence_name"),
+                "scanning_sequence": r.get("scanning_sequence"),
+                "sequence_variant": r.get("sequence_variant"),
+                "scan_options": r.get("scan_options"),
+            }
             psn = str(vh.get("pulse_sequence_name","") or "").lower()
             ss  = str(vh.get("scanning_sequence","") or "").lower()
             sv  = str(vh.get("sequence_variant","") or "").lower()
@@ -1967,6 +1987,24 @@ def classify_exam_series(exam_dir, mr_subdir="MR", verbose=False):
     PUBLIC API: one-call metadata extraction + classification.
     """
     return _classify_all_series_once(exam_dir, mr_subdir=mr_subdir, verbose=verbose)
+
+
+def classify_series_metadata(series_rows, verbose=False):
+    """Classify already-collected series metadata without reading DICOM files.
+
+    ``series_rows`` must contain the raw fields produced by the organizer's
+    series aggregation. This uses the same classifier and exam-level context
+    logic as :func:`classify_exam_series`, but bypasses directory traversal and
+    DICOM reads.
+    """
+    if hasattr(series_rows, "to_dict"):
+        series_rows = series_rows.to_dict(orient="records")
+    return _classify_all_series_once(
+        exam_dir=".",
+        mr_subdir=".",
+        verbose=verbose,
+        preloaded_rows=series_rows,
+    )
 
 # ------------------------------------------------------------------------
 # Helper functions for creating patient Metadata tables
