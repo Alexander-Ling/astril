@@ -6972,11 +6972,15 @@ def convert_dicom_plan(
         return False
 
     if "selected_for_conversion" in plan.columns:
-        _sel = plan["selected_for_conversion"].map(_to_bool)
+        _sel = plan["selected_for_conversion"].map(_to_bool).astype(bool)
     else:
         _sel = pd.Series(True, index=plan.index)
 
-    _has_path = plan["proposed_nifti_path"].map(_valid_path)
+    # .astype(bool) forces a plain boolean dtype regardless of the column's original dtype --
+    # pandas >=3 infers a nullable StringDtype for CSV string columns by default, and combining
+    # two StringDtype-backed Series with `&` raises TypeError, even though .map() here always
+    # returns plain Python bools.
+    _has_path = plan["proposed_nifti_path"].map(_valid_path).astype(bool)
     todo = plan.loc[_sel & _has_path].copy()
     if todo.empty:
         cols = ["Directory","ExamDirectory","series_identifier","final_label",
@@ -7320,7 +7324,9 @@ def convert_dicom_plan(
                 derived_label = rec.get("DerivedLabel", "")
                 src_input = rec.get("DeriveInputs") or rec.get("PrimarySeriesPath") or series_dir  # dict for multi-input, else DICOM dir
                 if "is_derived" in plan.columns:
-                    _not_derived = ~plan["is_derived"].map(_to_bool).fillna(False)
+                    # .astype(bool): see the matching comment near `_sel & _has_path` above --
+                    # pandas >=3's default string dtype breaks `~`/`&` on a bare .map() result.
+                    _not_derived = ~plan["is_derived"].map(_to_bool).fillna(False).astype(bool)
                 else:
                     _not_derived = pd.Series(True, index=plan.index)
                 # Enforce: SWI/SWI_GAD MIP/MINIP must use a composite of the same family (vendor or synthesized).
