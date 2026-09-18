@@ -1,6 +1,6 @@
 {
   "GBM_seg_v2.zip": {
-    "bytes": 1759730639,
+    "bytes": 1761691310,
     "expect": [
       "README.md",
       "CITATIONS.md",
@@ -16,12 +16,13 @@
       "Model_B_Coronal.pt",
       "Model_B_Coronal_train_parameters.cfg",
       "Model_B_Sagittal.pt",
-      "Model_B_Sagittal_train_parameters.cfg"
+      "Model_B_Sagittal_train_parameters.cfg",
+      "pipeline.json"
     ],
     "extract_to": "GBM_seg_v2",
     "kind": "pytorch_zip",
-    "sha256": "47c5a4f97b8ea415300e84a139ef744e75ea4b646e13a848373c995c0b342cb1",
-    "url": "https://osf.io/download/j2vbp/",
-    "version": "2026-08-10"
+    "sha256": "a235566d299187e44ff51c6c519c7e20a87a079ad7f03b406d6abebb381a83fc",
+    "url": "https://osf.io/download/7f5vy/",
+    "version": "2026-09-18"
   }
 }

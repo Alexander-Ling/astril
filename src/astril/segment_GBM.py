@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Module: segment_GBM
-This module runs a pre-specified segmentation pipeline using pre-trained models
-on a directory of input scans (GBM segmentation). The pipeline now processes each subject
-fully (Model 1 segmentation, remapping, then Model 2 segmentation) before moving on.
-Model 2 configuration files are generated on a per‐subject basis (in a subject‐specific
-subfolder) after necessary inputs have been generated. The pre‐trained models for each
-stage are loaded only once.
+Runs the GBM_seg_v2 segmentation pipeline: a Model A three-plane gating pass (average-probability
+consensus) whose output is thresholded, dilated, and intersected with the brainmask into a spatial
+gate, followed by a Model B three-plane five-class consensus (average-logit) constrained to that
+gate. Each subject is processed fully (Model A, gate derivation, Model B) before moving on. Model
+B's per-subject configuration files are generated in a subject-specific subfolder after the gate is
+available. Each stage's pre-trained models are loaded once, not per subject.
 """
 import os
-import sys
 import argparse
 import shutil
 from pathlib import Path
@@ -26,16 +25,6 @@ MISSING_CHANNEL_SENTINEL = "__MISSING__"
 # ------------------------------------------------------------
 # Model set specification (single source of truth)
 # ------------------------------------------------------------
-GBM_V1_SPEC = {
-    # name: {plane, model checkpoint stem, train_cfg filename}
-    "Axial_1":     {"plane": "Axial",    "dir": "Axial_1",    "cfg": "Axial_1_train_parameters.cfg"},
-    "Coronal_1":   {"plane": "Coronal",  "dir": "Coronal_1",  "cfg": "Coronal_1_train_parameters.cfg"},
-    "Sagittal_1":  {"plane": "Sagittal", "dir": "Sagittal_1", "cfg": "Sagittal_1_train_parameters.cfg"},
-    "Axial_2":     {"plane": "Axial",    "dir": "Axial_2",    "cfg": "Axial_2_train_parameters.cfg"},
-    "Coronal_2":   {"plane": "Coronal",  "dir": "Coronal_2",  "cfg": "Coronal_2_train_parameters.cfg"},
-    "Sagittal_2":  {"plane": "Sagittal", "dir": "Sagittal_2", "cfg": "Sagittal_2_train_parameters.cfg"},
-}
-
  # Model A is the binary abnormality detector used to create the spatial gate.
  # Model B is the five-class, normalized-MRI consensus selected for the final
  # segmentation. Both are deployed together under GBM_seg_v2 so the gate and
@@ -51,21 +40,21 @@ GBM_MODEL_B_FIVE_CLASS_SPEC = {
     "Sagittal": {"plane": "Sagittal", "dir": "Model_B_Sagittal", "cfg": "Model_B_Sagittal_train_parameters.cfg"},
 }
 
-def _resolve_gbm_family_root(family: str = "GBM_seg_v1") -> Path:
+def _resolve_gbm_family_root(family: str) -> Path:
     """Base directory where the GBM model family lives inside package models/."""
     # Lazy import so CLI help is instant (avoid importing anything heavy at module import time)
     from .models_download import locate_models_dir
     return Path(locate_models_dir()) / family
 
-def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1", specs=None):
+def _resolve_model_artifacts(names: list[str], family: str, specs: dict):
     """
-    For the given list of logical model names (keys in GBM_V1_SPEC),
-    return parallel lists: model_paths (.pt), train_cfg_paths, planes.
+    For the given list of logical model names (keys in `specs`), return parallel lists:
+    model_paths (.pt), train_cfg_paths, planes.
     """
     root = _resolve_gbm_family_root(family)
     model_paths, train_cfgs, planes = [], [], []
     for name in names:
-        spec = (specs or (GBM_V1_SPEC if family == "GBM_seg_v1" else GBM_MODEL_B_FIVE_CLASS_SPEC))[name]
+        spec = specs[name]
         pt_file = root / f"{spec['dir']}.pt"
         nested_pt_file = root / spec["dir"] / f"{spec['dir']}.pt"
         if pt_file.is_file():
@@ -78,34 +67,6 @@ def _resolve_model_artifacts(names: list[str], family: str = "GBM_seg_v1", specs
         train_cfgs.append(str(root / spec["cfg"]))
         planes.append(spec["plane"])
     return model_paths, train_cfgs, planes
-
-def _required_gbm_paths(family: str = "GBM_seg_v1") -> tuple[list[tuple[Path, Path]], list[Path]]:
-    """Return alternative .pt checkpoint locations and required cfg files."""
-    root = _resolve_gbm_family_root(family)
-    model_alternatives = [
-        (root / f"{spec['dir']}.pt", root / spec["dir"] / f"{spec['dir']}.pt")
-        for spec in GBM_V1_SPEC.values()
-    ]
-    cfgs = [root / spec["cfg"] for spec in GBM_V1_SPEC.values()]
-    return model_alternatives, cfgs
-
-def _ensure_models_available() -> None:
-    need_models, need_cfgs = _required_gbm_paths("GBM_seg_v1")
-    missing_models = [alts[0] for alts in need_models if not any(p.exists() for p in alts)]
-    missing_cfgs = [p for p in need_cfgs if not p.exists()]
-    missing = missing_models + missing_cfgs
-    if missing:
-        target = _resolve_gbm_family_root("GBM_seg_v1")
-        items = "\n".join(f"  - {m}" for m in missing)
-        print(
-            "Required Astril GBM v1 model artifacts are missing:\n"
-            f"{items}\n\n"
-            "To fetch them, run:\n"
-            "  astril-download-models\n\n"
-            f"Artifacts are expected under:\n  {target}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
 def _ensure_model_b_five_class_available() -> None:
     root = _resolve_gbm_family_root("GBM_seg_v2")
@@ -123,6 +84,30 @@ def _ensure_model_b_five_class_available() -> None:
             "Required Model A and five-class Model B artifacts are missing from Astril's GBM_seg_v2 family:\n"
             f"{items}\n\nRun `astril-download-models --family GBM_seg_v2` after the GBM_seg_v2 archive is registered in the model manifest."
         )
+
+
+def _write_segmentation_provenance(subject_dir, model_family: str) -> None:
+    """
+    Write a `segmentation_provenance.json` sidecar into `subject_dir` recording which model
+    family produced the segmentation output(s) there, and that family's level->label mapping
+    (if that family's pipeline.json declares any -- see `model_labels.py`). `quantify_volumes.py`
+    picks this up automatically to label volume columns meaningfully and to know which levels
+    a model can produce even if this particular exam happens to have zero voxels at one of them.
+    """
+    import json
+    from .model_labels import load_model_labels
+
+    labels = load_model_labels(model_family)
+    payload = {
+        "model_family": model_family,
+        "labels": {str(level): name for level, name in labels.items()} if labels else {},
+    }
+    out_path = Path(subject_dir) / "segmentation_provenance.json"
+    try:
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"[WARNING] Could not write segmentation provenance to {out_path}: {e}")
 
 
 def _print_model_b_citation_notice() -> None:
@@ -428,238 +413,6 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     return None
 
 
-def segment_GBM_per_subject(input_dir, slice_batch_size=1, n_threads=1,
-                             overwrite_existing_outputs=False,
-                             channel_patterns=None, brainmask_pattern="_brainmask.nii.gz",
-                             segment_suffix="_GBM-seg.nii.gz", debug_models=False,
-                             optional_channels=None):
-    """
-    Implements the GBM segmentation pipeline per subject:
-      1. Create and use a Model 1 segmentation config for all subjects.
-      2. Process Model 1 segmentation.
-      3. Remap Model 1 outputs.
-      4. For each subject, generate a Model 2 config file (using --silent)
-         with inputVolumeDirectory set to the subject directory.
-      5. Process Model 2 segmentation.
-      6. Clean up intermediate files in the subject's directory immediately.
-    """
-    # Lazy imports: avoid importing these (and their transitive deps) unless we actually run segmentation
-    from .create_segmentation_config import (
-        create_segmentation_config,
-        parse_train_config_for_model_parameters,
-    )
-    from .remap_gt_classes import remap_gt_classes
-    from .data_loading import read_paths_from_file
-    from .run_segmentation import load_models_for_config
-
-    if channel_patterns is None:
-        channel_patterns = ["_T1c_brain-norm.nii.gz",
-                            "_T1n_brain-norm.nii.gz",
-                            "_T2f_brain-norm.nii.gz",
-                            "_T2w_brain-norm.nii.gz"]
-    channels = ["t1c", "t1n", "t2f", "t2w"]
-    optional_channels = list(optional_channels or [])
-    
-    working_dir = os.path.join(input_dir, "Segmentation_Configs")
-    Path(working_dir).mkdir(parents=True, exist_ok=True)
-    
-    #########################################
-    # STEP 1: Prepare segmentation config for Model 1.
-    #########################################
-    model1_names = ["Axial_1", "Coronal_1", "Sagittal_1"]
-    model1_paths, model1_train_configs, model1_planes = _resolve_model_artifacts(model1_names, "GBM_seg_v1")
-    seg_config_model1 = create_segmentation_config(
-        workingDirectory=working_dir,
-        inputChannels=channels,
-        channelPatterns=channel_patterns,
-        maskPattern=brainmask_pattern,
-        model_paths=model1_paths,
-        modelTrainConfigFiles=model1_train_configs,
-        merging_method="average_logit",
-        inputVolumeDirectory=input_dir,
-        outputVolumeDirectory="in_place",
-        segmentSuffix="_Model_1_seg.nii.gz",
-        output_config_filename="model_1_parameters.cfg",
-        silent=False,
-        optional_channels=optional_channels,
-        allow_missing_optional_channels=bool(optional_channels),
-    )
-    print("-------------------------")
-    print("[INFO] Prepared segmentation config for Model 1.")
-    
-    #########################################
-    # STEP 2: Load pre-trained models (Model 1 and Model 2).
-    #########################################
-    print("[INFO] Loading Model 1 weights...")
-    # derive lists needed by the unified loader from the model_1 config we just created
-    cp_tmp = configparser.ConfigParser()
-    cp_tmp.read(seg_config_model1)
-    cfg1 = cp_tmp["DEFAULT"]
-    m1_num_in = list(map(int, cfg1["model_train_num_input_slices"].split(",")))
-    m1_min_hw = list(map(int, cfg1["model_train_minimum_hw"].split(",")))
-    num_modal_channels = len(channels)  # for Model 1
-    loaded_models_model1 = load_models_for_config(
-        model_paths=model1_paths,
-        model_train_config_files=model1_train_configs,
-        model_num_input_slices=m1_num_in,
-        model_min_hw=m1_min_hw,
-        num_modal_channels=num_modal_channels,
-    )
-    
-    print("[INFO] Loading Model 2 weights...")
-    model2_names = ["Axial_2", "Coronal_2", "Sagittal_2"]
-    model2_paths, model2_train_configs, model2_planes = _resolve_model_artifacts(model2_names, "GBM_seg_v1")
-    # Build a single-subject Model 2 config template (values used for loader dims)
-    # We'll still generate per-subject configs later for file lists.
-    dummy_cp2 = configparser.ConfigParser()
-    # mimic create_segmentation_config scalar arrays for dims; we only need dims here
-    # by reading train cfgs (safer) to avoid drifting from training settings
-    m2_num_in, m2_min_hw = [], []
-    for cfg_path in model2_train_configs:
-        params = parse_train_config_for_model_parameters(cfg_path)
-        m2_num_in.append(params.get("num_input_slices", 3))
-        m2_min_hw.append(params.get("minimum_height_width", 256))
-    # Model 2 uses 3 channels: t1c, t2f, mod1DB
-    loaded_models_model2 = load_models_for_config(
-        model_paths=model2_paths,
-        model_train_config_files=model2_train_configs,
-        model_num_input_slices=m2_num_in,
-        model_min_hw=m2_min_hw,
-        num_modal_channels=3,
-    )
-    
-    #########################################
-    # STEP 3: Process each subject sequentially.
-    #########################################
-    cp_model1 = configparser.ConfigParser()
-    cp_model1.read(seg_config_model1)
-    mask_cfg_file = cp_model1["DEFAULT"]["mask_paths_file"]
-    mask_paths = read_paths_from_file(mask_cfg_file)
-    num_subjects = len(mask_paths)
-    print(f"[INFO] Found {num_subjects} exam(s) to process in {input_dir}.")
-
-    # Detect BrainIAC dependency from Model 1 training configs
-    from .run_segmentation import (
-        _train_config_requires_brainiac,
-        _train_config_brainiac_embedding_type,
-        _train_config_brainiac_channel_indices,
-    )
-    brainiac_needed = any(_train_config_requires_brainiac(tc) for tc in model1_train_configs)
-    brainiac_weights_path = None
-    brainiac_tmp_dir = None
-    brainiac_mode = None
-    brainiac_channel_indices = None
-    if brainiac_needed:
-        from .brainiac_utils import ensure_brainiac_weights, BrainIACWeightsNotFoundError
-        import tempfile
-        try:
-            brainiac_weights_path = ensure_brainiac_weights(weights_path=None)
-        except BrainIACWeightsNotFoundError as e:
-            raise RuntimeError(str(e))
-        brainiac_tmp_dir = Path(tempfile.mkdtemp(prefix="astril_brainiac_"))
-
-        _brainiac_cfg = next(tc for tc in model1_train_configs if _train_config_requires_brainiac(tc))
-        brainiac_mode = _train_config_brainiac_embedding_type(_brainiac_cfg)
-
-        if brainiac_mode != "encoder_fusion":
-            raise ValueError(
-                "BrainIAC now supports only brainiac_embedding_type = encoder_fusion. "
-                f"Found {brainiac_mode} in {_brainiac_cfg}."
-            )
-        brainiac_channel_indices = _train_config_brainiac_channel_indices(
-            _brainiac_cfg,
-            len(cp_model1["DEFAULT"]["channel_paths_files"].split(",")),
-        )
-        print(f"[brainiac] Encoder-fusion mode. Channels={brainiac_channel_indices}.")
-
-    for subj_idx in range(num_subjects):
-        # BEFORE ANY PROCESSING: Check if the final segmentation file already exists.
-        # Use the original mask pattern (from --brainmask_pattern) and the Model 2 mask pattern.
-        subject_mask = mask_paths[subj_idx]
-        final_seg_path = compute_final_segmentation_path(subject_mask, brainmask_pattern, "_Model_2_mask.nii.gz", segment_suffix)
-        if final_seg_path.exists() and not overwrite_existing_outputs:
-            print(f"[INFO] Skipping subject {subj_idx+1}: final segmentation file {final_seg_path} already exists.")
-            continue
-
-        # Compute BrainIAC features for this subject if Model 1 requires it
-        brainiac_extra_paths_subj = None
-        brainiac_encoder_paths_subjects = None
-        if brainiac_needed:
-            from .brainiac_utils import compute_brainiac_encoder_features
-            channel_paths = cp_model1["DEFAULT"]["channel_paths_files"].split(",")
-            subject_features = []
-            for ch_idx in brainiac_channel_indices:
-                channel_cfg = channel_paths[ch_idx]
-                source_path = read_paths_from_file(channel_cfg)[subj_idx]
-                label = f"ch{ch_idx}"
-                if str(source_path).strip() == MISSING_CHANNEL_SENTINEL:
-                    subject_features.append(MISSING_CHANNEL_SENTINEL)
-                else:
-                    features = compute_brainiac_encoder_features(
-                        [source_path], brainiac_weights_path,
-                        brainiac_tmp_dir / f"{label}_encoder", label,
-                    )
-                    subject_features.append(features[0])
-            brainiac_encoder_paths_subjects = [None] * num_subjects
-            brainiac_encoder_paths_subjects[subj_idx] = subject_features
-
-        print("\n==============================")
-        print(f"[INFO] Processing exam {subj_idx+1} of {num_subjects} with Model 1...")
-        process_subject_with_models(seg_config_model1, subj_idx, loaded_models_model1,
-                                    slice_batch_size, overwrite_existing_outputs, "_Model_1_seg.nii.gz",
-                                    tiebreaker_model=0, debug_models=debug_models,
-                                    extra_channel_paths=brainiac_extra_paths_subj,
-                                    brainiac_paths_list=brainiac_encoder_paths_subjects)
-        # Remap Model 1 segmentation outputs in the subject's directory.
-        subject_dir = os.path.dirname(mask_paths[subj_idx])
-        print("[INFO] Remapping Model 1 segmentation for Model 2 inputs...")
-        remap_gt_classes(trainDataDirectory=subject_dir,
-                         gtPattern="_Model_1_seg.nii.gz",
-                         outputPattern="_Model_2_mask.nii.gz",
-                         classRemapDict='{(0,):0,(1,2):1}')
-        remap_gt_classes(trainDataDirectory=subject_dir,
-                         gtPattern="_Model_1_seg.nii.gz",
-                         outputPattern="_Model_1_DB.nii.gz",
-                         classRemapDict='{(0,2):0,(1,):1}')
-        
-        # For Model 2, generate a config file for this subject (using --silent)
-        # Use a subject-specific working directory.
-        subject_mod2_working_dir = os.path.join(working_dir, "Mod2", f"Exam_{subj_idx+1}")
-        Path(subject_mod2_working_dir).mkdir(parents=True, exist_ok=True)
-        seg_config_model2 = create_segmentation_config(
-            workingDirectory=subject_mod2_working_dir,
-            inputChannels=["t1c", "t2f", "mod1DB"],
-            channelPatterns=[channel_patterns[0], channel_patterns[2], "_Model_1_DB.nii.gz"],
-            maskPattern="_Model_2_mask.nii.gz",
-            model_paths=model2_paths,
-            modelTrainConfigFiles=model2_train_configs,
-            merging_method="average_logit",
-            inputVolumeDirectory=subject_dir,
-            outputVolumeDirectory="in_place",
-            segmentSuffix=segment_suffix,
-            output_config_filename="model_2_parameters.cfg",
-            silent=True,
-            optional_channels=[ch for ch in optional_channels if ch in {"t1c", "t2f"}],
-            allow_missing_optional_channels=any(ch in {"t1c", "t2f"} for ch in optional_channels),
-        )
-        print(f"[INFO] Processing exam {subj_idx+1} with Model 2...")
-        # Since the generated Model 2 config corresponds to a single subject, use index 0.
-        process_subject_with_models(seg_config_model2, 0, loaded_models_model2,
-                                    slice_batch_size, overwrite_existing_outputs, segment_suffix,
-                                    tiebreaker_model=0, debug_models=debug_models)
-        
-        # Clean up intermediate files in the subject's directory immediately.
-        print(f"[INFO] Cleaning up intermediate files in exam directory: {subject_dir}")
-        cleanup_intermediate_files(subject_dir)
-    
-    #########################################
-    # FINAL STEP: Clean up segmentation configuration files.
-    #########################################
-    print("[INFO] Cleaning up segmentation configuration files...")
-    cleanup_intermediate_files(working_dir)
-    print("[INFO] GBM segmentation pipeline complete.")
-
-
 def _write_model_a_gate(probabilities, mask_path, output_path, threshold=0.30, dilation_voxels=5):
     """Write the Model A consensus foreground gate used by five-class Model B."""
     import nibabel as nib
@@ -694,7 +447,11 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
         channel_patterns = ["_T1c_brain-norm.nii.gz", "_T1n_brain-norm.nii.gz",
                             "_T2f_brain-norm.nii.gz", "_T2w_brain-norm.nii.gz"]
     channels = ["t1c", "t1n", "t2f", "t2w"]
-    optional_channels = list(optional_channels or [])
+    # Preserve None (not [] ) when the caller doesn't specify anything, so
+    # create_segmentation_config's own per-model auto-inference (reading each checkpoint's
+    # `optional_channels` from its train_parameters.cfg -- GBM_seg_v2 was trained with channel
+    # dropout and only requires t1c) actually runs instead of being short-circuited.
+    optional_channels = list(optional_channels) if optional_channels is not None else None
     working_dir = os.path.join(input_dir, "Segmentation_Configs")
     Path(working_dir).mkdir(parents=True, exist_ok=True)
 
@@ -707,7 +464,8 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
         merging_method="average_prob", inputVolumeDirectory=input_dir,
         outputVolumeDirectory="in_place", segmentSuffix="_Model_A_seg.nii.gz",
         output_config_filename="model_a_parameters.cfg", silent=False,
-        optional_channels=optional_channels, allow_missing_optional_channels=bool(optional_channels),
+        optional_channels=optional_channels,
+        allow_missing_optional_channels=(bool(optional_channels) if optional_channels is not None else None),
     )
     model_a_cp = configparser.ConfigParser()
     model_a_cp.read(model_a_config)
@@ -763,7 +521,8 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
             merging_method="average_logit", inputVolumeDirectory=subject_dir,
             outputVolumeDirectory="in_place", segmentSuffix=segment_suffix,
             output_config_filename="model_b_parameters.cfg", silent=True,
-            optional_channels=optional_channels, allow_missing_optional_channels=bool(optional_channels),
+            optional_channels=optional_channels,
+            allow_missing_optional_channels=(bool(optional_channels) if optional_channels is not None else None),
         )
         print(f"[INFO] Processing exam {subject_index + 1} with five-class Model B average-logit consensus...")
         process_subject_with_models(
@@ -771,6 +530,7 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
             overwrite_existing_outputs, segment_suffix, tiebreaker_model=0,
             debug_models=False,
         )
+        _write_segmentation_provenance(subject_dir, "GBM_seg_v2")
         cleanup_intermediate_files(subject_dir)
     cleanup_intermediate_files(working_dir)
     print("[INFO] Model A-gated five-class Model B segmentation complete.")
@@ -800,7 +560,12 @@ def main():
     prog = f"python -m {module.name}" if module and module.name else None
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Run the full GBM segmentation pipeline using pre-trained models. Output segmentation volumes will have 4 levels: 0 = normal brain, 1 = tumor, 2 = surgical artefact, 3 = edema"
+        description="Run the full GBM segmentation pipeline using pre-trained models (GBM_seg_v2: "
+                    "Model A three-plane gating + five-class Model B consensus). Output segmentation "
+                    "labels are model-specific -- see the README bundled with the model weights, or "
+                    "astril.model_labels.load_model_labels('GBM_seg_v2'), for what each non-zero "
+                    "level means. A segmentation_provenance.json sidecar recording the model family "
+                    "and its labels is written alongside each exam's output."
     )
     parser.add_argument("input_directory",
                         help="Directory containing input scans for segmentation.")

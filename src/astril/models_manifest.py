@@ -132,12 +132,18 @@ def generate_models_json(
                         topdir = next(iter(top_levels))
 
                     pt_names = [n for n in names if n.lower().endswith(".pt")]
-                    cfg_names = [n for n in names if n.lower().endswith(".cfg")]
                     if pt_names:
                         record["kind"] = "pytorch_zip"
                         record["extract_to"] = topdir or p.stem
+                        # Expect every extracted file, not just .pt/.cfg -- README.md,
+                        # CITATIONS.*, and pipeline.json (the model's labels/pipeline contract)
+                        # belong in the archive too, and should be caught by this sanity check
+                        # the same way a missing checkpoint would be, without needing to keep
+                        # extending a hardcoded extension list by hand each time a new
+                        # always-expected file is added to a family's archive.
+                        file_names = [n for n in names if not n.endswith("/")]
                         expect = []
-                        for n in pt_names + cfg_names:
+                        for n in file_names:
                             if topdir and n.startswith(f"{topdir}/"):
                                 expect.append(n.split("/", 1)[1])
                             else:
