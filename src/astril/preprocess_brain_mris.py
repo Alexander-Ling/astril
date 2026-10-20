@@ -20,7 +20,7 @@ import sysconfig
 # We import and call your existing function directly (no subprocess).
 # If your package layout differs (e.g., installed as astril), adjust the import:
 from .preprocess_single_brain_mri import preprocess_single_brain_mri  # type: ignore
-from .preprocessing_utils import ensure_dcm2niix_accessible
+from .preprocessing_utils import ensure_dcm2niix_accessible, _cleanup_registered_temp_dirs, _register_temp_dir_for_atexit
 
 
 try:
@@ -43,6 +43,27 @@ class _InterruptibleThreadPoolExecutor(ThreadPoolExecutor):
             cancel_futures=exc_type is not None,
         )
         return False
+
+
+def _stop_cli_immediately(signum, _frame):
+    print("\n[preprocess_brain_mris] Interrupted; removing scratch dirs and stopping immediately.", flush=True)
+    # os._exit is required to abandon in-flight worker threads promptly, but it skips
+    # finally/atexit; delete registered scratch dirs (unmasked intermediates) first.
+    _cleanup_registered_temp_dirs()
+    os._exit(128 + int(signum))
+
+
+def _install_cli_stop_handlers() -> None:
+    """Stop promptly AND clean up on Ctrl+C or scheduler termination (Nextflow/AWS Batch SIGTERM).
+
+    Installed from main() because the `preprocess_brain_mris` console script calls main()
+    directly and never runs this module's __main__ block.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _stop_cli_immediately)
+        except (ValueError, OSError):
+            pass  # not in the main thread, or unsupported on this platform
 
 
 def _ensure_dcm2niix_accessible() -> str:
@@ -771,6 +792,8 @@ def preprocess_library(
                 )
 
             with tempfile.TemporaryDirectory(prefix="astril_hd_bet_refs_") as td:
+                # Holds unmasked reference scans; make sure an interrupt deletes it.
+                _register_temp_dir_for_atexit(td)
                 tmp_in = Path(td) / "in"
                 tmp_out = Path(td) / "out"
                 tmp_in.mkdir(parents=True, exist_ok=True)
@@ -1239,6 +1262,7 @@ def main():
     p.add_argument("--verbose", action="store_true", help="Print logging from underlying preprocessing.")
 
     args = p.parse_args()
+    _install_cli_stop_handlers()
 
     # Accept numeric strings (e.g. '3') or names (e.g. 'cubic') for --interp
     from .preprocessing_utils import _interp_to_scipy_order
@@ -1299,14 +1323,10 @@ def main():
 
 
 if __name__ == "__main__":
-    def _stop_cli_immediately(_signum, _frame):
-        print("\n[preprocess_brain_mris] Interrupted; stopping immediately.", flush=True)
-        os._exit(130)
-
-    signal.signal(signal.SIGINT, _stop_cli_immediately)
     try:
         main()
     except KeyboardInterrupt:
         # Keep a fallback for platforms where the signal handler cannot be
         # installed or a nested call restores the default handler.
+        _cleanup_registered_temp_dirs()
         os._exit(130)

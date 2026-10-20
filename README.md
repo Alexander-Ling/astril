@@ -260,6 +260,8 @@ options:
   --debug               Keep temp dirs from underlying preprocessing.
   --verbose             Print logging from underlying preprocessing.
 ```
+Unmasked (skull-on) intermediates are written to a scratch directory outside `--out_dir` (the system temp directory, or `$ASTRIL_SCRATCH_DIR` if set -- point it at a large drive if the system temp drive is small), so an interrupted or killed run can't leave identifiable images next to the skull-stripped outputs. Ctrl+C and SIGTERM delete the scratch directory before exiting; `.astril_tmp_*` folders left inside exam output folders by older versions are removed on the next run.
+
 ---
 #### Segment Brain MRIs
 [PRELIMINARY] astril currently has built in segmentation algorithms for brain MRIs for patients with glioblastoma. The algorithms are actively being refined following major changes to the preprocessing pipeline, and do not perform particularly well. This will change in the next week or two.

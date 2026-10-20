@@ -36,10 +36,13 @@ try:
 except Exception:
     tqdm = None
 
-# --- temp-dir leak prevention for dcm2niix conversions ---
+# --- temp-dir leak prevention (dcm2niix conversions, preprocessing scratch dirs) ---
 # Some call paths request an explicit output_path (so the converted NIfTI is immediately moved/copied
 # out of a dcm2niix temp folder). Historically, those temp folders were not removed, which can
 # accumulate and fill disks during large conversions.
+# Preprocessing scratch dirs (unmasked, face-containing intermediates) are registered here too, so
+# CLI signal handlers that must exit via os._exit (which skips atexit/finally) can still delete
+# them by calling _cleanup_registered_temp_dirs() first.
 _TEMP_DIRS_FOR_ATEXIT_CLEANUP: set[str] = set()
 _TEMP_DIRS_FOR_ATEXIT_LOCK = threading.Lock()
 
@@ -57,6 +60,16 @@ def _register_temp_dir_for_atexit(d: str, *, verbose=None) -> None:
         return
     with _TEMP_DIRS_FOR_ATEXIT_LOCK:
         _TEMP_DIRS_FOR_ATEXIT_CLEANUP.add(d)
+
+
+def _unregister_temp_dir_for_atexit(d: str) -> None:
+    """Forget a temp directory whose owner has already removed it."""
+    try:
+        d = os.path.abspath(d)
+    except Exception:
+        return
+    with _TEMP_DIRS_FOR_ATEXIT_LOCK:
+        _TEMP_DIRS_FOR_ATEXIT_CLEANUP.discard(d)
 
 
 def _cleanup_registered_temp_dirs() -> None:

@@ -12,6 +12,51 @@ import copy
 import tempfile
 import shutil
 import json
+from contextlib import contextmanager
+from pathlib import Path
+
+# Older astril versions put the unmasked scratch workspace inside output_dir with this prefix.
+_LEGACY_OUTPUT_TEMP_PREFIX = ".astril_tmp_"
+
+
+def _remove_stale_output_temp_dirs(output_dir) -> None:
+    """Delete `.astril_tmp_*` workspaces that interrupted runs left in output_dir.
+
+    They hold unmasked (face-containing) intermediates, so they must not linger next to
+    skull-stripped outputs that get shared or published.
+    """
+    try:
+        entries = list(os.scandir(output_dir))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name.startswith(_LEGACY_OUTPUT_TEMP_PREFIX) and entry.is_dir(follow_symlinks=False):
+            print(f"[preprocess_single_brain_mri] Removing stale temp workspace left by an interrupted run: {entry.path}")
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+@contextmanager
+def _unmasked_scratch_dir(output_dir):
+    """Temp workspace for unmasked intermediates, kept OUTSIDE output_dir.
+
+    os._exit, SIGKILL, or a scheduler killing the task skips TemporaryDirectory cleanup, so
+    anything here can outlive an interruption; it must never land in the output tree.
+    Location: $ASTRIL_SCRATCH_DIR if set (use it to pick a large drive), else the system temp
+    dir (which honors TMPDIR/TEMP/TMP).
+    """
+    from astril.preprocessing_utils import _register_temp_dir_for_atexit, _unregister_temp_dir_for_atexit
+
+    scratch_root = os.environ.get("ASTRIL_SCRATCH_DIR") or None
+    if scratch_root:
+        os.makedirs(scratch_root, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch_root, prefix="astril_tmp_") as temp_dir:
+        if Path(temp_dir).resolve().is_relative_to(Path(output_dir).resolve()):
+            print(f"[WARN] ASTRIL_SCRATCH_DIR is inside the output directory; unmasked intermediates may be left there if interrupted: {temp_dir}")
+        _register_temp_dir_for_atexit(temp_dir)
+        try:
+            yield temp_dir
+        finally:
+            _unregister_temp_dir_for_atexit(temp_dir)
 
 
 def _parse_triplet(value, *, cast=float, name="value"):
@@ -1815,6 +1860,9 @@ def preprocess_single_brain_mri(
     if anchor_label not in scans:
         raise RuntimeError(f"Anchor label '{anchor_label}' was removed during input preflight; cannot preprocess exam.")
 
+    # Before the skip check, so already-complete exams get cleaned too.
+    _remove_stale_output_temp_dirs(output_dir)
+
     # ------------------------------------------------------------------
     # Robust "skip if complete" behavior:
     # Only skip when *all* expected outputs for this run configuration exist.
@@ -1911,10 +1959,10 @@ def preprocess_single_brain_mri(
             verbose=verbose,
         )
     else:
-        # Use an output-local temp workspace so large intermediates are written to
-        # the destination volume the user chose, avoiding failures from a full
-        # system temp directory on a different drive.
-        with tempfile.TemporaryDirectory(dir=output_dir, prefix=".astril_tmp_") as temp_dir:
+        # Unmasked (skull-on) intermediates go to a scratch dir outside output_dir so an
+        # interrupted/killed run can never leave faces in the output tree. Set
+        # ASTRIL_SCRATCH_DIR to put scratch on a larger drive than the system temp dir.
+        with _unmasked_scratch_dir(output_dir) as temp_dir:
             run_preprocessing_pipeline(
                 scans=scans,
                 output_dir=output_dir,
