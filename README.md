@@ -57,33 +57,9 @@ inputs/outputs, and organization-index schema, see
 
 #### Format for radiology image inputs:
 astril is designed to perform image pre-processing and segmentation on NIFTI (.nii.gz) images. However, astril includes functionality to convert DICOM imaging datasets to NIFTI images and organize them into the folder structure expected by astril's processing functions.
-If starting from a set of DICOM images, they should be organized by patient, exam, radiology type, and sequence as in the following example:
-```
-DICOM_Library/
-├── Patient1/ 					{Patient}
-│   ├── Exam1/ 				    {Exam}
-|	|	├── MR/ 			    {Radiology Type}
-|	|	|	├── T1n/ 			{Sequence}
-|	|	|	|	├── 001.dcm
-|	|	|	|	├── 002.dcm
-|	|	|	|	├── ...
-|	|	|	├── T1c/
-|	|	|	|	├── 145.dcm
-|	|	|	|	├── 146.dcm
-|	|	|	|	├── ...
-|	|	|	├── ...
-|	|	├── ...
-|	├── Exam2/
-|	|	├── MR/ 
-|	|	|	├── T1n/
-|	|	|	|	├── 001.dcm
-|	|	|	|	├── 002.dcm
-|	|	|	|	├── ...
-|	|	|	├── ...
-|	|	├── ...
-│   ├── ...
-├── ...
-```
+
+If starting from a set of DICOM images, **no particular folder structure is required.** DICOM files can be nested in any arrangement (including mixed layouts across patients and files without a .dcm extension). astril identifies patients, exams, and series from the DICOM metadata (PatientID, StudyInstanceUID, and SeriesInstanceUID) rather than from folder names.
+
 If starting from a set of NIFTI images, they should be organized by patient, exam, and sequence as in the following example:
 ```
 NIFTI_Library/
@@ -97,25 +73,57 @@ NIFTI_Library/
 ```
 ---
 #### Convert DICOM library to NIFTI library
-1. (Optional) Ensure that all of the DICOM files for each series are properly separated into their respective directories. I have occasionally found that DICOM libraries can have misplaced dicom files such that a single series has been divided into multiple folders or such that dicom files from multiple series have been placed in the same folder. The following command will check that all dicom files are correctly separated. **Note: The .dcm files in your library must have meaningful SeriesInstanceUID or SeriesNumber, SeriesDescription, and ProtocolName metadata fields for this to work. If these fields have been stripped, this function will not work as intended and could scramble your library if used with the --in_place option.**
+The DICOM to NIFTI workflow is:
+```
+DICOM library (any structure)
+  └─ organize_dicoms ─────────────────► Organized DICOM library + DICOM index
+       └─ create_patient_metadata ────► Patient metadata table   (you fill in patientID and day0Date)
+            └─ plan_dicom_to_nifti_conversion ─► Conversion plan  (you review/edit)
+                 └─ convert_dicom_plan ────────► NIFTI library
+```
+The organized library and the DICOM index produced in step 1 are used by both step 2 and step 3. See [the preprocessing reference](docs/preprocessing_reference.md) for the full Python API and the DICOM index schema.
+
+1. Organize the DICOM library. This reads the metadata of every file under --dir (recursively) and copies each readable DICOM file into a normalized `Patient/Exam/Series` tree under --outDir. It also writes a DICOM index (one row per file) that the later steps use to find patients, exams, and series. The original library is not modified.
     ```
-    usage: python -m astril.preprocess demix_dicoms [-h] --dir DIR [--outDir OUTDIR] [--logOut LOGOUT] [--n_workers N_WORKERS] [--dryRun] [--in_place] [--noProgress]
+    usage: python -m astril.preprocess organize_dicoms [-h] --dir DIR --outDir OUTDIR --indexOut INDEXOUT [--quarantineDir QUARANTINEDIR] [--logOut LOGOUT] [--unresolvedOut UNRESOLVEDOUT] [--dryRun]
+                                                       [--n_workers N_WORKERS] [--noProgress]
 
     options:
       -h, --help            show this help message and exit
-      --dir DIR             Root directory containing patient/exam/MR folders with DICOM (.dcm) files. (default: None)
-      --outDir OUTDIR       Write a fully de-mixed COPY of --dir under this path (default: None)
-      --logOut LOGOUT       Optional path for move log (.csv|.tsv) (default: None)
+      --dir DIR             Source directory; source folder names are ignored for identity (default: None)
+      --outDir OUTDIR       Normalized output directory (default: None)
+      --indexOut INDEXOUT   Output index (.csv|.tsv) (default: None)
+      --quarantineDir QUARANTINEDIR
+                            Directory for files missing or conflicting required metadata (default: None)
+      --logOut LOGOUT       Optional copy of the complete organizer index (default: None)
+      --unresolvedOut UNRESOLVEDOUT
+                            Optional unresolved-file report (.csv|.tsv); defaults beside the index (default: None)
+      --dryRun              Read and index metadata without copying files (default: False)
       --n_workers N_WORKERS
-                            Threads for header reads/transfers (I/O bound) (default: 12)
-      --dryRun              Plan demix and write log, but do not move/copy files (default: False)
-      --in_place            Allow in-place moves inside --dir (no --outDir) (default: False)
+                            Threads for metadata reads and copies (default: None)
       --noProgress          Disable progress bar (default: False)
     ```
-2. Create a spreadsheet of patient-level metadata to help with organizing/deidentifying your dataset during NIFTI file conversion. A template patient metadata spreadsheet can be generated using the following function.
+    The organized library will look like this (the exact folder labels are generated from metadata; the index is the authoritative mapping back to the original files):
+    ```
+    Organized_DICOM/
+    ├── Patient_<PatientID>_<hash>/
+    |   ├── Exam_<StudyInstanceUID hash>/
+    |   |   ├── Series_<SeriesNumber>_<SeriesDescription>_<hash>/
+    |   |   |   ├── <DICOM files>
+    |   |   ├── ...
+    |   ├── ...
+    ├── _quarantine/
+    ├── ...
+    ```
+    - The index must be a .csv or .tsv file.
+    - Files that are unreadable, missing required identity metadata, or whose UIDs conflict with other files are copied to `_quarantine/` (or --quarantineDir) instead of the organized tree. These files, and any other files that were not organized cleanly, are listed in an unresolved-file report written next to the index as `<index name>_unresolved.csv`. Review this report after organizing.
+    - Because series are separated by SeriesInstanceUID, this step also separates DICOM files from different series that were stored in the same folder. The older `demix_dicoms` command is not needed for this workflow (see [the preprocessing reference](docs/preprocessing_reference.md)).
+    - **The organized folder names include the DICOM PatientID, which may be PHI.** The NIFTI library created in step 4 uses the patient IDs you assign in step 2 instead.
+
+2. Create a spreadsheet of patient-level metadata to help with organizing/deidentifying your dataset during NIFTI file conversion. Run this on the organized library from step 1 and pass the DICOM index with --index.
     ```
     usage: python -m astril.preprocess create_patient_metadata [-h] --dir DIR --metadataOut METADATAOUT [--previousMetadata [PREVIOUSMETADATA ...]] [--omitPrevious] [--subdirs SUBDIRS [SUBDIRS ...]]
-                                                           [--excludeEmpty] [--n_workers N_WORKERS]
+                                                               [--index INDEX] [--excludeEmpty] [--n_workers N_WORKERS]
 
     options:
       -h, --help            show this help message and exit
@@ -127,44 +135,49 @@ NIFTI_Library/
       --omitPrevious        Omit rows already present in previous tables (default: False)
       --subdirs SUBDIRS [SUBDIRS ...]
                             Subfolder names to search under each patient folder (default: ['MR'])
+      --index INDEX         Optional organize_dicoms() index; derive patient rows from DICOM metadata (default: None)
       --excludeEmpty        Drop patient folders with no DICOM series found (default: False)
       --n_workers N_WORKERS
                             Threads for scanning (I/O bound). Set 1 to disable. (default: None)
     ```
-    This will generate a metadata table with the following columns:
-    - **Directory:** The immediate subdirectory of --dir to which the metadata in a given row pertains. Remember, each of these directories should contain scans for only a single patient.
+    When --index is supplied, --dir should be the organized library from step 1, and --subdirs is not used. This will generate a metadata table with the following columns:
+    - **Directory:** The patient folder in the organized library (relative to --dir) to which the metadata in a given row pertains.
     - **patientID:** An arbitrary identifier that you will assign to this patient. This is the identifier that will be used when DICOM files are converted to NIFTI files.
-    - **patientName:** The name of the patient as extracted from the DICOM metadata.
+    - **patientName:** The name of the patient as extracted from the DICOM metadata. If more than one name occurs in a patient folder, they are listed together separated by `; `.
     - **dicomPatientID:** The patientID for this patient as extracted from the DICOM metadata.
     - **day0Date:** A date (mm/dd/yyyy) that should be used as day 0 when organizing scans by timepoint.
+
+    You must fill in **patientID** and **day0Date** before the next step. Rows missing either value are skipped during conversion planning.
 
     <u>Example of an Incomplete Table</u>
     |Directory|patientID|patientName|dicomPatientID|day0Date|
      |-|-|-|-|-|
-     |Patient1| |Jane Doe|1234567||
-     |Patient2| |John Doe|7654321||
+     |Patient_1234567_3f9a1c2b7d| |jane doe|1234567||
+     |Patient_7654321_a81e04c6f2| |john doe|7654321||
 
     <u>Example of a Completed Table</u>
     |Directory|patientID|patientName|dicomPatientID|day0Date|
      |-|-|-|-|-|
-     |Patient1|Subject1|Jane Doe|1234567|01/21/1900|
-     |Patient2|Subject2|John Doe|7654321|01/22/1900|
+     |Patient_1234567_3f9a1c2b7d|Subject1|jane doe|1234567|01/21/1900|
+     |Patient_7654321_a81e04c6f2|Subject2|john doe|7654321|01/22/1900|
 
-     Note: If you load the patient metadata table into Excel to edit it, **do not** permit excel to perform data conversion. Data conversion could remove leading 0's on directory names that start with 0, causing the directories listed in the table to no longer match the actual directory names.
+     Note: If you load the patient metadata table into Excel to edit it, **do not** permit excel to perform data conversion. Data conversion can alter values in the Directory column (for example, by removing leading 0's), causing the directories listed in the table to no longer match the actual directory names.
 
- 3. Create a DICOM to NIFTI conversion plan by identifying DICOM series types and identifying where the converted scans will be stored and how they will be named.
+ 3. Create a DICOM to NIFTI conversion plan by identifying DICOM series types and identifying where the converted scans will be stored and how they will be named. --dir must be the organized library from step 1, and --dicomIndex must be the index from step 1.
      ```
-     usage: python -m astril.preprocess plan_dicom_to_nifti_conversion [-h] --patientMetadata PATIENTMETADATA --dir DIR --outDir OUTDIR --planOut PLANOUT [--n_workers N_WORKERS] [--noProgress]
-                                                                  [--previousPlan [PREVIOUSPLAN ...]] [--ignorePrevious] [--minSlices MINSLICES] [--use_actual_exam_ids]
-                                                                  [--add_missing_derived] [--make_derived_from_scratch] [--unexpectedMultiframePolicy {keep_first,skip}]
+     usage: python -m astril.preprocess plan_dicom_to_nifti_conversion [-h] --patientMetadata PATIENTMETADATA --dir DIR --dicomIndex DICOMINDEX --outDir OUTDIR --planOut PLANOUT [--n_workers N_WORKERS]
+                                                                       [--noProgress] [--previousPlan [PREVIOUSPLAN ...]] [--ignorePrevious] [--minSlices MINSLICES] [--use_actual_exam_ids]
+                                                                       [--add_missing_derived] [--make_derived_from_scratch] [--unexpectedMultiframePolicy {keep_first,skip}]
 
     options:
       -h, --help            show this help message and exit
       --patientMetadata PATIENTMETADATA
                             Table from create_patient_metadata() (filled in) (default: None)
       --dir DIR             Root DICOM directory; must contain subfolders in 'Directory' column (default: None)
+      --dicomIndex DICOMINDEX
+                            CSV/TSV index produced by organize_dicoms() (default: None)
       --outDir OUTDIR       Planned destination root for converted files (default: None)
-      --planOut PLANOUT     Where to write the plan (.csv|.tsv|.xlsx). .csv|.tsv files will be streamed; .xlsx files will only write after function is complete. (default: None)
+      --planOut PLANOUT     Where to write the plan (.csv|.tsv) (default: None)
       --n_workers N_WORKERS
                             Threads per exam (I/O bound) (default: None)
       --noProgress          Disable progress bar (default: False)
@@ -182,15 +195,15 @@ NIFTI_Library/
       --unexpectedMultiframePolicy {keep_first,skip}
                             What to do if a sequence expected to be single-frame/3D converts to multi-frame/4D. keep_first = keep frame 0 (warn); skip = skip conversion (warn). (default: keep_first)
     ```
-    This will generate a table which lists all of the scan series present in --dir along with the patient, timepoint, and inferred scan type (i.e. T1c, T1n, etc.) assocaited with them. After this file has been created, you can manually inspect and edit it to ensure that all desired series will be converted and correctly named in the next step. The columns relevant to conversion in the next step are:
+    This will generate a table which lists all of the scan series in the organized library along with the patient, timepoint, and inferred scan type (i.e. T1c, T1n, etc.) associated with them. After this file has been created, **manually inspect and edit it** to ensure that all desired series will be converted and correctly named in the next step. The columns relevant to conversion in the next step are:
     - selected_for_conversion
     - proposed_nifti_path
 
     All scans selected for conversion with a valid proposed_nifti_path will be converted to that path. The proposed file names are constructed to follow the format `{outDir}/{patientID}/{patientID}_{timepoint_days}_{ExamAlias}/{patientID}_{timepoint_days}_{final_label}.nii.gz`. This is the format astril will expect NIFTI libraries to be in for downstream segmentation/algorithm training.
 
-4. Convert DICOM image library to a NIFTI image library.
+4. Convert DICOM image library to a NIFTI image library. The plan is the only required input; it already records where each series is stored in the organized library.
     ```
-    usage: python -m astril.preprocess convert_dicom_plan [-h] --plan PLAN [--n_workers N_WORKERS] [--overwrite] [--logOut LOGOUT] [--unexpectedMultiframePolicy {keep_first,skip}]
+    usage: python -m astril.preprocess convert_dicom_plan [-h] --plan PLAN [--n_workers N_WORKERS] [--overwrite] [--logOut LOGOUT] [--unexpectedMultiframePolicy {keep_first,skip}] [--debug]
 
     options:
       -h, --help            show this help message and exit
@@ -201,9 +214,35 @@ NIFTI_Library/
       --logOut LOGOUT       Optional CSV/TSV log path for results. (default: None)
       --unexpectedMultiframePolicy {keep_first,skip}
                             What to do if a sequence expected to be single-frame/3D converts to multi-frame/4D. keep_first = keep frame 0 (warn); skip = skip conversion (warn). (default: keep_first)
+      --debug               Print debug statements. (default: False)
     ```
 
     This will use the conversion plan created in the last step to actually convert the files to a NIFTI library, ready for downstream processing and segmentation.
+
+Example command sequence (PowerShell):
+```powershell
+python -m astril.preprocess organize_dicoms `
+  --dir D:\DICOM_Library `
+  --outDir D:\Organized_DICOM `
+  --indexOut D:\Organized_DICOM\dicom_index.csv
+
+python -m astril.preprocess create_patient_metadata `
+  --dir D:\Organized_DICOM `
+  --index D:\Organized_DICOM\dicom_index.csv `
+  --metadataOut D:\Organized_DICOM\patient_metadata.csv
+
+# Fill in patientID and day0Date in patient_metadata.csv, then:
+python -m astril.preprocess plan_dicom_to_nifti_conversion `
+  --patientMetadata D:\Organized_DICOM\patient_metadata.csv `
+  --dir D:\Organized_DICOM `
+  --dicomIndex D:\Organized_DICOM\dicom_index.csv `
+  --outDir D:\NIFTI_Library `
+  --planOut D:\Organized_DICOM\conversion_plan.csv
+
+# Review selected_for_conversion and proposed_nifti_path in conversion_plan.csv, then:
+python -m astril.preprocess convert_dicom_plan `
+  --plan D:\Organized_DICOM\conversion_plan.csv
+```
 ---
 #### Perform image pre-processing on NIFTI library
 Currently, the only preprocessing pipeline implemetned in astril is for brain MRI exams. This pipeline co-registers all identified MRI series for a given patient to a common reference series, resamples to a common data shape, skull-strips, and normalizes. The resulting pre-processed output folder should be fully de-identified (no guarantee -- you are responsible for verifying this to ensure no PHI is leaked) and fully ready for use with segmentation pipelines.

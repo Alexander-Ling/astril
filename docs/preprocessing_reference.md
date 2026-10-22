@@ -7,15 +7,28 @@ functions. The command-line interface exposes the same functions through
 The metadata-indexed workflow is:
 
 ```text
-organize_dicoms -> demix_dicoms (optional) -> create_patient_metadata (optional)
-                 -> plan_dicom_to_nifti_conversion
+DICOM library (any structure)
+  -> organize_dicoms                 -> organized DICOM library + DICOM index
+  -> create_patient_metadata         -> patient metadata table (user fills in patientID, day0Date)
+  -> plan_dicom_to_nifti_conversion  -> conversion plan (user reviews/edits)
+  -> convert_dicom_plan              -> NIfTI library
 ```
 
-`organize_dicoms` is the preferred entry point for a library whose input
-folders may not use a consistent naming convention. It reads DICOM metadata
-recursively and creates a normalized Patient/Exam/Series tree. Downstream
-functions can then use the generated index instead of inferring identity from
-folder names.
+`organize_dicoms` is the entry point for every DICOM library. It reads DICOM
+metadata recursively and creates a normalized Patient/Exam/Series tree, so the
+input folders do not need to follow any naming or nesting convention.
+Downstream functions use the generated index instead of inferring identity
+from folder names.
+
+The organized library and the DICOM index are inputs to both
+`create_patient_metadata` and `plan_dicom_to_nifti_conversion`. The planner
+requires a patient metadata table with `Directory`, `patientID`, and
+`day0Date` columns; `create_patient_metadata` is the supported way to produce
+one. `convert_dicom_plan` reads only the plan, which records the source series
+folder for each conversion.
+
+`demix_dicoms` is a legacy cleanup step and is not part of this workflow; see
+[`demix_dicoms`](#demix_dicoms) below.
 
 ## `organize_dicoms`
 
@@ -31,7 +44,10 @@ Patient, exam, and series identity are metadata-based:
 - Series: `SeriesInstanceUID` (with a deterministic fallback when absent)
 
 The input may be nested differently for different patients and may contain
-suffixless DICOM files. Existing destination files are not overwritten:
+suffixless DICOM files. Because files are routed by `SeriesInstanceUID`, files
+from different series that share a source folder are separated, and files from
+one series that are split across source folders are combined. The source
+library is never modified. Existing destination files are not overwritten:
 identical files are skipped and conflicting files are recorded as conflicts.
 
 ### Python API
@@ -41,39 +57,66 @@ organize_dicoms(
     root_dir: str,
     out_dir: str,
     index_out: str | None = None,
-    n_workers: int | None = None,
-    show_progress: bool = True,
+    quarantine_dir: str | None = None,
+    log_out: str | None = None,
     unresolved_out: str | None = None,
+    dry_run: bool = False,
+    show_progress: bool = True,
+    n_workers: int | None = None,
 )
 ```
 
 `root_dir` is the source library. `out_dir` is the normalized output root.
-`index_out` writes the organization index as CSV or TSV. CSV/TSV are required
-for scalable indexed processing; XLSX is not supported for the organization
-index. If supplied,
-the default unresolved report is written beside it as
-`<index stem>_unresolved.csv`; otherwise it is written beneath `out_dir` as
-`unresolved_dicom_report.csv`. `n_workers` controls metadata reads and
-copying, and `show_progress` controls progress display.
+`index_out` writes the organization index and must be a CSV or TSV path; XLSX
+is not supported for the organization index. The CLI requires `--indexOut`,
+and the downstream functions cannot run without it.
 
-The function returns the generated organization records for programmatic
-callers. A Ctrl+C interruption is handled cooperatively: completed records
-and the unresolved report are preserved when possible.
+`quarantine_dir` receives files that are unreadable, missing required identity
+metadata, or have UID conflicts; it defaults to `out_dir/_quarantine`.
+Quarantined files keep their path relative to `root_dir`.
+
+`unresolved_out` sets the unresolved-file report path. By default the report is
+written beside the index as `<index stem>_unresolved.csv`, or beneath `out_dir`
+as `unresolved_dicom_report.csv` when no index path is given. `log_out` writes
+an additional CSV copy of the complete index.
+
+`dry_run=True` reads metadata and writes the index without copying files.
+Dry-run rows have status `planned`, which the downstream functions do not
+accept, so rerun without `dry_run` before continuing.
+
+`n_workers` controls metadata reads and copying, and `show_progress` controls
+progress display.
+
+The function returns the generated organization records as a pandas DataFrame.
+A Ctrl+C interruption is handled cooperatively: completed records and the
+unresolved report are preserved when possible.
+
+### CLI
+
+```text
+python -m astril.preprocess organize_dicoms --dir DIR --outDir OUTDIR --indexOut INDEXOUT
+    [--quarantineDir QUARANTINEDIR] [--logOut LOGOUT] [--unresolvedOut UNRESOLVEDOUT]
+    [--dryRun] [--n_workers N_WORKERS] [--noProgress]
+```
 
 ### Normalized output
 
-The destination uses the following logical structure:
+The destination uses the following structure:
 
 ```text
 out_dir/
-  Patient_<patient key>/
-    Exam_<StudyInstanceUID key>/
-      <sequence or series label>/
+  Patient_<PatientID>_<hash>/
+    Exam_<StudyInstanceUID hash>/
+      Series_<SeriesNumber>_<SeriesDescription>_<SeriesInstanceUID hash>/
         DICOM files
+  _quarantine/
+    <source-relative paths of quarantined files>
 ```
 
 The exact filesystem-safe labels are implementation details; the index is the
-authoritative mapping back to source files.
+authoritative mapping back to source files. Patient folder names include the
+DICOM `PatientID`, which may be PHI. NIfTI outputs use the `patientID` values
+assigned in the patient metadata table instead.
 
 ### Organization index columns
 
@@ -101,23 +144,29 @@ authoritative mapping back to source files.
 | `acq_dt_iso` | Acquisition date/time in ISO-like form, when available. |
 | `sequence_name` | DICOM sequence name. |
 | `image_type` | DICOM `ImageType` values, serialized with semicolon separators. |
+| `imgtype_flags` | Normalized image-type flags used by series classification. |
 | `echo_time` | Echo time. |
 | `repetition_time` | Repetition time. |
 | `inversion_time` | Inversion time. |
 | `flip_angle` | Flip angle. |
 | `b_value` | Diffusion b-value. |
 | `primary_secondary` | `PRIMARY`, `SECONDARY`, or empty based on `ImageType`. |
+| `is_fspgr` | Whether the series looks like an FSPGR acquisition. |
+| `plane` | Acquisition plane inferred from series text or image orientation. |
 | `rows_px`, `cols_px` | Image matrix dimensions. |
 | `pixel_spacing` | DICOM pixel-spacing values. |
-| `slice_thickness` | Slice thickness. |
-| `spacing_between_slices` | Spacing between slices. |
+| `pixdim_row_mm`, `pixdim_col_mm` | In-plane pixel spacing in millimeters. |
+| `slice_thickness_mm` | Slice thickness in millimeters. |
+| `spacing_between_slices_mm`, `spacing_between_slices` | Spacing between slices (parsed millimeters and raw DICOM value). |
+| `z_spacing_mm` | Through-plane spacing: spacing between slices, or slice thickness when absent. |
+| `n_slices_per_vol_est` | Estimated number of slices per volume. |
 | `num_frames` | Number of frames, when present. |
 | `images_in_acq`, `locations_in_acq` | DICOM acquisition/location counts. |
 | `mr_acq_type` | MR acquisition type. |
 | `pulse_sequence_name`, `scanning_sequence`, `sequence_variant`, `scan_options` | Vendor and sequence descriptors. |
 | `acquisition_contrast`, `contrast_agent`, `contrast_volume` | Contrast metadata. |
 | `study_description`, `procedure_step_description` | Study/procedure descriptions. |
-| `status` | Organization result, such as success, skipped, conflict, or unresolved. |
+| `status` | Organization result; see the status values below. |
 | `error` | Error or diagnostic message for non-success records. |
 
 The index can contain one row per DICOM file. A series may therefore have many
@@ -125,39 +174,24 @@ rows, while all rows for one `StudyInstanceUID` map to the same exam directory.
 The expanded fields are the raw inputs needed by series classification; the
 planner aggregates these rows into one classifier record per series.
 
+### Status values
+
+| `status` | Meaning | Used downstream |
+|---|---|---|
+| `copied` | File was copied into the organized tree. | Yes |
+| `skipped_existing` | An identical file already existed at the destination. | Yes |
+| `duplicate_sop` | The same SOP Instance UID occurred more than once; one copy is retained. | Yes |
+| `planned` | Dry run only; the file would have been copied. | No |
+| `quarantined` | File was unreadable, missing identity metadata, or had a UID conflict; see `error`. | No |
+| `conflict` | A different file already existed at the destination. | No |
+
 ### Unresolved-file report
 
 The unresolved report is a filtered copy of the organization records containing
-non-success statuses or a nonempty `error`. It is intended for triage and
-reruns. It retains source paths and all available DICOM context, so unresolved
-files can be investigated without relying on the original folder layout.
-
-## `demix_dicoms`
-
-### Purpose
-
-Separate files that were placed in the wrong series directory by examining
-series-related DICOM metadata. This is an optional legacy cleanup step.
-
-### Python API
-
-```python
-demix_dicoms(
-    dir: str,
-    out_dir: str | None = None,
-    log_out: str | None = None,
-    n_workers: int = 12,
-    dry_run: bool = False,
-    in_place: bool = False,
-    show_progress: bool = True,
-)
-```
-
-Use `out_dir` for a de-mixed copy. In-place moves require explicit
-`in_place=True`. This function expects the legacy patient/exam/series-style
-layout closely enough to identify the series directories; it is not the
-metadata-indexed entry point. Prefer `organize_dicoms` when the input layout is
-unknown or inconsistent.
+statuses other than `copied`, `skipped_existing`, or `planned`, or a nonempty
+`error`. It is intended for triage and reruns. It retains source paths and all
+available DICOM context, so unresolved files can be investigated without
+relying on the original folder layout.
 
 ## `create_patient_metadata`
 
@@ -171,31 +205,60 @@ reference dates before conversion planning.
 ```python
 create_patient_metadata(
     root_dir: str,
-    metadata_out: str,
-    previous_metadata: list[str] | None = None,
+    out_path: str,
+    previous_paths: list[str] | None = None,
     omit_previous: bool = False,
     subdirs: list[str] | None = None,
     exclude_empty: bool = False,
+    show_progress: bool = True,
     n_workers: int | None = None,
-    dicom_index: str,
+    index_path: str | None = None,
 )
 ```
 
-With `dicom_index`, patient rows are grouped by normalized patient directory,
-not by individual `patientName` values. If multiple names occur in one
-directory, they are combined into one `patientName` value separated by `; `.
+For the indexed workflow, pass the organized library from `organize_dicoms` as
+`root_dir` and its index as `index_path` (`--index` on the CLI). Patient rows
+are then grouped by organized patient directory, and `subdirs` is not used.
+If multiple names or DICOM patient IDs occur in one directory, they are
+combined into one value separated by `; `.
 
-The output table contains the patient directory, assigned patient ID, DICOM
-patient ID/name, and the day-zero date used for timepoint calculation. The
-exact output column names are preserved by the selected CSV, TSV, or XLSX
-writer and should be treated as the input contract for the planner.
+Without `index_path`, the function falls back to the legacy folder scan, which
+expects `{Patient}/.../MR/{series}` folders (configurable with `subdirs`). That
+mode does not work on the organized tree.
+
+`previous_paths` prefills `patientID` and `day0Date` from earlier tables with
+matching `Directory` values; `omit_previous=True` drops those rows instead.
+
+### CLI
+
+```text
+python -m astril.preprocess create_patient_metadata --dir DIR --metadataOut METADATAOUT
+    [--index INDEX] [--previousMetadata [PREVIOUSMETADATA ...]] [--omitPrevious]
+    [--subdirs SUBDIRS [SUBDIRS ...]] [--excludeEmpty] [--n_workers N_WORKERS]
+```
+
+### Output
+
+The table (CSV, TSV, or XLSX) has these columns:
+
+| Column | Meaning |
+|---|---|
+| `Directory` | Patient folder relative to `root_dir`. Must match an existing folder. |
+| `patientID` | User-assigned identifier used in NIfTI output paths. Blank unless prefilled. |
+| `patientName` | Lowercased DICOM patient name(s). |
+| `dicomPatientID` | Lowercased DICOM patient ID(s). |
+| `day0Date` | User-assigned reference date (mm/dd/yyyy) for timepoint calculation. Blank unless prefilled. |
+
+Users must fill in `patientID` and `day0Date`. The planner skips rows missing
+either value. If you edit the table in Excel, disable automatic data
+conversion so `Directory` values are not altered.
 
 ## `plan_dicom_to_nifti_conversion`
 
 ### Purpose
 
-Inspect DICOM series, associate them with patient metadata, infer conversion
-labels, and produce an editable DICOM-to-NIfTI conversion plan.
+Associate indexed DICOM series with patient metadata, infer conversion labels,
+and produce an editable DICOM-to-NIfTI conversion plan.
 
 ### Python API
 
@@ -223,14 +286,96 @@ Pass the organization index with `dicom_index` and the organized root with
 folder-based DICOM discovery. Do not use the removed legacy `--mrSubdirs`
 option. The planner uses the index to select organized series and performs no
 DICOM reads; the patient metadata table supplies assigned patient IDs and
-day-zero dates. `plan_out` is required and must be a CSV or TSV path.
+day-zero dates. `plan_out` is required and must be a CSV or TSV path. Only
+index rows with status `copied`, `skipped_existing`, or `duplicate_sop` are
+planned.
 
 The generated plan includes the discovered DICOM-series metadata and the
 conversion decisions, especially `selected_for_conversion` and
-`proposed_nifti_path`. Only selected rows with valid proposed paths are
-intended for conversion. The Python function returns a summary dictionary
-with `plan_out`, `n_exams`, `n_series`, `n_selected`, `n_derived`, and
-`n_errors`; it does not return the complete plan table.
+`proposed_nifti_path`. Review and edit these columns before conversion; only
+selected rows with valid proposed paths are converted. Proposed paths follow
+`{out_dir}/{patientID}/{patientID}_{timepoint_days}_{ExamAlias}/{patientID}_{timepoint_days}_{final_label}.nii.gz`.
+
+The Python function returns a summary dictionary with `plan_out`, `n_exams`,
+`n_series`, `n_selected`, `n_derived`, and `n_errors`; it does not return the
+complete plan table.
+
+### CLI
+
+```text
+python -m astril.preprocess plan_dicom_to_nifti_conversion --patientMetadata PATIENTMETADATA
+    --dir DIR --dicomIndex DICOMINDEX --outDir OUTDIR --planOut PLANOUT
+    [--n_workers N_WORKERS] [--noProgress] [--previousPlan [PREVIOUSPLAN ...]]
+    [--ignorePrevious] [--minSlices MINSLICES] [--use_actual_exam_ids]
+    [--add_missing_derived] [--make_derived_from_scratch]
+    [--unexpectedMultiframePolicy {keep_first,skip}]
+```
+
+## `convert_dicom_plan`
+
+### Purpose
+
+Run the conversions described by a reviewed plan.
+
+### Python API
+
+```python
+convert_dicom_plan(
+    plan_path: str,
+    n_workers: int | None = None,
+    overwrite: bool = False,
+    log_out: str | None = None,
+    show_progress: bool = True,
+    unexpected_multiframe_policy: str = "keep_first",
+    debug: bool = False,
+)
+```
+
+The plan is the only data input; it records the source series folder and
+target path for each row. Rows are converted when `selected_for_conversion` is
+true and `proposed_nifti_path` is non-empty and not `-`. `CONVERT` rows run
+before `DERIVE` rows. Existing outputs are kept unless `overwrite=True`.
+
+`unexpected_multiframe_policy` controls series expected to be 3D that convert
+to multi-frame/4D: `keep_first` keeps frame 0 with a warning, and `skip`
+deletes the output with a warning. A per-row CSV/TSV log is streamed to
+`log_out`, and the function returns the log as a pandas DataFrame.
+
+### CLI
+
+```text
+python -m astril.preprocess convert_dicom_plan --plan PLAN [--n_workers N_WORKERS]
+    [--overwrite] [--logOut LOGOUT] [--unexpectedMultiframePolicy {keep_first,skip}] [--debug]
+```
+
+## `demix_dicoms`
+
+### Purpose
+
+Separate files that were placed in the wrong series directory by examining
+series-related DICOM metadata. This is a legacy cleanup step and is not needed
+in the indexed workflow, because `organize_dicoms` already routes files by
+`SeriesInstanceUID`.
+
+### Python API
+
+```python
+demix_dicoms(
+    root_dir: str,
+    show_progress: bool = True,
+    log_out: str | None = None,
+    out_dir: str | None = None,
+    dry_run: bool = False,
+    n_workers: int | None = None,
+    in_place: bool = False,
+)
+```
+
+Use `out_dir` for a de-mixed copy. In-place moves require explicit
+`in_place=True`. This function expects the legacy patient/exam/series-style
+layout closely enough to identify the series directories; it is not the
+metadata-indexed entry point. Use `organize_dicoms` when the input layout is
+unknown or inconsistent.
 
 ## Recommended indexed command sequence
 
@@ -240,15 +385,24 @@ python -m astril.preprocess organize_dicoms `
   --outDir D:\Organized_DICOM `
   --indexOut D:\Organized_DICOM\dicom_index.csv
 
+# Review D:\Organized_DICOM\dicom_index_unresolved.csv for quarantined or conflicting files.
+
 python -m astril.preprocess create_patient_metadata `
   --dir D:\Organized_DICOM `
-  --metadataOut D:\Organized_DICOM\patient_metadata.csv `
-  --dicomIndex D:\Organized_DICOM\dicom_index.csv
+  --index D:\Organized_DICOM\dicom_index.csv `
+  --metadataOut D:\Organized_DICOM\patient_metadata.csv
+
+# Fill in patientID and day0Date in patient_metadata.csv.
 
 python -m astril.preprocess plan_dicom_to_nifti_conversion `
   --patientMetadata D:\Organized_DICOM\patient_metadata.csv `
   --dir D:\Organized_DICOM `
+  --dicomIndex D:\Organized_DICOM\dicom_index.csv `
   --outDir D:\NIFTI_Library `
-  --planOut D:\Organized_DICOM\conversion_plan.csv `
-  --dicomIndex D:\Organized_DICOM\dicom_index.csv
+  --planOut D:\Organized_DICOM\conversion_plan.csv
+
+# Review selected_for_conversion and proposed_nifti_path in conversion_plan.csv.
+
+python -m astril.preprocess convert_dicom_plan `
+  --plan D:\Organized_DICOM\conversion_plan.csv
 ```
