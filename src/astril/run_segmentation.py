@@ -302,6 +302,7 @@ def run_segmentation(
     foreground_probability_suffix="_foreground_probability.nii.gz",
     save_class_probabilities=False,
     class_probability_suffix_template="_class{class_index}_probability.nii.gz",
+    slice_overlap_mode="average",
 ):
     import numpy as np
     import nibabel as nib
@@ -310,6 +311,7 @@ def run_segmentation(
     from .data_loading import (
         read_paths_from_file,
         load_val_data,
+        reassemble_window_predictions,
         ValDataGenerator,
         undo_all_transforms,
         apply_inverse_canonical_4d,
@@ -532,6 +534,7 @@ def run_segmentation(
                 target_width=min_HW,
                 brainiac_paths_list=brainiac_encoder_paths_list if model_uses_brainiac_fusion else None,
                 append_modality_presence=model_uses_presence,
+                slice_overlap_mode=slice_overlap_mode,
             )
             if model_uses_brainiac_fusion:
                 (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
@@ -574,19 +577,9 @@ def run_segmentation(
                 reoriented_4d = reassembled_4d
             else:
                 all_preds = np.concatenate(all_preds, axis=0)
-                (Hpw, Wpw, Dpw) = mask_info['post_alignment_shape']
-                reassembled_4d = np.zeros((Hpw, Wpw, Dpw, n_cls), dtype=np.float32)
-                half_out = out_sl // 2
-                start_out = -half_out
-                end_out = start_out + out_sl
-
-                for i_slice in range(len(X_data)):
-                    z_center = z_indices[i_slice]
-                    slice_pred = all_preds[i_slice]
-                    for oi, offset in enumerate(range(start_out, end_out)):
-                        z_out = z_center + offset
-                        if 0 <= z_out < Dpw:
-                            reassembled_4d[..., z_out, :] = slice_pred[..., oi, :]
+                reassembled_4d = reassemble_window_predictions(
+                    all_preds, z_indices, out_sl, mask_info['post_alignment_shape']
+                )
 
                 unaligned_4d = undo_all_transforms(reassembled_4d, mask_info)
                 if 'transform_from_canonical' in mask_info and mask_info['transform_from_canonical'] is not None:
@@ -688,6 +681,9 @@ def main():
                         help="With average-probability merging, write one probability NIfTI per class.")
     parser.add_argument("--class_probability_suffix_template", default="_class{class_index}_probability.nii.gz",
                         help="Filename suffix template for --save_class_probabilities.")
+    parser.add_argument("--slice_overlap_mode", choices=["average", "tile"], default="average",
+                        help="'average' (default): one 2.5D window per slice, overlapping outputs averaged. "
+                             "'tile': non-overlapping output windows (faster).")
 
     args = parser.parse_args()
     if args.use_cpu:
@@ -703,6 +699,7 @@ def main():
         foreground_probability_suffix=args.foreground_probability_suffix,
         save_class_probabilities=args.save_class_probabilities,
         class_probability_suffix_template=args.class_probability_suffix_template,
+        slice_overlap_mode=args.slice_overlap_mode,
     )
 
 if __name__ == "__main__":

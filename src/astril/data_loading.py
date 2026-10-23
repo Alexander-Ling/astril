@@ -475,6 +475,61 @@ def apply_inverse_canonical_4d(prob_4d, transform_from_canonical):
     return reoriented
 
 # -------------------------------------------------
+# 2.5D window placement + reassembly (inference)
+# -------------------------------------------------
+# "average": one window per in-mask slice; each slice is predicted by up to
+#            num_output_slices overlapping windows and those predictions are averaged.
+# "tile":    windows are spaced num_output_slices apart so their outputs tile the
+#            volume (~1/num_output_slices of the forward passes).
+SLICE_OVERLAP_MODES = ("average", "tile")
+
+
+def select_window_centers(relevant_z_indices, num_output_slices, slice_overlap_mode="average"):
+    """Choose the 2.5D window centers that cover every relevant slice."""
+    if slice_overlap_mode not in SLICE_OVERLAP_MODES:
+        raise ValueError(
+            f"slice_overlap_mode must be one of {SLICE_OVERLAP_MODES}; got {slice_overlap_mode!r}."
+        )
+    relevant = sorted(int(z) for z in relevant_z_indices)
+    if slice_overlap_mode == "average" or num_output_slices <= 1 or not relevant:
+        return relevant
+
+    half_out = num_output_slices // 2
+    last = relevant[-1]
+    centers = []
+    covered_through = -1
+    for z in relevant:
+        if z <= covered_through:
+            continue
+        # Place z in the window's first output slot; clamp so the input window never
+        # extends past the last relevant slice (the final window overlaps instead).
+        center = min(z + half_out, last)
+        centers.append(center)
+        covered_through = center - half_out + num_output_slices - 1
+    return centers
+
+
+def reassemble_window_predictions(predictions, z_indices, num_output_slices, volume_shape):
+    """
+    Place per-window predictions (N, H, W, num_output_slices, C) back into an
+    (H, W, D, C) volume, averaging wherever windows overlap.
+    """
+    height, width, depth = volume_shape
+    num_classes = predictions.shape[-1]
+    summed = np.zeros((height, width, depth, num_classes), dtype=np.float32)
+    counts = np.zeros(depth, dtype=np.float32)
+    start_out = -(num_output_slices // 2)
+    for window_pred, z_center in zip(predictions, z_indices):
+        for oi in range(num_output_slices):
+            z_out = z_center + start_out + oi
+            if 0 <= z_out < depth:
+                summed[:, :, z_out, :] += window_pred[:, :, oi, :]
+                counts[z_out] += 1
+    covered = counts > 0
+    summed[:, :, covered, :] /= counts[covered][:, None]
+    return summed
+
+# -------------------------------------------------
 # Helper functions (class presence checks, etc.)
 # -------------------------------------------------
 def slice_has_all_classes(slice_array, required_classes):
@@ -526,10 +581,13 @@ def load_val_slices(
     target_width=minimum_height_width,
     brainiac_paths_list=None,
     append_modality_presence=False,
+    slice_overlap_mode="average",
 ):
     """
     Load all 2.5D slices from the scan at index `idx` (without augmentation),
-    exactly as done in training/validation. 
+    exactly as done in training/validation.
+    slice_overlap_mode: "average" builds one window per in-mask slice; "tile" spaces
+      windows num_output_slices apart (see select_window_centers).
     Returns:
       X_scan_data, y_scan_data, mask_scan_data, z_indices_used,
       [optional] mask_transform_info (for orientation inversion, etc.)
@@ -591,6 +649,9 @@ def load_val_slices(
 
     # Identify relevant slices (mask > 0)
     relevant_z_indices = np.where(np.any(mask_data > 0, axis=(0,1)))[0]
+    window_centers = select_window_centers(
+        relevant_z_indices, num_output_slices, slice_overlap_mode
+    )
 
     X_scan_data = []
     B_scan_data = []
@@ -603,7 +664,7 @@ def load_val_slices(
     start_out = -half_out
     end_out   = start_out + num_output_slices
 
-    for z_center in relevant_z_indices:
+    for z_center in window_centers:
         # (A) Build input window
         input_slices = []
         for offset in range(start_in, end_in):

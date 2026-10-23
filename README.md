@@ -305,11 +305,15 @@ Unmasked (skull-on) intermediates are written to a scratch directory outside `--
 #### Segment Brain MRIs
 [PRELIMINARY] astril currently has built in segmentation algorithms for brain MRIs for patients with glioblastoma. The algorithms are actively being refined following major changes to the preprocessing pipeline, and do not perform particularly well. This will change in the next week or two.
 
-Segmentation can be applied to preprocess brain MRIs by applying the following function to the output folder produced by python -m astril.preprocess_brain_mris. Note that you will need to run "astril-download-models" before the first time you perform segmentations with astril.
+Segmentation can be applied to preprocess brain MRIs by applying the following function to the output folder produced by python -m astril.preprocess_brain_mris (installed console script: `segment-gbm`). Note that you will need to run "astril-download-models" before the first time you perform segmentations with astril.
 ```
-usage: python -m astril.segment_GBM [-h] [--slice_batch_size SLICE_BATCH_SIZE] [--n_threads N_THREADS] [--overwrite_existing_outputs] [--channel_patterns CHANNEL_PATTERNS [CHANNEL_PATTERNS ...]] [--brainmask_pattern BRAINMASK_PATTERN] [--segment_suffix SEGMENT_SUFFIX] input_directory
+usage: python -m astril.segment_GBM [-h] [--slice_batch_size SLICE_BATCH_SIZE] [--n_threads N_THREADS] [--overwrite_existing_outputs] [--channel_patterns CHANNEL_PATTERNS [CHANNEL_PATTERNS ...]]
+                                    [--brainmask_pattern BRAINMASK_PATTERN] [--segment_suffix SEGMENT_SUFFIX] [--optional_channels [OPTIONAL_CHANNELS ...]] [--slice_overlap_mode {average,tile}]
+                                    input_directory
 
-Run the full GBM segmentation pipeline using pre-trained models. Output segmentation volumes will have 4 levels: 0 = normal brain, 1 = tumor, 2 = surgical artefact, 3 = edema
+Run the full GBM segmentation pipeline using pre-trained models (GBM_seg_v2: Model A three-plane gating + five-class Model B consensus). Output segmentation labels are model-specific -- see the
+README bundled with the model weights, or astril.model_labels.load_model_labels('GBM_seg_v2'), for what each non-zero level means. A segmentation_provenance.json sidecar recording the model family
+and its labels is written alongside each exam's output.
 
 positional arguments:
   input_directory       Directory containing input scans for segmentation.
@@ -323,9 +327,57 @@ options:
   --overwrite_existing_outputs
                         Overwrite existing segmentation outputs if they exist.
   --channel_patterns CHANNEL_PATTERNS [CHANNEL_PATTERNS ...]
-                        List of filename patterns for the input scans (in order: T1-post, T1-pre, T2-FLAIR, and T2). Default: _T1c_brain_norm.nii.gz _T1n_brain_norm.nii.gz _T2f_brain_norm.nii.gz _T2w_brain_norm.nii.gz
+                        List of filename patterns for the input scans (in order: T1-post, T1-pre, T2-FLAIR, and T2). Default: _T1c_brain-norm.nii.gz _T1n_brain-norm.nii.gz _T2f_brain-norm.nii.gz
+                        _T2w_brain-norm.nii.gz
   --brainmask_pattern BRAINMASK_PATTERN
                         Brainmask pattern for Model 1 (default: _brainmask.nii.gz)
   --segment_suffix SEGMENT_SUFFIX
-                        Suffix to use in the final segmentation file names (default: _GBM_seg.nii.gz)
+                        Suffix to use in the final segmentation file names (default: _GBM-seg.nii.gz)
+  --optional_channels [OPTIONAL_CHANNELS ...]
+                        Model 1 channel names that may be absent and zero-filled, e.g. t1n t2f t2w.
+  --slice_overlap_mode {average,tile}
+                        How 2.5D output windows cover each scan. 'average' (default, robust): one window per slice, overlapping multi-slice outputs are averaged. 'tile' (fast): non-overlapping
+                        windows, ~3x fewer forward passes for GBM_seg_v2.
 ```
+
+##### GBM_seg_v2 model
+
+`segment_GBM` runs the `GBM_seg_v2` model family, a two-stage cascade of six
+`residual_context_unext_25d` networks (one axial, coronal, and sagittal network
+per stage). All six were trained only on the BraTS 2024 BraTS-GLI (adult
+glioma, post-treatment) training release; see the README and citations bundled
+with the downloaded weights.
+
+| Stage | Classes | Plane merge | Output |
+|---|---|---|---|
+| Model A (gate) | background / abnormal | average probability | abnormal probability > 0.30, dilated 5 voxels, intersected with the brain mask |
+| Model B | 5 (below) | average logit, then argmax | final segmentation, restricted to the Model A gate |
+
+Output labels: `0` background, `1` necrosis/non-enhancing tumor, `2`
+edema/surrounding non-FLAIR hyperintensity, `3` enhancing tumor/tissue, `4`
+resection cavity.
+
+Each network takes 7 adjacent slices of the four normalized sequences (T1c is
+required; T1n, T2-FLAIR, and T2w may be missing and are zero-filled) plus four
+modality-presence channels, padded to at least 256 x 256, and predicts 3
+adjacent output slices (~19.9 M parameters per network):
+
+- **Slab context stem**: a 3x3x3 convolution over the ordered 7-slice x 4-modality
+  slab, fused from the center slice's features, a learned softmax attention over
+  slice depth, and a projection of the modality-presence channels.
+- **Encoder**: four levels (32, 64, 128, 256 channels), each two pre-activation
+  GroupNorm/SiLU residual blocks, downsampled by stride-2 convolutions.
+- **Bottleneck**: two residual blocks at 512 channels (the second dilated).
+- **Decoder**: bilinear upsampling + 3x3 projection at each level, with
+  identity-initialized residual skip attention that rescales (0.5-1.5x) rather
+  than erases skip features, followed by two residual blocks.
+- **Heads**: a 1x1 convolution to 3 slices x classes; auxiliary half- and
+  quarter-resolution heads are used for deep supervision during training only.
+
+Because each window predicts 3 slices, `--slice_overlap_mode` controls how
+windows cover a scan. `average` (default) runs a window at every in-mask slice
+and averages the up-to-3 overlapping predictions of each slice (logits for
+average-logit stages, probabilities otherwise). `tile` spaces windows 3 slices
+apart so outputs do not overlap, cutting forward passes roughly 3x. Versions
+before 0.7.33 ran every window but kept only the last overlapping prediction
+for each slice.

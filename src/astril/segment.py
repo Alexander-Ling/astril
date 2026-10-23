@@ -217,7 +217,7 @@ def _cleanup_intermediate_files(subject_dir, intermediate_patterns: list[str], c
 
 def run_segmentation(input_dir, model_family=None, model_dir=None, slice_batch_size=1,
                      overwrite_existing_outputs=False, input_overrides=None,
-                     segment_suffix="_seg.nii.gz", debug_models=False):
+                     segment_suffix="_seg.nii.gz", debug_models=False, slice_overlap_mode="average"):
     """
     Run a pipeline.json-described segmentation pipeline over every subject discovered under
     `input_dir` (via stage 0's mask pattern). Exactly one of `model_family` (a name registered in
@@ -378,6 +378,7 @@ def run_segmentation(input_dir, model_family=None, model_dir=None, slice_batch_s
                 config_path, idx_in_config, loaded_models, slice_batch_size,
                 overwrite_for_stage, out_suffix, tiebreaker_model=tiebreaker,
                 debug_models=debug_models, return_merged=needs_probs,
+                slice_overlap_mode=slice_overlap_mode,
             )
 
             for derived in stage.get("derived_outputs", []):
@@ -430,6 +431,9 @@ def main():
     parser.add_argument("--debug_models", action="store_true")
     parser.add_argument("--input_override", action="append", default=[], metavar="NAME=PATTERN",
                         help="Override an initial_input's default file pattern, e.g. brainmask=_my_mask.nii.gz. Repeatable.")
+    parser.add_argument("--slice_overlap_mode", choices=["average", "tile"], default="average",
+                        help="'average' (default): one 2.5D window per slice, overlapping outputs averaged. "
+                             "'tile': non-overlapping output windows (faster).")
     args = parser.parse_args()
 
     input_overrides = {}
@@ -448,6 +452,7 @@ def main():
         input_overrides=input_overrides or None,
         segment_suffix=args.segment_suffix,
         debug_models=args.debug_models,
+        slice_overlap_mode=args.slice_overlap_mode,
     )
 
 

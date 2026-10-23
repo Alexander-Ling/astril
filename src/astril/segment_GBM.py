@@ -194,12 +194,14 @@ def compute_final_segmentation_path(mask_path, original_mask_pattern, final_mask
 def process_subject_with_models(seg_config_file, subject_index, loaded_models,
                                 slice_batch_size, overwrite, segment_suffix, tiebreaker_model, debug_models,
                                 extra_channel_paths=None, brainiac_paths_list=None,
-                                return_merged=False):
+                                return_merged=False, slice_overlap_mode="average"):
     """
     Process one subject (identified by its mask file in the segmentation config)
     using the provided pre-loaded models (for one segmentation stage).
     extra_channel_paths: optional list of additional channel NIfTI paths (e.g. BrainIAC PCA maps)
     appended to the subject's channel list at inference time.
+    slice_overlap_mode: "average" (one window per slice, overlapping outputs averaged) or
+    "tile" (non-overlapping output windows, ~1/num_output_slices the forward passes).
     """
     # Lazy imports: avoid nibabel/numpy/torch at module import time
     import torch
@@ -209,6 +211,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
     from .data_loading import (
         read_paths_from_file,
         load_val_data,
+        reassemble_window_predictions,
         ValDataGenerator,
         undo_all_transforms,
         apply_inverse_canonical_4d,
@@ -317,6 +320,7 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             target_width=min_HW,
             brainiac_paths_list=brainiac_paths_list if model_uses_brainiac_fusion else None,
             append_modality_presence=model_uses_presence,
+            slice_overlap_mode=slice_overlap_mode,
         )
         if model_uses_brainiac_fusion:
             (X_data, B_data, _, M_data, z_indices, transform_infos) = val_data
@@ -359,18 +363,9 @@ def process_subject_with_models(seg_config_file, subject_index, loaded_models,
             reoriented_4d = reassembled_4d
         else:
             all_preds = np.concatenate(all_preds, axis=0)
-            (Hpw, Wpw, Dpw) = mask_info['post_alignment_shape']
-            reassembled_4d = np.zeros((Hpw, Wpw, Dpw, n_cls), dtype=np.float32)
-            half_out = out_sl // 2
-            start_out = -half_out
-            end_out = start_out + out_sl
-            for i_slice in range(len(X_data)):
-                z_center = z_indices[i_slice]
-                slice_pred = all_preds[i_slice]
-                for oi, offset in enumerate(range(start_out, end_out)):
-                    z_out = z_center + offset
-                    if 0 <= z_out < Dpw:
-                        reassembled_4d[..., z_out, :] = slice_pred[..., oi, :]
+            reassembled_4d = reassemble_window_predictions(
+                all_preds, z_indices, out_sl, mask_info['post_alignment_shape']
+            )
             unaligned_4d = undo_all_transforms(reassembled_4d, mask_info)
             if 'transform_from_canonical' in mask_info and mask_info['transform_from_canonical'] is not None:
                 reoriented_4d = apply_inverse_canonical_4d(unaligned_4d, mask_info['transform_from_canonical'])
@@ -437,7 +432,8 @@ def _write_model_a_gate(probabilities, mask_path, output_path, threshold=0.30, d
 def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_existing_outputs=False,
                                     channel_patterns=None, brainmask_pattern="_brainmask.nii.gz",
                                     segment_suffix="_GBM-seg.nii.gz", optional_channels=None,
-                                    model_a_threshold=0.30, model_a_dilation=5):
+                                    model_a_threshold=0.30, model_a_dilation=5,
+                                    slice_overlap_mode="average"):
     """Run Model A gating followed by the selected five-class Model B consensus."""
     from .create_segmentation_config import create_segmentation_config
     from .data_loading import read_paths_from_file
@@ -506,6 +502,7 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
             model_a_config, subject_index, loaded_model_a, slice_batch_size,
             True, "_Model_A_seg.nii.gz", tiebreaker_model=0,
             debug_models=False, return_merged=True,
+            slice_overlap_mode=slice_overlap_mode,
         )
         _, model_a_probabilities, _ = model_a_result
         subject_dir = os.path.dirname(subject_mask)
@@ -528,7 +525,7 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
         process_subject_with_models(
             model_b_config, 0, loaded_model_b, slice_batch_size,
             overwrite_existing_outputs, segment_suffix, tiebreaker_model=0,
-            debug_models=False,
+            debug_models=False, slice_overlap_mode=slice_overlap_mode,
         )
         _write_segmentation_provenance(subject_dir, "GBM_seg_v2")
         cleanup_intermediate_files(subject_dir)
@@ -538,7 +535,7 @@ def _segment_GBM_model_b_five_class(input_dir, slice_batch_size=1, overwrite_exi
 
 def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_outputs=False,
                 channel_patterns=None, brainmask_pattern="_brainmask.nii.gz", segment_suffix="_GBM-seg.nii.gz",
-                optional_channels=None):
+                optional_channels=None, slice_overlap_mode="average"):
     """
     Runs Model A three-plane gating followed by five-class Model B consensus.
 
@@ -551,6 +548,7 @@ def segment_GBM(input_dir, slice_batch_size=1, n_threads=1, overwrite_existing_o
         overwrite_existing_outputs=overwrite_existing_outputs,
         channel_patterns=channel_patterns, brainmask_pattern=brainmask_pattern,
         segment_suffix=segment_suffix, optional_channels=optional_channels,
+        slice_overlap_mode=slice_overlap_mode,
     )
 
 
@@ -584,6 +582,10 @@ def main():
                         help="Suffix to use in the final segmentation file names (default: _GBM-seg.nii.gz)")
     parser.add_argument("--optional_channels", nargs="*", default=None,
                         help="Model 1 channel names that may be absent and zero-filled, e.g. t1n t2f t2w.")
+    parser.add_argument("--slice_overlap_mode", choices=["average", "tile"], default="average",
+                        help="How 2.5D output windows cover each scan. 'average' (default, robust): one window "
+                             "per slice, overlapping multi-slice outputs are averaged. 'tile' (fast): "
+                             "non-overlapping windows, ~3x fewer forward passes for GBM_seg_v2.")
     args = parser.parse_args()
 
     # Fail early with a clear instruction if the v2 gate/segmentation models
@@ -600,6 +602,7 @@ def main():
         brainmask_pattern=args.brainmask_pattern,
         segment_suffix=args.segment_suffix,
         optional_channels=args.optional_channels,
+        slice_overlap_mode=args.slice_overlap_mode,
     )
 
 

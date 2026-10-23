@@ -20,7 +20,7 @@ def _write_nifti(path, data):
 def _fake_process_subject_with_models(seg_config_file, subject_index, loaded_models,
                                       slice_batch_size, overwrite, segment_suffix, tiebreaker_model,
                                       debug_models, extra_channel_paths=None, brainiac_paths_list=None,
-                                      return_merged=False):
+                                      return_merged=False, slice_overlap_mode="average"):
     """
     Stands in for the real (torch/GPU) astril.segment_GBM.process_subject_with_models: mirrors
     its real out_path-naming logic (reading maskPattern/output_directory back out of the
