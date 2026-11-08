@@ -250,7 +250,8 @@ Currently, the only preprocessing pipeline implemetned in astril is for brain MR
 The preprocesing pipline can be applied by simply applying the following function to the NIFTI library generated in the previous step. Note that you will need to run "pip install astril[preprocessing]" the before the first time running preprocessing pipelines in astril.
 ```
 usage: python -m astril.preprocess_brain_mris [-h] --in_dir IN_DIR --out_dir OUT_DIR [--preprocess_log PREPROCESS_LOG] [--coreg_log COREG_LOG] [--old_coreg_log [OLD_COREG_LOG ...]] [--dont_coregister]
-                                              [--n_workers N_WORKERS] [--n_workers_per_registration_process N_WORKERS_PER_REGISTRATION_PROCESS] [--n_workers_per_hd_bet_process N_WORKERS_PER_HD_BET_PROCESS]
+                                              [--n_workers N_WORKERS] [--n_workers_per_registration_process N_WORKERS_PER_REGISTRATION_PROCESS] [--registration_backend {auto,itk,gpu}]
+                                              [--n_workers_per_hd_bet_process N_WORKERS_PER_HD_BET_PROCESS]
                                               [--overwrite] [--no_reuse_patient_brainmask] [--modalities MODALITIES] [--anchor_label ANCHOR_LABEL] [--registration_metric REGISTRATION_METRIC]
                                               [--registration_strategy REGISTRATION_STRATEGY] [--family_parent_map FAMILY_PARENT_MAP] [--final_dims NX NY NZ] [--final_voxels SX SY SZ]
                                               [--save_scans_with_skulls] [--use_gpu] [--enable_tta] [--skip_qc] [--debug] [--verbose]
@@ -272,6 +273,8 @@ options:
                         Parallel workers across patients (threaded). Use 1 to run serially.
   --n_workers_per_registration_process N_WORKERS_PER_REGISTRATION_PROCESS
                         Optional override: CPU threads to allow per SimpleITK/ITK process within each pipeline. Default: floor(cpu_threads / n_workers).
+  --registration_backend {auto,itk,gpu}
+                        Registration engine: auto (default; gpu when CUDA is available, else itk), itk, or gpu (CUDA port of the same ITK algorithms). With --n_workers > 1, all exam workers share one batched GPU registration service.
   --n_workers_per_hd_bet_process N_WORKERS_PER_HD_BET_PROCESS
                         Optional override: CPU threads to allow for HD-BET when device=cpu, per pipeline. Default: min(8, floor(cpu_threads / n_workers)). (Capped at 8 in batch mode.)
   --overwrite           Overwrite existing outputs instead of skipping processed exams.
@@ -299,6 +302,8 @@ options:
   --debug               Keep temp dirs from underlying preprocessing.
   --verbose             Print logging from underlying preprocessing.
 ```
+**GPU registration.** With a CUDA GPU, registration and resampling run on the GPU by default (`--registration_backend auto`). The GPU backend (`astril.gpu`) is a port of the same ITK algorithms astril uses on the CPU (Mattes MI / correlation, multi-resolution pyramid, regular-step gradient descent, B-spline resampling); on validation exams its final transforms are within ~0.02 mm of ITK's, and a whole exam preprocesses roughly 3x faster. In batch mode the exam worker threads of one `preprocess_brain_mris` process share a single batched GPU service, so raise `--n_workers` to keep it busy. Only one process per GPU uses it (other processes, and anything the GPU path does not support, fall back to ITK automatically). Fused GPU kernels use Triton (`triton-windows` is installed automatically on Windows; Linux CUDA builds of torch include `triton`); if Triton is missing or incompatible with the installed torch, astril warns once and uses slower pure-torch GPU kernels. Use `--registration_backend itk` to force the CPU path. astril caps its own GPU memory at what is free when it starts minus `ASTRIL_GPU_HEADROOM_MB` (default 1024 MB, left for the desktop and other programs) and budgets that between the batched service and the exam threads, so it never spills into system RAM (which Windows' default CUDA "sysmem fallback" would otherwise do silently, slowing everything down); close other GPU-heavy programs before large runs. Environment overrides: `ASTRIL_GPU_DEVICE` (default `cuda:0`), `ASTRIL_GPU_HEADROOM_MB`, `ASTRIL_GPU_MAX_MEMORY_MB` (upper limit for astril's cap), `ASTRIL_GPU_SPILL_TO_CPU=1` (run registrations on ITK when the GPU queue is full; off by default because the GPU queue clears in seconds while a CPU registration ties up a core the rest of the pipeline needs).
+
 Unmasked (skull-on) intermediates are written to a scratch directory outside `--out_dir` (the system temp directory, or `$ASTRIL_SCRATCH_DIR` if set -- point it at a large drive if the system temp drive is small), so an interrupted or killed run can't leave identifiable images next to the skull-stripped outputs. Ctrl+C and SIGTERM delete the scratch directory before exiting; `.astril_tmp_*` folders left inside exam output folders by older versions are removed on the next run.
 
 ---

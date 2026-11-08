@@ -2830,28 +2830,52 @@ def _write_fsl_bvecs(path: str, bvecs_3xN):
 
 
 def _rotation_from_sitk_transform(tfm):
-    """Extract an orthonormal 3x3 rotation matrix from a SimpleITK transform.
+    """Orthonormal 3x3 rotation (LPS physical frame) of a linear SimpleITK transform, or None if non-linear.
 
-    For affine-like transforms, SimpleITK exposes a 3x3 matrix via GetMatrix().
-    We orthonormalize it (polar decomposition via SVD) to drop any numeric shear/scale.
+    Works for any linear transform, including the CompositeTransform files astril writes (which have no GetMatrix):
+    the linear part is recovered exactly by probing TransformPoint, then orthonormalised (polar decomposition via
+    SVD) to drop scale/shear, keeping a right-handed rotation.
     """
-    if not hasattr(tfm, "GetMatrix"):
+    t = tfm.Downcast() if hasattr(tfm, "Downcast") else tfm
+    try:
+        if not t.IsLinear():
+            return None
+        o = np.asarray(t.TransformPoint((0.0, 0.0, 0.0)), dtype=float)
+        A = np.stack([np.asarray(t.TransformPoint(tuple(e)), dtype=float) - o for e in np.eye(3)], axis=1)
+    except Exception:
         return None
-    mat = tfm.GetMatrix()
-    if mat is None:
-        return None
-    mat = list(mat)
-    if len(mat) != 9:
-        return None
-    A = np.array(mat, dtype=float).reshape(3, 3)
-    # Orthonormalize: R = U V^T
     U, _, Vt = np.linalg.svd(A)
     R = U @ Vt
-    # Ensure right-handed
     if np.linalg.det(R) < 0:
         U[:, -1] *= -1
         R = U @ Vt
     return R
+
+
+def _fsl_bvec_frame(nifti_path) -> np.ndarray:
+    """3x3 matrix mapping an FSL b-vector of `nifti_path` to a RAS world direction.
+
+    FSL b-vectors are in voxel-axis coordinates, with the x axis negated when the voxel-to-world matrix has a positive
+    determinant (FSL's radiological voxel convention; the same rule MRtrix uses to import FSL gradients).
+    """
+    import nibabel as nib
+    M = np.asarray(nib.load(str(nifti_path)).affine[:3, :3], dtype=float)
+    D = M / np.linalg.norm(M, axis=0)
+    F = np.diag([-1.0, 1.0, 1.0]) if np.linalg.det(M) > 0 else np.eye(3)
+    return D @ F
+
+
+def reorient_fsl_bvecs(bvecs_3xN: np.ndarray, src_nifti_path, dst_nifti_path, resample_rotation_lps: np.ndarray) -> np.ndarray:
+    """b-vectors of `src` expressed for `dst`, where dst was resampled from src with a transform whose rotation is
+    `resample_rotation_lps` (ITK convention: maps OUTPUT physical points to INPUT physical points, LPS).
+
+    A direction v in the input's physical space appears in the output as R^T v. World directions are converted to and
+    from each image's FSL voxel frame (axes + radiological x flip), so oblique and flipped grids are handled.
+    """
+    P = np.diag([-1.0, -1.0, 1.0])                 # LPS <-> RAS
+    R_ras = P @ resample_rotation_lps @ P
+    W_in, W_out = _fsl_bvec_frame(src_nifti_path), _fsl_bvec_frame(dst_nifti_path)
+    return W_out.T @ R_ras.T @ W_in @ np.asarray(bvecs_3xN, dtype=float)
 
 
 def update_fsl_vectors_after_transform(
@@ -2862,16 +2886,18 @@ def update_fsl_vectors_after_transform(
     inverse: bool = False,
     verbose: Optional[bool] = None,
 ) -> dict:
-    """Copy .bval and update (rotate) .bvec to match an applied spatial transform."""
+    """Copy .bval and reorient .bvec for an image that was resampled from src onto dst's grid.
+
+    transform: the resampling transform that was applied (maps dst physical points to src physical points, as passed
+    to ResampleImageFilter). inverse=True means `transform` is the inverse of that resampling transform.
+    Only linear transforms are supported; otherwise the .bvec is not written and the reason is returned.
+    """
     src_bval, src_bvec = _fsl_sidecar_paths(src_nifti_path)
     dst_bval, dst_bvec = _fsl_sidecar_paths(dst_nifti_path)
     out = {"copied_bval": False, "updated_bvec": False, "reason": ""}
-
     if not os.path.exists(src_bval) and not os.path.exists(src_bvec):
         out["reason"] = "no_bval_or_bvec"
         return out
-
-    # Always copy bvals if present
     if os.path.exists(src_bval):
         try:
             shutil.copy2(src_bval, dst_bval)
@@ -2879,36 +2905,29 @@ def update_fsl_vectors_after_transform(
         except Exception as e:
             out["reason"] = f"failed_copy_bval:{type(e).__name__}"
             _dbg(verbose, "[update_fsl_vectors] WARNING copying bval:", e)
-
     if not os.path.exists(src_bvec):
         out["reason"] = out["reason"] or "no_bvec"
         return out
-
     R = _rotation_from_sitk_transform(transform)
     if R is None:
-        out["reason"] = out["reason"] or "transform_no_matrix"
+        out["reason"] = out["reason"] or "transform_not_linear"
+        print(f"[WARN] {dst_bvec} not written: b-vector reorientation needs a linear transform.")
         return out
-
     if inverse:
-        R = np.linalg.inv(R)
-
+        R = R.T
     try:
         bvecs = _read_fsl_bvecs(src_bvec)  # 3xN
         if bvecs.shape[0] != 3:
             raise ValueError("bvecs not 3xN after parsing")
-        new_bvecs = R @ bvecs
-        _write_fsl_bvecs(dst_bvec, new_bvecs)
+        _write_fsl_bvecs(dst_bvec, reorient_fsl_bvecs(bvecs, src_nifti_path, dst_nifti_path, R))
         out["updated_bvec"] = True
         return out
     except Exception as e:
+        # Never ship un-reoriented gradients next to a resampled image: leave no .bvec rather than a wrong one.
         out["reason"] = f"failed_update_bvec:{type(e).__name__}"
-        _dbg(verbose, "[update_fsl_vectors] WARNING updating bvec:", e)
-        # fallback: copy original bvec without modification
-        try:
-            shutil.copy2(src_bvec, dst_bvec)
-        except Exception:
-            pass
+        print(f"[WARN] {dst_bvec} not written: b-vector reorientation failed ({type(e).__name__}: {e}).")
         return out
+
 
 def _sanitize_label(lbl: str) -> str:
     """Sanitize a label for use inside filenames.
@@ -3155,6 +3174,183 @@ def write_json_sidecar(nifti_path: str, info: Dict[str, Any], *, suffix: str = "
     return out
 
 
+_ITK_FILE_IO_LOCK = threading.RLock()
+
+
+def itk_file_io():
+    """Process-wide lock for all SimpleITK file I/O (images and transforms).
+
+    ITK's file I/O goes through shared factory/registry state that is not thread-safe; concurrent reads or writes
+    from preprocess_brain_mris exam threads crashed the interpreter (access violations inside ReadTransform while
+    other threads were in ReadImage/WriteImage). Locking transforms alone was not enough, so image and transform
+    I/O share one lock. Reentrant so helpers can nest.
+    """
+    return _ITK_FILE_IO_LOCK
+
+
+_ITK_IO_TRACE_PATH = os.environ.get("ASTRIL_ITK_IO_TRACE")
+_ITK_IO_TRACE_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def itk_file_io_timed(kind: str, path):
+    """itk_file_io() plus optional per-call wait/hold timing (env ASTRIL_ITK_IO_TRACE=<csv path>)."""
+    import time
+    if not _ITK_IO_TRACE_PATH:
+        with _ITK_FILE_IO_LOCK:
+            yield
+        return
+    t0 = time.perf_counter()
+    with _ITK_FILE_IO_LOCK:
+        t1 = time.perf_counter()
+        try:
+            yield
+        finally:
+            t2 = time.perf_counter()
+            with _ITK_IO_TRACE_LOCK, open(_ITK_IO_TRACE_PATH, "a") as fh:
+                fh.write(f"{kind},{str(path)[-7:].lstrip('.')},{t1 - t0:.4f},{t2 - t1:.4f},{threading.get_ident()},{t0:.3f}\n")
+
+
+# --- NIfTI fast path (nibabel, no ITK, no lock) -------------------------------------------------------------------
+# 3D scalar NIfTI images are read/written with nibabel so that the heavy gzip work runs in parallel across exam
+# threads instead of serialised under the ITK lock. Anything the nibabel path cannot reproduce exactly the way ITK
+# would read it (4D, vector, scaled, non-orthogonal or missing sform/qform, NRRD, ...) falls back to ITK under the
+# lock. Geometry: NIfTI affines are RAS, ITK is LPS -> flip the first two rows.
+_LPS_FROM_RAS = np.diag([-1.0, -1.0, 1.0, 1.0])
+_NIFTI_FAST_DTYPES = {np.dtype(t) for t in ("uint8", "int8", "uint16", "int16", "uint32", "int32", "uint64", "int64", "float32", "float64")}
+_NIFTI_GZIP_LEVEL = 6   # ITK's default zlib level, so file sizes stay the same as before
+
+
+def _is_nifti_file(path) -> bool:
+    p = str(path).lower()
+    return p.endswith(".nii") or p.endswith(".nii.gz")
+
+
+def _nifti_fast_affine(hdr) -> "np.ndarray | None":
+    """RAS affine ITK would use for this header, or None if ITK's behaviour cannot be matched cheaply."""
+    sform_code, qform_code = int(hdr["sform_code"]), int(hdr["qform_code"])
+    if sform_code > 0:
+        aff = hdr.get_sform()
+    elif qform_code > 0:
+        aff = hdr.get_qform()
+    else:
+        return None   # nibabel centres the fallback affine, ITK uses origin 0
+    aff = np.asarray(aff, dtype=np.float64)
+    m = aff[:3, :3]
+    norms = np.linalg.norm(m, axis=0)
+    if not np.all(np.isfinite(aff)) or np.any(norms <= 0):
+        return None
+    # ITK takes spacing from pixdim and requires orthogonal direction cosines; bail if the sform disagrees.
+    if not np.allclose(norms, np.asarray(hdr.get_zooms()[:3], dtype=np.float64), rtol=1e-4, atol=1e-6):
+        return None
+    d = m / norms
+    if not np.allclose(d.T @ d, np.eye(3), atol=1e-4):
+        return None
+    return aff
+
+
+def read_nifti_fast(path, pixel_id=None):
+    """Read a 3D scalar NIfTI via nibabel as a SimpleITK image; None if the file needs the ITK reader."""
+    import SimpleITK as sitk
+    if not _is_nifti_file(path):
+        return None
+    try:
+        nii = nib.load(str(path))
+    except Exception:
+        return None
+    hdr = nii.header
+    if int(hdr["dim"][0]) != 3 or len(nii.shape) != 3:
+        return None
+    # ITK rescales (and promotes integers to float) when slope/intercept are set to anything but 1/0 (nan and 0
+    # mean "none" for both libraries). nibabel moves the file's values onto the data proxy on load, so read them
+    # there; any real scaling is left to ITK.
+    if float(nii.dataobj.slope) != 1.0 or float(nii.dataobj.inter) != 0.0:
+        return None
+    if np.dtype(nii.get_data_dtype()).newbyteorder("=") not in _NIFTI_FAST_DTYPES:
+        return None
+    aff = _nifti_fast_affine(hdr)
+    if aff is None:
+        return None
+    data = np.asanyarray(nii.dataobj)
+    arr = np.ascontiguousarray(data.T, dtype=data.dtype.newbyteorder("="))   # (x,y,z) -> (z,y,x) for SimpleITK
+    img = sitk.GetImageFromArray(arr)
+    lps = _LPS_FROM_RAS @ aff
+    img.SetSpacing([float(v) for v in hdr.get_zooms()[:3]])   # ITK takes spacing from pixdim, not the sform
+    img.SetOrigin([float(v) for v in lps[:3, 3]])
+    img.SetDirection([float(v) for v in (lps[:3, :3] / np.linalg.norm(lps[:3, :3], axis=0)).ravel()])
+    if pixel_id is not None and img.GetPixelID() != pixel_id:
+        img = sitk.Cast(img, pixel_id)
+    return img
+
+
+def write_nifti_fast(image, path) -> bool:
+    """Write a 3D scalar SimpleITK image as NIfTI via nibabel; False if the image needs the ITK writer."""
+    import gzip
+    import SimpleITK as sitk
+    if not _is_nifti_file(path) or image.GetDimension() != 3 or image.GetNumberOfComponentsPerPixel() != 1:
+        return False
+    arr = sitk.GetArrayViewFromImage(image)
+    if arr.dtype not in _NIFTI_FAST_DTYPES:
+        return False
+    lps = np.eye(4)
+    lps[:3, :3] = np.asarray(image.GetDirection(), dtype=np.float64).reshape(3, 3) * np.asarray(image.GetSpacing(), dtype=np.float64)
+    lps[:3, 3] = image.GetOrigin()
+    aff = _LPS_FROM_RAS @ lps
+    nii = nib.Nifti1Image(arr.T, aff, dtype=arr.dtype)   # (z,y,x) view -> (x,y,z); Fortran-ordered, no copy
+    hdr = nii.header
+    hdr.set_qform(aff, code=1)   # ITK writes both forms as NIFTI_XFORM_SCANNER_ANAT
+    hdr.set_sform(aff, code=1)
+    hdr.set_zooms([float(v) for v in image.GetSpacing()])   # pixdim is what ITK reads back as spacing
+    hdr.set_xyzt_units("mm", "sec")
+    p = str(path)
+    if p.lower().endswith(".gz"):
+        with gzip.GzipFile(p, "wb", compresslevel=_NIFTI_GZIP_LEVEL) as fh:
+            fm = nii.make_file_map()
+            fm["image"].fileobj = fh
+            nii.to_file_map(fm)
+    else:
+        nib.save(nii, p)
+    return True
+
+
+def read_image(path, *args):
+    """sitk.ReadImage drop-in: nibabel fast path for 3D scalar NIfTI, otherwise ITK serialised process-wide."""
+    import SimpleITK as sitk
+    if len(args) <= 1:
+        img = read_nifti_fast(path, args[0] if args else None)
+        if img is not None:
+            return img
+    with itk_file_io_timed("read_image", path):
+        return sitk.ReadImage(str(path), *args)
+
+
+def write_image(image, path, *args):
+    """sitk.WriteImage drop-in: nibabel fast path for 3D scalar NIfTI, otherwise ITK serialised process-wide."""
+    import SimpleITK as sitk
+    if not args and write_nifti_fast(image, path):
+        return
+    with itk_file_io_timed("write_image", path):
+        sitk.WriteImage(image, str(path), *args)
+
+
+def read_transform(path):
+    """sitk.ReadTransform, serialised process-wide (see itk_file_io)."""
+    import SimpleITK as sitk
+    with itk_file_io_timed("read_transform", path):
+        return sitk.ReadTransform(str(path))
+
+
+def write_transform(transform, path):
+    """sitk.WriteTransform, serialised process-wide (see itk_file_io)."""
+    import SimpleITK as sitk
+    with itk_file_io_timed("write_transform", path):
+        sitk.WriteTransform(transform, str(path))
+
+
+_PREFLIGHT_OK: dict = {}
+_PREFLIGHT_LOCK = threading.Lock()
+
+
 def preflight_sitk_read_in_subprocess(image_path, *, full_read: bool = True, timeout_sec: int = 120):
     """
     Probe a SimpleITK read in a child Python process.
@@ -3162,11 +3358,23 @@ def preflight_sitk_read_in_subprocess(image_path, *, full_read: bool = True, tim
     This protects the main interpreter from native-library crashes caused by
     malformed image files. If the child crashes, hangs, or exits non-zero,
     raise RuntimeError in the parent process.
+
+    Successful probes are cached per (path, size, mtime, full_read) for the life of the process, so a file that the
+    pipeline reads many times (e.g. the anchor) is only probed once; a rewritten file is probed again.
     """
     import sys
     import textwrap
 
     p = os.fspath(image_path)
+    try:
+        st = os.stat(p)
+        cache_key = (os.path.abspath(p), st.st_size, st.st_mtime_ns, bool(full_read))
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        with _PREFLIGHT_LOCK:
+            if cache_key in _PREFLIGHT_OK:
+                return _PREFLIGHT_OK[cache_key]
 
     code = textwrap.dedent(r"""
         import json
@@ -3227,7 +3435,11 @@ def preflight_sitk_read_in_subprocess(image_path, *, full_read: bool = True, tim
         msg = stderr or stdout or f'child exited with code {proc.returncode}'
         raise RuntimeError(f"SimpleITK preflight failed for image: {p}\n{msg}")
 
-    return (proc.stdout or '').strip()
+    out = (proc.stdout or '').strip()
+    if cache_key is not None:
+        with _PREFLIGHT_LOCK:
+            _PREFLIGHT_OK[cache_key] = out
+    return out
 
 
 # ------------------------------------------------------------------------
@@ -3278,7 +3490,7 @@ def get_nifti_ndim(nifti_path):
     # Match the effective 3D/4D inference used by register_images().
     # SimpleITK exposes vector images as 3D + multiple components per pixel.
     try:
-        sitk_img = sitk.ReadImage(nifti_path) #This may be unecessarily expensive
+        sitk_img = read_image(nifti_path) #This may be unecessarily expensive
         """
         Something like below with a header only read might work better here,
         but I'm not sure it would expose all of the information needed.
@@ -3434,8 +3646,8 @@ def apply_mask_anydim_sitk(input_image_path, mask_path, output_path):
     preflight_sitk_read_in_subprocess(mask_path, full_read=True, timeout_sec=120)
 
     # Preserve original pixel type to avoid accidentally changing vector layout on write.
-    img = sitk.ReadImage(str(input_image_path))
-    msk = sitk.ReadImage(str(mask_path))
+    img = read_image(str(input_image_path))
+    msk = read_image(str(mask_path))
 
     if msk.GetDimension() != 3:
         raise ValueError(f"Mask must be 3D. Got dim={msk.GetDimension()} from {mask_path}")
@@ -3547,7 +3759,7 @@ def apply_mask_anydim_sitk(input_image_path, mask_path, output_path):
     except Exception:
         pass
 
-    sitk.WriteImage(out_img, str(output_path))
+    write_image(out_img, str(output_path))
     return output_path
 
 def apply_mask_anydim(input_image_path, mask_path, output_path):

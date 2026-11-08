@@ -13,10 +13,135 @@ import tempfile
 import shutil
 import json
 from contextlib import contextmanager
+import threading
 from pathlib import Path
+
+
+def _read_transform(path):
+    """Process-wide serialised sitk.ReadTransform (ITK transform IO is not thread-safe); imported lazily."""
+    from astril.preprocessing_utils import read_transform
+    return read_transform(path)
+
+
+def _write_transform(transform, path):
+    """Process-wide serialised sitk.WriteTransform; imported lazily."""
+    from astril.preprocessing_utils import write_transform
+    return write_transform(transform, path)
+
+
+def _read_image(path, *args):
+    """Process-wide serialised sitk.ReadImage (ITK file IO is not thread-safe); imported lazily."""
+    from astril.preprocessing_utils import read_image
+    return read_image(path, *args)
+
+
+def _write_image(image, path, *args):
+    """Process-wide serialised sitk.WriteImage; imported lazily."""
+    from astril.preprocessing_utils import write_image
+    return write_image(image, path, *args)
+
+
+def _working_grid_reference(ref_path, final_voxels_list, out_path):
+    """Grid the registered scans are resampled onto: the reference grid, but never finer than the final voxel size.
+
+    Steps 2-5 materialise every scan on this grid, and Step 6 only resizes to the final grid(s). A sub-millimetre
+    reference (e.g. 1024x1024 @ 0.25 mm) would otherwise cost 16-20x the voxels of the 1 mm outputs in resampling,
+    masking, normalisation and gzip I/O, and scipy's corner-aligned zoom in resize_mri would then shrink it with a
+    ~0.3% scale error. Transform *estimation* still uses the full-resolution reference; only the resampling target
+    changes (and it is already coarsened to registration_voxel_mm before any optimisation).
+
+    Returns ref_path unchanged when no axis is finer than the (finest requested) final voxel size; otherwise writes
+    a zero-filled reference image on the capped grid (origin/direction kept, size rounded to preserve the extent,
+    like sitk_resample_to_spacing) and returns its path.
+    """
+    import SimpleITK as sitk
+    from astril.preprocessing_utils import itk_file_io
+
+    cap = [min(float(v[i]) for v in final_voxels_list) for i in range(3)]
+    r = sitk.ImageFileReader()
+    r.SetFileName(str(ref_path))
+    with itk_file_io():
+        r.ReadImageInformation()
+    spacing = [float(s) for s in r.GetSpacing()[:3]]
+    size = [int(n) for n in r.GetSize()[:3]]
+    work = [max(s, c) for s, c in zip(spacing, cap)]
+    if all(abs(w - s) <= 1e-6 for w, s in zip(work, spacing)):
+        return str(ref_path)
+    new_size = [max(1, int(round(n * s / w))) for n, s, w in zip(size, spacing, work)]
+    grid = sitk.Image(new_size, sitk.sitkFloat32)
+    grid.SetSpacing(work)
+    grid.SetOrigin([float(v) for v in r.GetOrigin()[:3]])
+    d = [float(v) for v in r.GetDirection()]
+    if len(d) == 16:   # 4D reference header: keep the spatial 3x3
+        d = [d[0], d[1], d[2], d[4], d[5], d[6], d[8], d[9], d[10]]
+    grid.SetDirection(d)
+    _write_image(grid, out_path)
+    return str(out_path)
+
+
+def _write_identity_transform(path):
+    """Identity rigid transform file, for apply-only resamples that only change the sampling grid."""
+    import SimpleITK as sitk
+    _write_transform(sitk.Euler3DTransform(), path)
+    return str(path)
+
 
 # Older astril versions put the unmasked scratch workspace inside output_dir with this prefix.
 _LEGACY_OUTPUT_TEMP_PREFIX = ".astril_tmp_"
+
+
+_PATIENT_LOCKS: dict = {}
+_PATIENT_LOCKS_GUARD = threading.Lock()
+
+
+def _patient_lock(patient_out_dir) -> "threading.RLock":
+    """Process-wide lock for one patient's shared files (reference scan, patient-level brainmask).
+
+    preprocess_brain_mris runs a patient's exams in parallel threads; they read the same reference and patient mask, and
+    an exam that had to generate its own mask may write the patient-level mask. Holding this lock while copying shared
+    inputs into an exam's private scratch dir, and while writing the patient mask, means no exam ever reads a
+    half-written shared file. Exams of the same patient otherwise still run fully in parallel.
+    """
+    key = os.path.normcase(os.path.abspath(os.fspath(patient_out_dir)))
+    with _PATIENT_LOCKS_GUARD:
+        lock = _PATIENT_LOCKS.get(key)
+        if lock is None:
+            lock = _PATIENT_LOCKS[key] = threading.RLock()
+        return lock
+
+
+def _chain_transform_files(paths, out_path) -> str:
+    """Write to `out_path` one AffineTransform equal to applying the transforms in `paths` in order
+    (p -> T_last(...T_first(p))), and return `out_path`.
+
+    Each file maps fixed-space points to moving-space points (ITK resampling convention). astril's registration
+    transforms are linear (rigid/affine, stored as CompositeTransform files), so the chain is exactly one affine map;
+    it is recovered by probing TransformPoint and verified on off-axis points. ITK cannot write a composite nested in a
+    composite, hence a plain AffineTransform. Raises ValueError for non-linear members (caller falls back).
+    """
+    import numpy as _np
+    import SimpleITK as sitk
+
+    ts = [_read_transform(str(pth)) for pth in paths]
+    if not all(t.IsLinear() for t in ts):
+        raise ValueError(f"non-linear transform in chain {paths}")
+
+    def _seq(pt):
+        q = tuple(float(v) for v in pt)
+        for t in ts:
+            q = t.TransformPoint(q)
+        return _np.asarray(q)
+
+    o = _seq((0.0, 0.0, 0.0))
+    A = _np.stack([_seq(e) - o for e in _np.eye(3)], axis=1)
+    aff = sitk.AffineTransform(3)
+    aff.SetMatrix(tuple(A.reshape(-1)))
+    aff.SetTranslation(tuple(o))
+    for pt in [(13.37, -8.25, 4.125), (-40.0, 25.5, 60.25), (120.0, -95.0, 33.0)]:
+        if not _np.allclose(aff.TransformPoint(pt), _seq(pt), atol=1e-6):
+            raise ValueError(f"affine composition of {paths} does not match sequential application")
+    _write_transform(aff, str(out_path))
+    return str(out_path)
 
 
 def _remove_stale_output_temp_dirs(output_dir) -> None:
@@ -301,6 +426,8 @@ def run_preprocessing_pipeline(
     registration_strategy="medium",
     registration_voxel_mm="2,2,2",
     n_workers_per_registration_process=None,
+    registration_backend="auto",
+    registration_seed=1,
     n_workers_per_hd_bet_process=None,
     save_scans_with_skulls=False,
     save_native_space=False,
@@ -348,6 +475,12 @@ def run_preprocessing_pipeline(
         to this reference and the same transform is applied to all scans.
     registration_strategy : str, default="medium"
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
+    registration_backend : {"auto", "itk", "gpu"}, default="auto"
+        Passed to preprocess.register_images(..., registration_backend=...).
+    registration_seed : int | None, default=1
+        Seed for the registration metric's random sampling (passed to register_images as metric_sampling_seed),
+        making repeated runs reproducible. None = seed from the wall clock (runs differ slightly). Must not be 0
+        (SimpleITK treats 0 as "use the wall clock").
     n_workers_per_registration_process : int | None, default=None
         Passed to preprocess.register_images(..., n_workers=...). Caps ITK/SimpleITK threads per registration/resample
         call to avoid oversubscription when many pipelines run in parallel.
@@ -478,6 +611,20 @@ def run_preprocessing_pipeline(
     temp_dir = os.path.abspath(temp_dir)
     output_dir = os.path.abspath(output_dir)
 
+    # Patient-shared inputs (reference scan, patient-level brainmask) are copied once, under the patient's lock, into
+    # this exam's private scratch dir and only the private copies are read afterwards. Provenance keeps the originals.
+    co_register_path_recorded = os.fspath(co_register_path) if co_register_path else None
+    brainmask_path_recorded = os.fspath(brainmask_path) if brainmask_path else None
+    with _patient_lock(os.path.dirname(output_dir.rstrip(os.sep))):
+        if co_register_path and os.path.exists(co_register_path):
+            private = os.path.join(temp_dir, "shared_ref__" + os.path.basename(os.fspath(co_register_path)))
+            shutil.copy2(co_register_path, private)
+            co_register_path = private
+        if brainmask_path and os.path.exists(brainmask_path):
+            private = os.path.join(temp_dir, "shared_mask__" + os.path.basename(os.fspath(brainmask_path)))
+            shutil.copy2(brainmask_path, private)
+            brainmask_path = private
+
     # Derive IDs from anchor filename if not provided
     anchor_path = scans[anchor_label]
     if patientID is None or timepoint is None or scanID is None:
@@ -514,6 +661,10 @@ def run_preprocessing_pipeline(
 
     # Keep working paths for each stage
     reg_paths: dict[str, str] = {}
+    # Step 1 only estimates scan->anchor transforms; Step 2 resamples each native scan once, through the composed
+    # (coreg->anchor->scan) transform when a co-registration reference is given, onto the working grid (see
+    # _working_grid_reference). step1_tfm holds the scan->anchor transform file per label for that composition.
+    step1_tfm: dict[str, str] = {}
 
     # Track which inputs are 4D so we can treat them differently
     ndim_by_label: dict[str, int] = {}
@@ -568,24 +719,22 @@ def run_preprocessing_pipeline(
     # compute it once and reuse it later in Step 2.
     coreg_precomputed = False
     coreg_tfm = None
-    anchor_coreg = None
 
     brainmask_source = {"type": "hd-bet"}
 
     def _prepare_coreg_transform_if_needed():
-        nonlocal coreg_precomputed, coreg_tfm, anchor_coreg
+        nonlocal coreg_precomputed, coreg_tfm
         if coreg_precomputed:
             return
         if not co_register_path:
             return
         coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
-        anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
         if verbose:
             print(f"[Step 0] Precomputing anchor->coreg transform (needed for brainmask mapping): {anchor_label} -> {co_register_path}")
         register_images(
             fixed_path=co_register_path,
             moving_path=anchor_path,
-            output_path=anchor_coreg,
+            output_path=None,   # estimate only; the anchor is resampled onto the working grid in Step 2
             transform_path=coreg_tfm,
             apply_only=False,
             similarity_metric=anchor_to_coreg_metric,
@@ -593,6 +742,8 @@ def run_preprocessing_pipeline(
             registration_voxel_mm=registration_voxel_mm,
             registration_strategy=registration_strategy,
             n_workers=n_workers_per_registration_process,
+            registration_backend=registration_backend,
+            metric_sampling_seed=registration_seed,
             save_dummy_ref=True,
             verbose=False,
             debug=debug,
@@ -621,14 +772,14 @@ def run_preprocessing_pipeline(
                 interpolation="nearest",
                 verbose=False,
             )
-            brainmask_source = {"type": "provided", "path": brainmask_path, "space": "coreg", "resampled": True}
+            brainmask_source = {"type": "provided", "path": brainmask_path_recorded, "space": "coreg", "resampled": True}
         else:
             # Convention: brainmask is already in ANCHOR space.
             if verbose:
                 print("[Step 0] Using provided brainmask in ANCHOR space (skipping HD-BET)...")
             if nifti_geometry_compatible(brainmask_path, anchor_path):
                 shutil.copy(brainmask_path, brainmask_anchor_path)
-                brainmask_source = {"type": "provided", "path": brainmask_path, "space": "anchor", "resampled": False}
+                brainmask_source = {"type": "provided", "path": brainmask_path_recorded, "space": "anchor", "resampled": False}
             else:
                 if verbose:
                     print("[Step 0] Provided brainmask grid does not match anchor; resampling mask to anchor grid...")
@@ -638,7 +789,7 @@ def run_preprocessing_pipeline(
                     if verbose or debug:
                         print(f"[WARN] match_direction_matrices failed for brainmask '{brainmask_path}' -> '{anchor_path}': {e}.")
                     raise
-                brainmask_source = {"type": "provided", "path": brainmask_path, "space": "anchor", "resampled": True}
+                brainmask_source = {"type": "provided", "path": brainmask_path_recorded, "space": "anchor", "resampled": True}
 
     else:
         # No brainmask provided: generate in ANCHOR space via HD-BET.
@@ -689,11 +840,10 @@ def run_preprocessing_pipeline(
         if _is_perfusion_family(lbl):
             metric_focus = "background_subtracted"
         if ndim == 3:
-            out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
             register_images(
                 fixed_path=_fixed_for_registration(lbl),
                 moving_path=src,
-                output_path=out_reg,
+                output_path=None,   # estimate only; resampled once onto the working grid in Step 2
                 transform_path=tfm,
                 apply_only=False,
                 similarity_metric=registration_metric,
@@ -701,12 +851,14 @@ def run_preprocessing_pipeline(
                 registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                metric_sampling_seed=registration_seed,
                 save_dummy_ref=True,
                 metric_focus=metric_focus, #Shouldn't run into 3d perfusion scans, but I'll add this here just in case
                 verbose=False,
                 debug=debug,
             )
-            reg_paths[lbl] = out_reg
+            reg_paths[lbl] = src
 
         elif ndim == 4:
             # 4D: estimate transform from a single frame (default frame 0). We do NOT keep a registered 4D output.
@@ -714,7 +866,7 @@ def run_preprocessing_pipeline(
             register_images(
                 fixed_path=_fixed_for_registration(lbl),
                 moving_path=src,
-                output_path=out_reg,
+                output_path=None,  # estimate only: the registered 4D output is never used
                 transform_path=tfm,
                 apply_only=False,
                 similarity_metric=registration_metric,
@@ -722,6 +874,8 @@ def run_preprocessing_pipeline(
                 registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                metric_sampling_seed=registration_seed,
                 save_dummy_ref=True,
                 metric_focus=metric_focus,
                 use_first_frame_only=True,
@@ -748,6 +902,8 @@ def run_preprocessing_pipeline(
         # Move transform + dummy refs into output/transforms and record relative paths
         tfm_dest = os.path.join(transform_dir, os.path.basename(tfm))
         shutil.move(tfm, tfm_dest)
+        if ndim == 3:
+            step1_tfm[lbl] = tfm_dest
 
         moving_ref_dummy = tfm.replace(".tfm", "-moving-ref.nii.gz")
         fixed_ref_dummy = tfm.replace(".tfm", "-fixed-ref.nii.gz")
@@ -780,20 +936,9 @@ def run_preprocessing_pipeline(
         ndim, shape = get_nifti_ndim(src)
 
         if ndim == 3:
-            out_reg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
-            register_images(
-                fixed_path=_fixed_for_registration(lbl),
-                moving_path=src,
-                output_path=out_reg,
-                transform_path=tfm_path,
-                interpolation=interp,
-                n_workers=n_workers_per_registration_process,
-                apply_only=True,
-                save_dummy_ref=False,
-                verbose=False,
-                debug=debug,
-            )
-            reg_paths[lbl] = out_reg
+            # Resampled once in Step 2 through the composed transform.
+            reg_paths[lbl] = src
+            step1_tfm[lbl] = tfm_path
 
         elif ndim == 4:
             # Desired behavior: 4D scans are NEVER registered/resampled in this pipeline.
@@ -924,10 +1069,9 @@ def run_preprocessing_pipeline(
                 }
                 continue
 
-    # ---- Step 2: optionally co-register anchor space to provided reference ----
+    # ---- Step 2: optionally co-register anchor space to provided reference; resample every 3D scan once ----
     # Apply the same T1c->ref transform to anchor and all other registered scans.
     coreg_tfm_dest = None
-    coreg_anchor_path = reg_paths[anchor_label]
     if co_register_path:
         if verbose:
             print("[Step 2] Co-register anchor space to provided reference and apply to all scans")
@@ -939,15 +1083,14 @@ def run_preprocessing_pipeline(
         # Otherwise compute it here.
         if not coreg_precomputed:
             coreg_tfm = os.path.join(temp_dir, f"{anchor_label}_to_coreg.tfm")
-            anchor_coreg = os.path.join(temp_dir, f"{basename_prefix}_{anchor_label}_coreg.nii.gz")
 
             if verbose:
                 print(f"Registering {anchor_label} to {co_register_path}...")
 
             register_images(
                 fixed_path=co_register_path,
-                moving_path=coreg_anchor_path,
-                output_path=anchor_coreg,
+                moving_path=anchor_path,
+                output_path=None,   # estimate only; the anchor is resampled with the other scans below
                 transform_path=coreg_tfm,
                 apply_only=False,
                 similarity_metric=anchor_to_coreg_metric,
@@ -955,6 +1098,8 @@ def run_preprocessing_pipeline(
                 registration_voxel_mm=registration_voxel_mm,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                metric_sampling_seed=registration_seed,
                 save_dummy_ref=True,
                 verbose=False,
                 debug=debug,
@@ -962,12 +1107,10 @@ def run_preprocessing_pipeline(
             coreg_precomputed = True
         else:
             # Sanity checks: Step 0 should have created these.
-            if coreg_tfm is None or anchor_coreg is None:
-                raise RuntimeError("Internal error: coreg_precomputed=True but coreg_tfm/anchor_coreg not set")
+            if coreg_tfm is None:
+                raise RuntimeError("Internal error: coreg_precomputed=True but coreg_tfm not set")
             if not os.path.exists(coreg_tfm):
                 raise FileNotFoundError(f"Expected precomputed coreg transform not found: {coreg_tfm}")
-            if not os.path.exists(anchor_coreg):
-                raise FileNotFoundError(f"Expected precomputed coreg anchor not found: {anchor_coreg}")
 
         # Move coreg transform + dummy refs
         coreg_tfm_dest = os.path.join(transform_dir, os.path.basename(coreg_tfm))
@@ -985,79 +1128,118 @@ def run_preprocessing_pipeline(
             if os.path.exists(_dst):
                 os.remove(_dst)
             shutil.move(_src, _dst)
+    else:
+        if verbose:
+            print("[Step 2] No co-registration reference provided; working space is anchor space")
 
-        # Apply to all registered scans (including anchor)
-        new_reg_paths: dict[str, str] = {}
-        for lbl, src_reg in reg_paths.items():
+    # Working grid: the reference (co-reg or anchor) grid, capped at the final voxel size.
+    reference_space_path = co_register_path if co_register_path else anchor_path
+    working_ref = _working_grid_reference(
+        reference_space_path, final_voxels_list, os.path.join(temp_dir, f"{basename_prefix}_working-grid.nii.gz")
+    )
+    if verbose and working_ref != reference_space_path:
+        print(f"[Step 2] Reference grid is finer than the final voxel size; resampling onto a capped working grid: {working_ref}")
+    identity_tfm_path = os.path.join(temp_dir, "identity.tfm")
 
-            # Hard guard: never co-register 4D scans.
-            # (They should not be in reg_paths, but this prevents accidental resampling if they are.)
-            if ndim_by_label.get(lbl, 3) == 4:
-                if verbose:
-                    print(f"  [skip] {lbl} is 4D; not applying co-registration transform.")
-                new_reg_paths[lbl] = src_reg
-                continue
+    def _identity_tfm() -> str:
+        if not os.path.exists(identity_tfm_path):
+            _write_identity_transform(identity_tfm_path)
+        return identity_tfm_path
 
-            ndim, shape = get_nifti_ndim(src_reg)
+    # Resample every 3D scan (including the anchor) once onto the working grid through its composed transform.
+    new_reg_paths: dict[str, str] = {}
+    for lbl, src_reg in reg_paths.items():
 
-            if ndim == 3:
-                out_coreg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_coreg.nii.gz")
-                register_images(
-                    co_register_path, src_reg, out_coreg,
-                    n_workers=n_workers_per_registration_process,
-                    transform_path=coreg_tfm_dest,
-                    interpolation=interp,
-                    apply_only=True,
-                    save_dummy_ref=False,
-                    verbose=False,
-                    debug=debug,
-                )
-                new_reg_paths[lbl] = out_coreg
+        # Hard guard: never resample 4D scans.
+        # (They should not be in reg_paths, but this prevents accidental resampling if they are.)
+        if ndim_by_label.get(lbl, 3) == 4:
+            if verbose:
+                print(f"  [skip] {lbl} is 4D; not applying co-registration transform.")
+            new_reg_paths[lbl] = src_reg
+            continue
 
+        ndim, shape = get_nifti_ndim(src_reg)
+
+        if ndim == 3:
+            out_coreg = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_coreg.nii.gz")
+            parts = [t for t in (coreg_tfm_dest, step1_tfm.get(lbl)) if t]
+            if not parts:
+                # Anchor without a co-registration reference: already on the reference grid unless it was capped.
+                if working_ref == reference_space_path:
+                    new_reg_paths[lbl] = src_reg
+                    continue
+                apply_tfm = _identity_tfm()
+            elif len(parts) == 1:
+                apply_tfm = parts[0]
             else:
-                raise ValueError(f"Unexpected ndim={ndim} for registered scan: {src_reg}")
+                # src_reg is the native scan: one resample through coreg->anchor followed by anchor->scan.
+                try:
+                    apply_tfm = _chain_transform_files(parts, os.path.join(temp_dir, f"{lbl}-to-coreg-chained.tfm"))
+                except ValueError:
+                    # Non-linear chain: fall back to resampling into anchor space first (two resamples).
+                    src_anchor = os.path.join(temp_dir, f"{basename_prefix}_{lbl}_reg.nii.gz")
+                    register_images(
+                        fixed_path=_fixed_for_registration(lbl), moving_path=src_reg, output_path=src_anchor,
+                        transform_path=step1_tfm[lbl], interpolation=interp, apply_only=True, save_dummy_ref=False,
+                        n_workers=n_workers_per_registration_process, registration_backend=registration_backend,
+                        verbose=False, debug=debug,
+                    )
+                    src_reg = src_anchor
+                    apply_tfm = coreg_tfm_dest
+            register_images(
+                working_ref, src_reg, out_coreg,
+                n_workers=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                metric_sampling_seed=registration_seed,
+                transform_path=apply_tfm,
+                interpolation=interp,
+                apply_only=True,
+                save_dummy_ref=False,
+                verbose=False,
+                debug=debug,
+            )
+            new_reg_paths[lbl] = out_coreg
 
+        else:
+            raise ValueError(f"Unexpected ndim={ndim} for registered scan: {src_reg}")
+
+        if co_register_path:
             transform_records[lbl]["coregistration"] = {
                 "transform": f"./{transform_basedir}/{os.path.basename(coreg_tfm_dest)}",
                 "fixed_reference": f"./{transform_basedir}/{os.path.basename(coreg_fixed_ref_dest)}",
                 "moving_reference": f"./{transform_basedir}/{os.path.basename(coreg_moving_ref_dest)}",
-                "reference": os.fspath(co_register_path),
+                "reference": co_register_path_recorded,
                 "interpolation": interp,
                 "estimated_from": "anchor_volume",
             }
 
-        reg_paths = new_reg_paths
-        coreg_anchor_path = reg_paths[anchor_label]
-    else:
-        if verbose:
-            print("[Step 2] No co-registration reference provided; staying in anchor space")
+    reg_paths = new_reg_paths
 
-    # ---- Step 3: finalize brainmask in the CURRENT working space (anchor or co-reg) ----
+    # ---- Step 3: finalize brainmask on the working grid ----
     # At this point we already have an anchor-space brainmask (brainmask_anchor_path) created in Step 0.
-    # If co_register_path was provided, reg_paths are now in CO-REG space; we therefore also need a
-    # co-reg-space brainmask for masking Step 4.
+    # reg_paths are now on the working grid (co-reg or anchor reference, possibly capped); the mask for Step 4
+    # must match that grid.
     brainmask_temp = os.path.join(temp_dir, f"{basename_prefix}_brainmask_temp.nii.gz")
 
-    if co_register_path:
-        # Map anchor-space brainmask into co-reg space using the anchor->coreg transform.
-        if coreg_tfm_dest is None:
-            raise RuntimeError("Internal error: co_register_path set but coreg_tfm_dest is None")
+    if co_register_path or working_ref != reference_space_path:
         if verbose:
-            print("[Step 3] Mapping anchor-space brainmask into co-registration space...")
+            print("[Step 3] Mapping anchor-space brainmask onto the working grid...")
         register_images(
-            fixed_path=co_register_path,
+            fixed_path=working_ref,
             moving_path=brainmask_anchor_path,
             output_path=brainmask_temp,
-            transform_path=coreg_tfm_dest,
+            transform_path=coreg_tfm_dest if co_register_path else _identity_tfm(),
             apply_only=True,
             interpolation="nearest",
             n_workers=n_workers_per_registration_process,
+            registration_backend=registration_backend,
+            metric_sampling_seed=registration_seed,
             save_dummy_ref=False,
             verbose=False,
             debug=debug,
         )
     else:
-        # Working space is anchor space.
+        # Working space is anchor space on the anchor's own grid.
         shutil.copy(brainmask_anchor_path, brainmask_temp)
 
     # Save a per-patient *reference-space* brainmask for reuse, but only when we generated it via HD-BET.
@@ -1068,14 +1250,21 @@ def run_preprocessing_pipeline(
         patient_id_for_mask = basename_prefix.split("_", 1)[0]
         patient_out_dir = os.path.dirname(output_dir.rstrip(os.sep))
         patient_ref_mask = os.path.join(patient_out_dir, f"{patient_id_for_mask}_brainmask_ref.nii.gz")
-        if not os.path.exists(patient_ref_mask):
-            try:
-                shutil.copy(brainmask_temp, patient_ref_mask)
-                if verbose:
-                    print(f"[Info] Saved per-patient reference-space brainmask for reuse: {patient_ref_mask}")
-            except Exception as e:
-                if verbose:
-                    print(f"[WARN] Failed to save per-patient reference-space brainmask: {e}")
+        # Check-and-write under the patient's lock, via a temp name + os.replace, so a parallel exam of this patient
+        # never sees a partially written mask and only one exam writes it.
+        with _patient_lock(patient_out_dir):
+            if not os.path.exists(patient_ref_mask):
+                tmp_mask = patient_ref_mask + f".tmp{os.getpid()}_{threading.get_ident()}.nii.gz"
+                try:
+                    shutil.copy(brainmask_temp, tmp_mask)
+                    os.replace(tmp_mask, patient_ref_mask)
+                    if verbose:
+                        print(f"[Info] Saved per-patient reference-space brainmask for reuse: {patient_ref_mask}")
+                except Exception as e:
+                    if os.path.exists(tmp_mask):
+                        os.remove(tmp_mask)
+                    if verbose:
+                        print(f"[WARN] Failed to save per-patient reference-space brainmask: {e}")
 
     # ---- Step 4: apply mask to all scans ----
     if verbose:
@@ -1146,6 +1335,8 @@ def run_preprocessing_pipeline(
                 similarity_metric=registration_metric,
                 registration_strategy=registration_strategy,
                 n_workers=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                metric_sampling_seed=registration_seed,
                 save_dummy_ref=True,
                 metric_focus=metric_focus,
                 use_first_frame_only=True,
@@ -1368,7 +1559,7 @@ def run_preprocessing_pipeline(
                 native (moving) -> reference (fixed)
             therefore we typically invert transforms on load.
             """
-            t = sitk.ReadTransform(str(path))
+            t = _read_transform(str(path))
             if invert:
                 try:
                     t = t.GetInverse()
@@ -1411,11 +1602,10 @@ def run_preprocessing_pipeline(
                 comp2.AddTransform(t)
             return comp2
 
-        # Working reference space for masks
-        ref_fixed_path = co_register_path if co_register_path else anchor_path
-
-        # Brainmask in working reference space (anchor or co-reg)
-        bm_ref = sitk.ReadImage(str(brainmask_temp), sitk.sitkFloat32)
+        # Native masks come from the ANCHOR-space brainmask (the HD-BET output, or the provided mask mapped once onto
+        # the anchor grid) rather than the working-grid copy, so they do not inherit the working grid's (possibly
+        # capped) voxel size: one nearest-neighbour hop, lbl(native) <- anchor.
+        bm_ref = _read_image(str(brainmask_anchor_path), sitk.sitkFloat32)
 
         for lbl in output_3d_labels_brain_only:
             src_native = scans.get(lbl, None)
@@ -1443,6 +1633,9 @@ def run_preprocessing_pipeline(
                     tfm_chain.append(_read_tfm(_abs_record_path(rel_tfm), invert=True))
                     if debug:
                         print(f"[native_space][{lbl}] initial-registration tfm: {rel_tfm}")
+
+            # lbl(native) -> anchor: what the anchor-space brainmask needs (identity for the anchor itself).
+            tfm_to_anchor = tfm_chain[0] if tfm_chain else sitk.Transform(3, sitk.sitkIdentity)
 
             if co_register_path:
                 # anchor -> co-reg (already moved into transform_dir)
@@ -1485,12 +1678,12 @@ def run_preprocessing_pipeline(
                     ncomp = 0
                 print(f"[native_space][{lbl}] tfm_use: {name}  n_components={ncomp}")
 
-            # 1) Resample the reference-space brainmask onto the native moving grid
-            mv_ref = sitk.ReadImage(str(src_native), sitk.sitkFloat32)
+            # 1) Resample the anchor-space brainmask onto the native moving grid
+            mv_ref = _read_image(str(src_native), sitk.sitkFloat32)
             bm_native = sitk.Resample(
                 bm_ref,
                 mv_ref,
-                tfm_use,
+                tfm_to_anchor,
                 sitk.sitkNearestNeighbor,
                 0.0,
                 sitk.sitkFloat32,
@@ -1500,7 +1693,7 @@ def run_preprocessing_pipeline(
                 try:
                     # Save the native-grid mask for inspection
                     bm_native_out = os.path.join(native_dir, f"{basename_prefix}_{lbl}_native_mask.nii.gz")
-                    sitk.WriteImage(bm_native, bm_native_out)
+                    _write_image(bm_native, bm_native_out)
                     print(f"[native_space][{lbl}] Saved native-grid mask: {bm_native_out}")
                 except Exception as e:
                     print(f"[native_space][{lbl}][WARN] Failed to save native mask: {e}")
@@ -1677,6 +1870,8 @@ def preprocess_single_brain_mri(
     registration_strategy="medium",
     registration_voxel_mm="2,2,2",
     n_workers_per_registration_process=None,
+    registration_backend="auto",
+    registration_seed=1,
     n_workers_per_hd_bet_process: int | None = None,
     save_scans_with_skulls=False,
     save_native_space=False,
@@ -1728,6 +1923,12 @@ def preprocess_single_brain_mri(
         Registration preset controlling speed/accuracy tradeoffs (passed to `register_images`).
     registration_voxel_mm : str, default="2,2,2"
         Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False).
+    registration_backend : {"auto", "itk", "gpu"}, default="auto"
+        Passed to preprocess.register_images(..., registration_backend=...).
+    registration_seed : int | None, default=1
+        Seed for the registration metric's random sampling (passed to register_images as metric_sampling_seed),
+        making repeated runs reproducible. None = seed from the wall clock (runs differ slightly). Must not be 0
+        (SimpleITK treats 0 as "use the wall clock").
     n_workers_per_registration_process : int | None, default=None
          Passed down to run_preprocessing_pipeline and then to register_images(..., n_workers=...).
     n_workers_per_hd_bet_process : int | None, default=None
@@ -1940,6 +2141,8 @@ def preprocess_single_brain_mri(
             registration_strategy=registration_strategy,
             registration_voxel_mm=registration_voxel_mm,
             n_workers_per_registration_process=n_workers_per_registration_process,
+            registration_backend=registration_backend,
+            registration_seed=registration_seed,
             n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
             save_scans_with_skulls=save_scans_with_skulls,
             save_native_space=save_native_space,
@@ -1975,6 +2178,8 @@ def preprocess_single_brain_mri(
                 registration_voxel_mm=registration_voxel_mm,
                 co_register_path=co_register_path,
                 n_workers_per_registration_process=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                registration_seed=registration_seed,
                 n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
                 save_scans_with_skulls=save_scans_with_skulls,
                 save_native_space=save_native_space,
@@ -2094,6 +2299,11 @@ def main():
         default="medium",
         help="registration_strategy : {accurate, medium, or fast}, convenience preset controlling registration speed/accuracy tradeoffs",
     )
+    parser.add_argument("--registration_seed", default="1",
+                        help="Seed for registration metric sampling (default 1, reproducible runs); 'none' = wall clock.")
+    parser.add_argument("--registration_backend", choices=["auto", "itk", "gpu"], default="auto",
+                        help="Registration engine: auto (default; gpu when CUDA is available, else itk), itk, or gpu "
+                             "(CUDA port of the same ITK algorithms).")
     parser.add_argument("--registration_voxel_mm", default="2,2,2", help="Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
     parser.add_argument(
         "--n_workers_per_registration_process",
@@ -2258,6 +2468,8 @@ def main():
         registration_strategy=args.registration_strategy,
         registration_voxel_mm=args.registration_voxel_mm,
         n_workers_per_registration_process=args.n_workers_per_registration_process,
+        registration_backend=args.registration_backend,
+        registration_seed=None if str(args.registration_seed).strip().lower() == "none" else int(args.registration_seed),
         n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         co_register_path=args.co_register,
         save_scans_with_skulls=args.save_scans_with_skulls,

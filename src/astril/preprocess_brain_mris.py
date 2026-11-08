@@ -13,6 +13,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import subprocess
+import inspect
+import functools
+import contextlib
 import tempfile
 import importlib.util
 import sysconfig
@@ -416,7 +419,7 @@ def _find_existing_patient_brainmask(patient_out_dir: Path, patient: str) -> Pat
 # Core batch function
 # ----------------------------
 
-def preprocess_library(
+def _preprocess_library_impl(
     in_dir: str | Path,
     out_dir: str | Path,
     preprocess_log: str | Path | None = None,
@@ -425,6 +428,8 @@ def preprocess_library(
     dont_coregister: bool = False,
     n_workers: int = 1,
     n_workers_per_registration_process: int | None = None,
+    registration_backend: str = "auto",
+    registration_seed: int | None = 1,
     n_workers_per_hd_bet_process: int | None = None,
     overwrite: bool = False,
     reuse_patient_brainmask: bool = True,
@@ -471,6 +476,9 @@ def preprocess_library(
         interp = _norm_interp(interp)
     except Exception as e:
         raise ValueError(f"Invalid --interp / interp={interp!r}: {e}") from e
+
+    run_started = time.time()
+    exam_times: list[tuple[str, str, str, float]] = []   # (patient, exam, status, seconds) for the end-of-run summary
 
     in_dir = Path(in_dir).resolve()
     out_dir = Path(out_dir).resolve()
@@ -986,6 +994,8 @@ def preprocess_library(
                 use_gpu=use_gpu,
                 enable_tta=enable_tta,
                 n_workers_per_registration_process=n_workers_per_registration_process,
+                registration_backend=registration_backend,
+                registration_seed=registration_seed,
                 n_workers_per_hd_bet_process=n_workers_per_hd_bet_process,
                 overwrite=overwrite,
                 verbose=not quiet,
@@ -1036,6 +1046,16 @@ def preprocess_library(
     warned_missing_patient_masks = False
 
     def _process_exam_dir(exam_dir: Path) -> None:
+        patient, exam = _parse_patient_exam(exam_dir)
+        t0 = time.time()
+        status = "ERROR"
+        try:
+            status = _process_exam_dir_inner(exam_dir)
+        finally:
+            with log_lock:
+                exam_times.append((patient, exam, status, time.time() - t0))
+
+    def _process_exam_dir_inner(exam_dir: Path) -> str:
         #print(f"[Preprocess -- DEBUG] running _process_exam_dir on {exam_dir}")
         nonlocal warned_missing_patient_masks
         patient, exam = _parse_patient_exam(exam_dir)
@@ -1089,6 +1109,7 @@ def preprocess_library(
         ])
 
         _advance(1)
+        return status
 
     if n_workers and n_workers > 1:
         with _InterruptibleThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -1109,6 +1130,7 @@ def preprocess_library(
                         str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
                         anchor_label, ",".join(modalities) if modalities else "AUTO",
                         registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
+                        normalization_method, normalization_percentiles, normalization_z_clip,
                         final_dims, final_voxels,
                         save_scans_with_skulls, use_gpu, enable_tta, debug,
                     ])
@@ -1128,6 +1150,7 @@ def preprocess_library(
                     str(patient_mask_cache.get(patient) or "NONE") if reuse_patient_brainmask else "DISABLED",
                     anchor_label, ",".join(modalities) if modalities else "AUTO",
                     registration_metric, anchor_to_coreg_metric, registration_strategy, registration_voxel_mm, interp,
+                    normalization_method, normalization_percentiles, normalization_z_clip,
                     final_dims, final_voxels,
                     save_scans_with_skulls, use_gpu, enable_tta, debug,
                 ])
@@ -1136,7 +1159,73 @@ def preprocess_library(
     if pbar:
         pbar.close()
 
+    _print_run_summary(exam_times, time.time() - run_started, n_workers)
+
     return Path(preprocess_log), Path(coreg_log)
+
+
+def _fmt_secs(s: float) -> str:
+    s = float(s)
+    return f"{int(s // 60)}m {s % 60:04.1f}s" if s >= 60 else f"{s:.1f}s"
+
+
+def _print_run_summary(exam_times: list[tuple[str, str, str, float]], wall_seconds: float, n_workers: int) -> None:
+    """Per-exam times (slowest first) and the run's wall time, printed whether or not the run was quiet."""
+    print(f"\n[preprocess_brain_mris] Finished {len(exam_times)} exam(s) in {_fmt_secs(wall_seconds)} wall time "
+          f"(n_workers={n_workers}).", flush=True)
+    if not exam_times:
+        return
+    width = max(len(f"{p}/{e}") for p, e, _, _ in exam_times)
+    for patient, exam, status, secs in sorted(exam_times, key=lambda r: -r[3]):
+        print(f"    {f'{patient}/{exam}':<{width}}  {status:<8} {_fmt_secs(secs):>10}", flush=True)
+    ran = [r[3] for r in exam_times if r[2] not in ("SKIPPED", "ERROR")]
+    if ran:
+        print(f"    exams processed: {len(ran)}  mean {_fmt_secs(sum(ran) / len(ran))}  "
+              f"max {_fmt_secs(max(ran))}  summed {_fmt_secs(sum(ran))}", flush=True)
+
+
+@contextlib.contextmanager
+def _single_threaded_blas():
+    """Limit BLAS (numpy's OpenBLAS) to one thread while exam worker threads run, then restore.
+
+    numpy's bundled OpenBLAS is built with a fixed thread pool (MAX_THREADS=24 in current wheels); large BLAS calls
+    from many Python threads at once on machines with more logical CPUs can crash (access violation) or deadlock it.
+    Exam-level threading already uses every core, so BLAS threads add nothing. OPENBLAS_NUM_THREADS also covers child
+    processes started during the run (HD-BET, read probes).
+    """
+    prev_env = os.environ.get("OPENBLAS_NUM_THREADS")
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    limiter = None
+    try:
+        from threadpoolctl import threadpool_limits
+        limiter = threadpool_limits(limits=1, user_api="blas")
+    except Exception as e:  # noqa: BLE001 - best effort; the env var still protects child processes
+        print(f"[WARN] Could not limit BLAS threads in-process ({type(e).__name__}: {e}).")
+    try:
+        yield
+    finally:
+        if limiter is not None:
+            limiter.restore_original_limits()
+        if prev_env is None:
+            os.environ.pop("OPENBLAS_NUM_THREADS", None)
+        else:
+            os.environ["OPENBLAS_NUM_THREADS"] = prev_env
+
+
+@functools.wraps(_preprocess_library_impl)
+def preprocess_library(*args, **kwargs):
+    bound = inspect.signature(_preprocess_library_impl).bind_partial(*args, **kwargs)
+    try:
+        threaded = int(bound.arguments.get("n_workers", 1) or 1) > 1
+    except (TypeError, ValueError):
+        threaded = False
+    if not threaded:
+        return _preprocess_library_impl(*args, **kwargs)
+    with _single_threaded_blas():
+        return _preprocess_library_impl(*args, **kwargs)
+
+
+preprocess_library.__name__ = preprocess_library.__qualname__ = "preprocess_library"
 
 
 # ----------------------------
@@ -1161,6 +1250,7 @@ def _parse_family_parent_map(val: str | None) -> dict[str, str] | None:
 
 def main():
     import __main__
+    main_started = time.time()
     module = getattr(__main__, "__spec__", None)
     prog = f"python -m {module.name}" if module and module.name else None
     p = argparse.ArgumentParser(
@@ -1219,6 +1309,12 @@ def main():
         help="Similarity metric used for registration of the anchor volume to the co-registration volume: 'correlation' or 'mi' (mutual information) (default: correlation).",
     )
     p.add_argument("--interp", type=str, default="3", help="Interpolation order for resampling (0=nearest, 1=linear, 2=quadratic, ...). Accepts int 0-5 or strings like \'nearest\', \'linear\', \'cubic\'.")
+    p.add_argument("--registration_seed", default="1",
+                   help="Seed for registration metric sampling (default 1, reproducible runs); 'none' = wall clock.")
+    p.add_argument("--registration_backend", choices=["auto", "itk", "gpu"], default="auto",
+                   help="Registration engine: auto (default; gpu when CUDA is available, else itk), itk, or gpu "
+                        "(CUDA port of the same ITK algorithms). With --n_workers > 1, all exam workers share one "
+                        "batched GPU registration service.")
     p.add_argument("--registration_strategy", default="medium", help="Registration preset: accurate|medium|fast (default: medium).")
     p.add_argument("--registration_voxel_mm", default="2,2,2", help="Spacing (mm, mm, mm) to use *during transform estimation* (apply_only=False). This speeds up registration by downsampling both fixed and moving frames to a common voxel size before optimization. Does not affect spacing of output images.")
     p.add_argument(
@@ -1284,6 +1380,8 @@ def main():
         dont_coregister=args.dont_coregister,
         n_workers=args.n_workers,
         n_workers_per_registration_process=args.n_workers_per_registration_process,
+        registration_backend=args.registration_backend,
+        registration_seed=None if str(args.registration_seed).strip().lower() == "none" else int(args.registration_seed),
         n_workers_per_hd_bet_process=args.n_workers_per_hd_bet_process,
         overwrite=args.overwrite,
         reuse_patient_brainmask=not args.no_reuse_patient_brainmask,
@@ -1315,11 +1413,15 @@ def main():
         if args.verbose:
             print(f"[QC] Preparing PDF QC files to visualize preprocessed MRI volumes...")
 
+        qc_started = time.time()
         generate_preprocessing_qc_pdfs(
             root_dir=args.out_dir,
             n_workers=args.n_workers,
             out_dir=args.out_dir + "/QC/"
         )
+        print(f"[preprocess_brain_mris] QC PDFs: {_fmt_secs(time.time() - qc_started)}", flush=True)
+
+    print(f"[preprocess_brain_mris] Total run time: {_fmt_secs(time.time() - main_started)}", flush=True)
 
 
 if __name__ == "__main__":
