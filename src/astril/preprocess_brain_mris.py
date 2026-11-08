@@ -23,7 +23,7 @@ import sysconfig
 # We import and call your existing function directly (no subprocess).
 # If your package layout differs (e.g., installed as astril), adjust the import:
 from .preprocess_single_brain_mri import preprocess_single_brain_mri  # type: ignore
-from .preprocessing_utils import ensure_dcm2niix_accessible, _cleanup_registered_temp_dirs, _register_temp_dir_for_atexit
+from .preprocessing_utils import ensure_dcm2niix_accessible, _cleanup_registered_temp_dirs, _register_temp_dir_for_atexit, count_mask_voxels
 
 
 try:
@@ -891,6 +891,15 @@ def _preprocess_library_impl(
                                 if not quiet:
                                     print(
                                         f"[preprocess_brain_mris] WARNING: hd-bet did not produce a mask for {pat} (expected {src}). Will fall back to per-exam mask generation.",
+                                        flush=True,
+                                    )
+                                continue
+                            if count_mask_voxels(src) == 0:
+                                # Don't stage it: a staged ref mask is reused by every exam of the patient (and by
+                                # later incremental runs). Per-exam processing reports the empty mask as an error.
+                                if not quiet:
+                                    print(
+                                        f"[preprocess_brain_mris] WARNING: hd-bet produced an EMPTY mask for {pat}; not reusing it. Will fall back to per-exam mask generation.",
                                         flush=True,
                                     )
                                 continue

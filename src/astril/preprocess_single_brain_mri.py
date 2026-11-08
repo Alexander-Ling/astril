@@ -551,6 +551,7 @@ def run_preprocessing_pipeline(
         get_nifti_ndim,
         apply_mask_anydim,
         apply_mask_anydim_sitk,
+        count_mask_voxels,
         normalize_masked_anydim,
         ensure_hd_bet_installed,
         find_sidecars_for_nifti,
@@ -806,6 +807,16 @@ def run_preprocessing_pipeline(
             n_workers=n_workers_per_hd_bet_process,
         )
         brainmask_source = {"type": "hd-bet", "space": "anchor"}
+
+    # An empty mask would zero every masked scan, and Step 4 would then drop every label, leaving an exam with
+    # no outputs that still reports success. Fail the exam here instead, with the actual cause.
+    if count_mask_voxels(brainmask_anchor_path) == 0:
+        if brainmask_source["type"] == "hd-bet":
+            raise RuntimeError(
+                f"Brainmask is empty: HD-BET found no brain in the {anchor_label} anchor scan "
+                f"({anchor_path}). Check that the anchor is a whole-head brain MRI."
+            )
+        raise RuntimeError(f"Brainmask is empty: the provided brainmask has no voxels > 0 ({brainmask_path}).")
 
     # Create skull-stripped anchor in ANCHOR space for perfusion-fixed registrations.
     try:
@@ -1242,6 +1253,13 @@ def run_preprocessing_pipeline(
         # Working space is anchor space on the anchor's own grid.
         shutil.copy(brainmask_anchor_path, brainmask_temp)
 
+    if count_mask_voxels(brainmask_temp) == 0:
+        raise RuntimeError(
+            "Brainmask is empty after mapping it onto the working grid"
+            + (f" (co-registration reference: {co_register_path}); the anchor->reference registration "
+               "probably failed." if co_register_path else ".")
+        )
+
     # Save a per-patient *reference-space* brainmask for reuse, but only when we generated it via HD-BET.
     # Reference space is:
     #   - CO-REG space when co_register_path is provided
@@ -1517,6 +1535,11 @@ def run_preprocessing_pipeline(
 
     # Only output labels that survived all prior steps (registration -> masking -> normalization)
     output_3d_labels = sorted(set(brain_paths.keys()).intersection(norm_paths.keys()))
+    if not output_3d_labels and not unregistered_4d_outputs:
+        raise RuntimeError(
+            "No scan survived skull-stripping and normalization, so this exam has no outputs "
+            f"(labels: {', '.join(sorted(scans))}). Rerun with verbose output to see each label's [WARN] reason."
+        )
 
     # Native-space saving is intended for the non-normalized outputs (_brain.nii.gz),
     # so it must NOT depend on normalization succeeding.

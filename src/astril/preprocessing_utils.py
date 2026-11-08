@@ -3762,6 +3762,10 @@ def apply_mask_anydim_sitk(input_image_path, mask_path, output_path):
     write_image(out_img, str(output_path))
     return output_path
 
+def count_mask_voxels(mask_path) -> int:
+    """Number of voxels > 0 in a mask NIfTI (0 = empty mask)."""
+    return int(np.count_nonzero(np.asanyarray(nib.load(os.fspath(mask_path)).dataobj) > 0))
+
 def apply_mask_anydim(input_image_path, mask_path, output_path):
     import nibabel as nib
     import numpy as np
